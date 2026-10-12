@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation": "nav_expand",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "nav_expand",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "path": "/"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJsYWJlbCI6IkZpeHR1cmUgUm9vdCIsInJlZiI6eyJraW5kIjoicm9vdCIsInZhbHVlIjpudWxsfSwicGF0aCI6Ii8iLCJ0YXJnZXRfZW50aXRpZXMiOnsidHlwZSI6IlByb2plY3QiLCJhZGRpdGlvbmFsX2ZpbHRlcl9wcmVzZXRzIjpbXX0sImhhc19jaGlsZHJlbiI6ZmFsc2UsImNoaWxkcmVuIjpbXX0="
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation": "update_project_last_accessed",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "update_project_last_accessed_by_current_user",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "project_id": 1,
+          "user_id": 1
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp0cnVlfQ=="
+  }
+}

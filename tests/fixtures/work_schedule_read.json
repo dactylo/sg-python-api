@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "operation": "work_schedule_read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "work_schedule_read",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "start_date": "2026-01-05",
+          "end_date": "2026-01-09"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7IjIwMjYtMDEtMDUiOnsid29ya2luZyI6dHJ1ZSwiZGVzY3JpcHRpb24iOm51bGwsInJlYXNvbiI6IkZpeHR1cmUgc2NoZWR1bGUifSwiMjAyNi0wMS0wNiI6eyJ3b3JraW5nIjp0cnVlLCJkZXNjcmlwdGlvbiI6bnVsbCwicmVhc29uIjoiRml4dHVyZSBzY2hlZHVsZSJ9LCIyMDI2LTAxLTA3Ijp7IndvcmtpbmciOnRydWUsImRlc2NyaXB0aW9uIjpudWxsLCJyZWFzb24iOiJGaXh0dXJlIHNjaGVkdWxlIn0sIjIwMjYtMDEtMDgiOnsid29ya2luZyI6dHJ1ZSwiZGVzY3JpcHRpb24iOm51bGwsInJlYXNvbiI6IkZpeHR1cmUgc2NoZWR1bGUifSwiMjAyNi0wMS0wOSI6eyJ3b3JraW5nIjp0cnVlLCJkZXNjcmlwdGlvbiI6bnVsbCwicmVhc29uIjoiRml4dHVyZSBzY2hlZHVsZSJ9fX0="
+  }
+}

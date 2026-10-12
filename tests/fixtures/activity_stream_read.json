@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "operation": "activity_stream_read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "activity_stream",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "type": "Project",
+          "id": 1,
+          "max_id": null,
+          "min_id": null,
+          "limit": null,
+          "entity_fields": {}
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJlbnRpdHlfdHlwZSI6IlByb2plY3QiLCJlbnRpdHlfaWQiOjEsImxhdGVzdF91cGRhdGVfaWQiOjEsImVhcmxpZXN0X3VwZGF0ZV9pZCI6MSwidXBkYXRlcyI6W119"
+  }
+}

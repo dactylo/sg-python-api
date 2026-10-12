@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "operation": "fault_bad_auth",
+  "auth_mode": "session",
+  "outcome": {
+    "kind": "fault",
+    "exception": "AuthenticationFault"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "read",
+      "params": [
+        {
+          "session_token": "REDACTED"
+        },
+        {
+          "type": "Project",
+          "return_fields": ["id"],
+          "filters": {
+            "logical_operator": "and",
+            "conditions": []
+          },
+          "return_only": "active",
+          "paging": {
+            "entities_per_page": 1,
+            "current_page": 1
+          },
+          "api_return_image_urls": true
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJleGNlcHRpb24iOnRydWUsIm1lc3NhZ2UiOiJSRURBQ1RFRCIsImVycm9yX2NvZGUiOjEwMn0="
+  }
+}

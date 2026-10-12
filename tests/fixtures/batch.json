@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "operation": "batch",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "batch",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        [
+          {
+            "request_type": "create",
+            "type": "Note",
+            "fields": [
+              {
+                "field_name": "subject",
+                "value": "sg-python-api-wire-probe-replay-batch"
+              },
+              {
+                "field_name": "project",
+                "value": {
+                  "type": "Project",
+                  "id": 1
+                }
+              }
+            ],
+            "return_fields": ["id"]
+          }
+        ]
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjpbeyJpZCI6MSwic3ViamVjdCI6InNnLXB5dGhvbi1hcGktd2lyZS1wcm9iZS1yZXBsYXktYmF0Y2giLCJwcm9qZWN0Ijp7ImlkIjoxLCJuYW1lIjoiRml4dHVyZSBQcm9qZWN0IiwidHlwZSI6IlByb2plY3QifSwidHlwZSI6Ik5vdGUifV19"
+  }
+}

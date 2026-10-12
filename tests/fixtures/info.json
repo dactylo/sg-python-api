@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "operation": "info",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "info",
+      "params": []
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJ2ZXJzaW9uIjpbOSwwLDBdLCJmdWxsX3ZlcnNpb24iOls5LDAsMCwwXSwiczNfdXBsb2Fkc19lbmFibGVkIjpmYWxzZSwiczNfZGlyZWN0X3VwbG9hZHNfZW5hYmxlZCI6ZmFsc2UsInMzX2VuYWJsZWRfdXBsb2FkX3R5cGVzIjp7fSwic2hvdGd1bmxvY2FsaG9zdF9icm93c2VyX2ludGVncmF0aW9uX2VuYWJsZWQiOmZhbHNlLCJ1bmlmaWVkX2xvZ2luX2Zsb3dfZW5hYmxlZCI6ZmFsc2UsImF1dGhlbnRpY2F0aW9uX2FwcF9zZXNzaW9uX2xhdW5jaGVyX2VuYWJsZWQiOmZhbHNlLCJhbmFseXRpY3Nfc2l0ZV9pZCI6ImZpeHR1cmUtc2l0ZSIsImFuYWx5dGljc19zaXRlX25hbWUiOiJGaXh0dXJlIFNpdGUiLCJ1c2VyX2F1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImRlZmF1bHQiLCJhcGlfbWF4X2VudGl0aWVzX3Blcl9wYWdlIjo1MDB9"
+  }
+}

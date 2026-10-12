@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "operation": "text_search",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "query_display_name_cache",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "text": "wire probe",
+          "entity_types": {
+            "Project": {
+              "logical_operator": "and",
+              "conditions": []
+            }
+          },
+          "project_ids": [],
+          "max_results": null
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJtYXRjaGVzIjpbXSwidGVybXMiOlsid2lyZSIsInByb2JlIl19"
+  }
+}

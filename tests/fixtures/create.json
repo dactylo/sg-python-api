@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "operation": "create",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "create",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "type": "Note",
+          "fields": [
+            {
+              "field_name": "subject",
+              "value": "sg-python-api-wire-probe-replay"
+            },
+            {
+              "field_name": "project",
+              "value": {
+                "type": "Project",
+                "id": 1
+              }
+            }
+          ],
+          "return_fields": ["id"]
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7ImlkIjoxLCJzdWJqZWN0Ijoic2ctcHl0aG9uLWFwaS13aXJlLXByb2JlLXJlcGxheSIsInByb2plY3QiOnsiaWQiOjEsIm5hbWUiOiJGaXh0dXJlIFByb2plY3QiLCJ0eXBlIjoiUHJvamVjdCJ9LCJ0eXBlIjoiTm90ZSJ9fQ=="
+  }
+}

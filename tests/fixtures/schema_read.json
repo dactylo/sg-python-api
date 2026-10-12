@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation": "schema_read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "schema_read",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7IlByb2plY3QiOnsiaWQiOnsibmFtZSI6eyJ2YWx1ZSI6IklkIiwiZWRpdGFibGUiOmZhbHNlfSwiZGVzY3JpcHRpb24iOnsidmFsdWUiOiJGaXh0dXJlIGlkZW50aWZpZXIiLCJlZGl0YWJsZSI6ZmFsc2V9LCJjdXN0b21fbWV0YWRhdGEiOnsidmFsdWUiOm51bGwsImVkaXRhYmxlIjpmYWxzZX0sImVudGl0eV90eXBlIjp7InZhbHVlIjoiUHJvamVjdCIsImVkaXRhYmxlIjpmYWxzZX0sImRhdGFfdHlwZSI6eyJ2YWx1ZSI6Im51bWJlciIsImVkaXRhYmxlIjpmYWxzZX0sImVkaXRhYmxlIjp7InZhbHVlIjpmYWxzZSwiZWRpdGFibGUiOmZhbHNlfSwibWFuZGF0b3J5Ijp7InZhbHVlIjp0cnVlLCJlZGl0YWJsZSI6ZmFsc2V9LCJ1bmlxdWUiOnsidmFsdWUiOnRydWUsImVkaXRhYmxlIjpmYWxzZX0sInByb3BlcnRpZXMiOnsiZGVmYXVsdF92YWx1ZSI6eyJ2YWx1ZSI6bnVsbCwiZWRpdGFibGUiOmZhbHNlfX0sInZpc2libGUiOnsidmFsdWUiOnRydWUsImVkaXRhYmxlIjpmYWxzZX0sInVpX3ZhbHVlX2Rpc3BsYXlhYmxlIjp7InZhbHVlIjp0cnVlLCJlZGl0YWJsZSI6ZmFsc2V9fX19fQ=="
+  }
+}

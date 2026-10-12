@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "operation": "following",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "following",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "user": {
+            "type": "HumanUser",
+            "id": 1
+          }
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjpbeyJ0eXBlIjoiSHVtYW5Vc2VyIiwiaWQiOjF9XX0="
+  }
+}

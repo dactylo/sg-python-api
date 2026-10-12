@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "operation": "schema_entity_read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "schema_entity_read",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7IlByb2plY3QiOnsibmFtZSI6eyJ2YWx1ZSI6IlByb2plY3QiLCJlZGl0YWJsZSI6ZmFsc2V9LCJ2aXNpYmxlIjp7InZhbHVlIjp0cnVlLCJlZGl0YWJsZSI6ZmFsc2V9fX19"
+  }
+}

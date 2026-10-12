@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "operation": "summarize",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "summarize",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "type": "Project",
+          "filters": {
+            "logical_operator": "and",
+            "conditions": []
+          },
+          "summaries": [
+            {
+              "field": "id",
+              "type": "count"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7InN1bW1hcmllcyI6eyJpZCI6MX0sImdyb3VwcyI6W119fQ=="
+  }
+}

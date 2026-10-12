@@ -1,0 +1,15 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+  "files": {
+    "maxSize": 2097152
+  },
+  "formatter": {
+    "useEditorconfig": true,
+    "includes": ["*.json", "*.jsonc", "src/**", "tests/**"]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "operation": "read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "read",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "type": "Project",
+          "return_fields": ["name"],
+          "filters": {
+            "logical_operator": "and",
+            "conditions": []
+          },
+          "return_only": "active",
+          "paging": {
+            "entities_per_page": 2,
+            "current_page": 1
+          },
+          "api_return_image_urls": true
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "eyJyZXN1bHRzIjp7ImVudGl0aWVzIjpbeyJ0eXBlIjoiUHJvamVjdCIsImlkIjoxLCJuYW1lIjoiRml4dHVyZSBQcm9qZWN0IDEifSx7InR5cGUiOiJQcm9qZWN0IiwiaWQiOjIsIm5hbWUiOiJGaXh0dXJlIFByb2plY3QgMiJ9XSwicGFnaW5nX2luZm8iOnsicGFnZV9jb3VudCI6MSwiY3VycmVudF9wYWdlIjoxLCJlbnRpdGllc19wZXJfcGFnZSI6MiwiZW50aXR5X2NvdW50IjoyfX19"
+  }
+}

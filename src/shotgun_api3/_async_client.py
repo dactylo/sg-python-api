@@ -51,7 +51,6 @@ from ._client import (
     expose_constructor_signature,
 )
 from ._config import (
-    CompatibilityWarningCode,
     Config,
     RequestContext,
     advance_transport_generation,
@@ -288,7 +287,6 @@ class _InvocationOptions:
     """Collect non-payload controls for one client invocation."""
 
     auth_spec: _protocol.AuthSpec | None = None
-    compatibility_warning_codes: tuple[CompatibilityWarningCode, ...] = ()
     include_auth: bool = True
     logical_method_name: str | None = None
 
@@ -523,7 +521,6 @@ class AsyncShotgun:
             outbound,
             context,
             include_auth=invocation.options.include_auth,
-            compatibility_warning_codes=invocation.options.compatibility_warning_codes,
             _logical_method_name=invocation.options.logical_method_name,
         )
         return _protocol.transform_inbound(result, context.convert_datetimes_to_utc)
@@ -1220,6 +1217,28 @@ class AsyncShotgun:
         await self._upload_direct(driver, context, prepared, upload_info)
         return await self._upload_link(driver, context, prepared, upload_info)
 
+    async def _upload_thumbnails_after_write(
+        self,
+        entity_type: str,
+        entity_id: int,
+        thumbnails: dict[str, object],
+        result: dict[str, object],
+    ) -> dict[str, object]:
+        """Upload separated thumbnail paths and merge their current field values."""
+        if not thumbnails:
+            return result
+        for field_name, path in thumbnails.items():
+            upload = (
+                self.upload_filmstrip_thumbnail
+                if field_name == 'filmstrip_image'
+                else self.upload_thumbnail
+            )
+            await upload(entity_type, entity_id, cast('str', path))
+        current = await self.find_one(entity_type, [['id', 'is', entity_id]], list(thumbnails))
+        if current is not None:
+            result.update({field_name: current.get(field_name) for field_name in thumbnails})
+        return result
+
     @overload
     async def activity_stream_read(self, entity_type: Never) -> dict[str, object]: ...
 
@@ -1520,6 +1539,10 @@ class AsyncShotgun:
     ) -> dict[str, object]:
         """Create an entity with the supplied field values.
 
+        Non-empty `image` and `filmstrip_image` values are file paths. They are
+        uploaded as thumbnails after the entity is created, and the result
+        includes their current field values.
+
         Args:
             entity_type: Entity type to create.
             data: Field values for the new entity.
@@ -1530,14 +1553,22 @@ class AsyncShotgun:
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if `data`, its field names, `return_fields`, or the server
-                result is invalid.
+                if `data`, its field names, `return_fields`, or the server
+                result is invalid, or if a thumbnail path is not a nonempty
+                file. A thumbnail failure occurs after the entity is created.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        params = _crud.build_create_params(entity_type, data, return_fields)
-        return _crud.require_dictionary_result(await self._call('create', params), 'create')
+        field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=False)
+        params = _crud.build_create_params(entity_type, field_data, return_fields)
+        result = _crud.require_dictionary_result(await self._call('create', params), 'create')
+        if not thumbnails:
+            return result
+        entity_id = _crud.require_entity_id(result.get('id'), 'create did not return an entity id')
+        return await self._upload_thumbnails_after_write(
+            entity_type, entity_id, thumbnails, result
+        )
 
     async def delete(self, entity_type: str, entity_id: int) -> bool:
         """Retire an entity.
@@ -1641,6 +1672,15 @@ class AsyncShotgun:
             raise
         except (TransportError, _errors.ProtocolError, OSError):
             raise _errors.ShotgunFileDownloadError('attachment download failed') from None
+
+    async def entity_types(self) -> Never:
+        """Reject the deprecated alias of `schema_entity_read()` without I/O.
+
+        Raises:
+            ShotgunError: Always, naming `schema_entity_read()` as the
+                replacement.
+        """
+        raise _methods.entity_types_alias_error()
 
     @overload
     async def export_page(
@@ -2085,6 +2125,18 @@ class AsyncShotgun:
         params = _crud.build_entity_action_params(entity_type, entity_id)
         return _crud.require_boolean_result(await self._call('revive', params), 'revive')
 
+    async def schema(self, entity_type: str) -> Never:
+        """Reject the deprecated alias of `schema_field_read()` without I/O.
+
+        Args:
+            entity_type: Entity type named in the replacement suggestion.
+
+        Raises:
+            ShotgunError: Always, naming the equivalent `schema_field_read()`
+                call.
+        """
+        raise _methods.schema_alias_error(entity_type)
+
     async def schema_entity_read(
         self,
         project_entity: dict[str, Any] | None = None,
@@ -2104,33 +2156,11 @@ class AsyncShotgun:
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        warnings_codes = _methods.consume_compatibility_warnings(
-            _methods.SCHEMA_ENTITY_READ_WARNINGS,
-            self,
-        )
         result = await self._call(
             'schema_entity_read',
             _methods.build_schema_entity_read_params(project_entity),
-            _InvocationOptions(compatibility_warning_codes=warnings_codes),
         )
         return _crud.require_dictionary_result(result, 'schema_entity_read')
-
-    async def entity_types(self) -> dict[str, object]:
-        """Return entity schema through the deprecated alias.
-
-        Returns:
-            Entity-type schema data returned by the server.
-
-        Raises:
-            ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the server result is not a dictionary.
-            ProtocolError: If a server request returns an HTTP error.
-            ValueError: If authenticated HTTP violates the configured origin
-                policy.
-        """
-        _methods.warn_entity_types_alias()
-        with _methods.entity_types_alias(self):
-            return await self.schema_entity_read()
 
     async def schema_field_create(
         self,
@@ -2210,10 +2240,6 @@ class AsyncShotgun:
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        warning_codes = _methods.consume_compatibility_warnings(
-            _methods.SCHEMA_FIELD_READ_WARNINGS,
-            self,
-        )
         result = await self._call(
             'schema_field_read',
             _methods.build_schema_field_read_params(
@@ -2221,29 +2247,8 @@ class AsyncShotgun:
                 field_name,
                 project_entity,
             ),
-            _InvocationOptions(compatibility_warning_codes=warning_codes),
         )
         return _crud.require_dictionary_result(result, 'schema_field_read')
-
-    async def schema(self, entity_type: str) -> dict[str, object]:
-        """Return field schema through the deprecated alias.
-
-        Args:
-            entity_type: Entity type whose fields to return.
-
-        Returns:
-            Field schema data returned by the server.
-
-        Raises:
-            ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the server result is invalid.
-            ProtocolError: If a server request returns an HTTP error.
-            ValueError: If authenticated HTTP violates the configured origin
-                policy.
-        """
-        _methods.warn_schema_alias()
-        with _methods.schema_alias(self):
-            return await self.schema_field_read(entity_type)
 
     async def schema_field_update(
         self,
@@ -2559,6 +2564,12 @@ class AsyncShotgun:
     ) -> dict[str, object]:
         """Update fields on an existing entity.
 
+        Non-empty `image` and `filmstrip_image` values are file paths. They are
+        uploaded as thumbnails after the other fields are updated, and the
+        result includes their current field values. An `image` of `None` clears
+        both thumbnails. When no other fields remain, no update request is sent
+        and the result contains only `id` and `type`.
+
         Args:
             entity_type: Entity type to update.
             entity_id: Numeric entity identifier.
@@ -2570,19 +2581,29 @@ class AsyncShotgun:
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if `data`, its field names, `multi_entity_update_modes`, or
-                the server result is invalid.
+                if `data`, its field names, `multi_entity_update_modes`, or the
+                server result is invalid, or if a thumbnail path is not a
+                nonempty file. A thumbnail failure occurs after the update.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
+        field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=True)
         params = _crud.build_update_params(
             entity_type,
             entity_id,
-            data,
+            field_data,
             multi_entity_update_modes,
         )
-        return _crud.require_dictionary_result(await self._call('update', params), 'update')
+        result: dict[str, object] = {'id': entity_id, 'type': entity_type}
+        if params['fields']:
+            result = _crud.require_dictionary_result(
+                await self._call('update', params),
+                'update',
+            )
+        return await self._upload_thumbnails_after_write(
+            entity_type, entity_id, thumbnails, result
+        )
 
     async def update_project_last_accessed(
         self,

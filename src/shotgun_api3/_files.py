@@ -34,6 +34,7 @@ _FILE_SERVE_ATTACHMENT = '/file_serve/attachment/'
 _MULTIPART_CHUNK_SIZE = 20_000_000
 _Origin: TypeAlias = tuple[str, str, int]
 _PART_LINK_FIELD_COUNT = 2
+_THUMBNAIL_UPLOAD_FIELDS = ('image', 'filmstrip_image')
 _UPLOAD_FILE = '/upload/upload_file'
 
 
@@ -992,8 +993,8 @@ def prepare_upload(options: UploadOptions) -> PreparedUpload:
         Captured filename, size, and options for one upload.
 
     Raises:
-        ShotgunError: If the path does not name a nonempty file or `created_at`
-            is not a datetime.
+        ShotgunError: If the path does not name a file, the file is empty, or
+            `created_at` is not a datetime.
     """
     created_at = cast('object', options.arguments.created_at)
     if created_at is not None and not isinstance(created_at, datetime.datetime):
@@ -1006,11 +1007,14 @@ def prepare_upload(options: UploadOptions) -> PreparedUpload:
         )
     path = Path(options.arguments.path)
     try:
-        file_size = path.stat().st_size if path.is_file() else 0
+        is_file = path.is_file()
+        file_size = path.stat().st_size if is_file else 0
     except OSError:
-        file_size = 0
+        is_file, file_size = False, 0
+    if not is_file:
+        raise ShotgunError(f"Path must be a valid file, got '{options.arguments.path}'")
     if file_size <= 0:
-        raise ShotgunError('File must exist and be non-empty')
+        raise ShotgunError(f"Path cannot be an empty file: '{options.arguments.path}'")
     return PreparedUpload(filename=path.name, file_size=file_size, options=options)
 
 
@@ -1047,6 +1051,41 @@ def resolve_attachment_url(attachment: object, base_url: str) -> str | None:
     elif type(attachment) is int:
         return f'{base_url.rstrip("/")}{_FILE_SERVE_ATTACHMENT}{attachment}'
     raise ShotgunError('attachment must be an id or dictionary')
+
+
+def split_thumbnail_uploads(
+    data: object,
+    *,
+    keep_image_none: bool,
+) -> tuple[object, dict[str, object]]:
+    """Separate `image` and `filmstrip_image` paths from entity field data.
+
+    Autodesk's client uploads these paths after the entity write instead of
+    sending them as field values.
+
+    Args:
+        data: Public field mapping. A non-dictionary is returned unchanged so
+            that the caller's own validation reports it.
+        keep_image_none: Whether an `image` value of `None` stays in the field
+            data, which lets an update clear both thumbnails.
+
+    Returns:
+        A copy of the field data without the separated fields, and the
+        non-empty paths to upload, with `image` before `filmstrip_image`.
+    """
+    if not isinstance(data, dict):
+        return data, {}
+    mapping = cast('dict[object, object]', data)
+    fields: dict[object, object] = {}
+    paths: dict[str, object] = {}
+    for name, value in mapping.items():
+        if name not in _THUMBNAIL_UPLOAD_FIELDS or (
+            keep_image_none and name == 'image' and value is None
+        ):
+            fields[name] = value
+        elif value:
+            paths[cast('str', name)] = value
+    return fields, {name: paths[name] for name in _THUMBNAIL_UPLOAD_FIELDS if name in paths}
 
 
 def thumbnail_source_ready(

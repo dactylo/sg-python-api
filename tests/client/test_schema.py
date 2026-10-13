@@ -1,18 +1,16 @@
 import copy
 import inspect
-import logging
 import re
-import threading
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Never, TypeAlias, cast
 
 import pytest
 
 from shotgun_api3 import _errors
 from shotgun_api3._client import Shotgun
-from shotgun_api3._config import CompatibilityWarningEvent, ObserverEvent, ResponseEvent
-from tests.conftest import _fake_client, _make_response, _sent_payload
+from shotgun_api3._config import ObserverEvent, ResponseEvent
+from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
 
 _SchemaReadCallable: TypeAlias = Callable[[dict[str, Any] | None], dict[str, object]]
 _SchemaEntityReadCallable: TypeAlias = Callable[[dict[str, Any] | None], dict[str, object]]
@@ -29,8 +27,8 @@ _SchemaFieldUpdateCallable: TypeAlias = Callable[
     bool,
 ]
 _SchemaFieldDeleteCallable: TypeAlias = Callable[[str, str], bool]
-_SchemaCallable: TypeAlias = Callable[[str], dict[str, object]]
-_EntityTypesCallable: TypeAlias = Callable[[], dict[str, object]]
+_SchemaCallable: TypeAlias = Callable[[str], Never]
+_EntityTypesCallable: TypeAlias = Callable[[], Never]
 
 if TYPE_CHECKING:
     _STATIC_CLIENT = cast('Shotgun', object())
@@ -63,276 +61,32 @@ def _run_result_contract_case(sg: Shotgun, method_name: str) -> object:
     return sg.schema_field_delete('Shot', 'sg_label')
 
 
-def test_alias_warning_context_is_thread_local(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    alias_events: list[ObserverEvent] = []
-    direct_events: list[ObserverEvent] = []
-    errors: list[AssertionError | RuntimeError | _errors.ShotgunError] = []
-    caught_warnings: list[warnings.WarningMessage] = []
-    delegate_entered = threading.Event()
-    release_delegate = threading.Event()
-    alias_sg = _fake_client([_make_response({'Alias': {}})])
-    direct_sg = _fake_client([_make_response({'Direct': {}})])
-    original = alias_sg.schema_entity_read
-    alias_sg.config.on_compatibility_warning = alias_events.append
-    direct_sg.config.on_compatibility_warning = direct_events.append
-
-    def blocked_delegate() -> dict[str, object]:
-        delegate_entered.set()
-        assert release_delegate.wait(timeout=5)
-        return original()
-
-    def run_alias() -> None:
-        try:
-            with warnings.catch_warnings(record=True) as recorded:
-                warnings.simplefilter('always', DeprecationWarning)
-                assert alias_sg.entity_types() == {'Alias': {}}
-                caught_warnings.extend(recorded)
-        except (AssertionError, RuntimeError, _errors.ShotgunError) as exc:
-            errors.append(exc)
-
-    monkeypatch.setattr(alias_sg, 'schema_entity_read', blocked_delegate)
-    thread = threading.Thread(target=run_alias, daemon=True)
-    thread.start()
-    assert delegate_entered.wait(timeout=5)
-
-    assert direct_sg.schema_entity_read() == {'Direct': {}}
-    release_delegate.set()
-    thread.join(timeout=5)
-
-    assert not thread.is_alive()
-    assert errors == []
-    assert [warning.category for warning in caught_warnings] == [DeprecationWarning]
-    assert direct_events == []
-    assert alias_events == [
-        CompatibilityWarningEvent(
-            code='deprecated-entity-types-alias',
-            message='The entity_types alias is deprecated.',
-        )
-    ]
-
-
-def test_alias_warning_is_consumed_before_observer_reentry() -> None:
-    events: list[ObserverEvent] = []
-    sg = _fake_client([_make_response({'nested': {}}), _make_response({'outer': {}})])
-
-    def reenter(event: ObserverEvent) -> None:
-        events.append(event)
-        assert sg.schema_field_read('Asset') == {'nested': {}}
-
-    sg.config.on_compatibility_warning = reenter
-
-    with pytest.warns(
-        DeprecationWarning,
-        match=r'^schema\(\) is deprecated; use schema_field_read\(\)$',
-    ):
-        assert sg.schema('Shot') == {'outer': {}}
-
-    assert events == [
-        CompatibilityWarningEvent(
-            code='deprecated-schema-alias',
-            message='The schema alias is deprecated.',
-        )
-    ]
-
-
-def test_alias_warning_is_consumed_only_by_originating_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    alias_events: list[ObserverEvent] = []
-    direct_events: list[ObserverEvent] = []
-    alias_sg = _fake_client([_make_response({'Alias': {}})])
-    direct_sg = _fake_client([_make_response({'Direct': {}})])
-    original = alias_sg.schema_entity_read
-    alias_sg.config.on_compatibility_warning = alias_events.append
-    direct_sg.config.on_compatibility_warning = direct_events.append
-
-    def interleaved_delegate() -> dict[str, object]:
-        assert direct_sg.schema_entity_read() == {'Direct': {}}
-        return original()
-
-    monkeypatch.setattr(alias_sg, 'schema_entity_read', interleaved_delegate)
-
-    with pytest.warns(
-        DeprecationWarning,
-        match=r'^entity_types\(\) is deprecated; use schema_entity_read\(\)$',
-    ):
-        assert alias_sg.entity_types() == {'Alias': {}}
-
-    assert direct_events == []
-    assert alias_events == [
-        CompatibilityWarningEvent(
-            code='deprecated-entity-types-alias',
-            message='The entity_types alias is deprecated.',
-        )
-    ]
-
-
-def test_alias_warning_scope_cleans_up_when_public_delegate_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[ObserverEvent] = []
-    sg = _fake_client([_make_response({'Shot': {}})])
-    original = sg.schema_entity_read
-    sg.config.on_compatibility_warning = events.append
-
-    def fail() -> dict[str, object]:
-        raise RuntimeError('delegate failed')
-
-    monkeypatch.setattr(sg, 'schema_entity_read', fail)
-    with (
-        pytest.warns(
-            DeprecationWarning,
-            match=r'^entity_types\(\) is deprecated; use schema_entity_read\(\)$',
-        ),
-        pytest.raises(RuntimeError, match=r'^delegate failed$'),
-    ):
-        sg.entity_types()
-    monkeypatch.setattr(sg, 'schema_entity_read', original)
-
-    assert sg.schema_entity_read() == {'Shot': {}}
-    assert events == []
-
-
-@pytest.mark.parametrize('alias_name', ['schema', 'entity_types'])
-def test_deprecated_alias_observer_failures_are_non_invasive_and_sanitized(
-    alias_name: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    def fail(_event: ObserverEvent) -> None:
-        raise RuntimeError('observer-secret')
-
-    sg = _fake_client([_make_response({'result': 'ok'})])
-    sg.config.on_compatibility_warning = fail
-    alias = getattr(sg, alias_name)
-    warning_message = (
-        'schema() is deprecated; use schema_field_read()'
-        if alias_name == 'schema'
-        else 'entity_types() is deprecated; use schema_entity_read()'
-    )
-
-    with (
-        caplog.at_level(logging.WARNING, logger='shotgun_api3'),
-        pytest.warns(DeprecationWarning, match=rf'^{re.escape(warning_message)}$'),
-    ):
-        result = alias('Shot') if alias_name == 'schema' else alias()
-
-    assert result == {'result': 'ok'}
-    assert 'observer-secret' not in caplog.text
-
-
 @pytest.mark.parametrize(
-    ('alias_name', 'code', 'message'),
+    ('method_name', 'args', 'message'),
     [
-        ('schema', 'deprecated-schema-alias', 'schema() is deprecated; use schema_field_read()'),
-        (
-            'entity_types',
-            'deprecated-entity-types-alias',
-            'entity_types() is deprecated; use schema_entity_read()',
-        ),
+        ('entity_types', (), 'Deprecated: use schema_entity_read() instead'),
+        ('schema', ('Shot',), "Deprecated: use schema_field_read('Shot') instead"),
+        ('schema', (7,), "Deprecated: use schema_field_read('7') instead"),
     ],
 )
-def test_deprecated_aliases_warn_and_emit_redacted_structured_events(
-    alias_name: str,
-    code: str,
+def test_deprecated_aliases_raise_before_io(
+    method_name: str,
+    args: tuple[object, ...],
     message: str,
 ) -> None:
     events: list[ObserverEvent] = []
-    response: dict[str, object] = {'caller-secret-result': {}}
-    sg = _fake_client([_make_response(response)])
+    sg = _fake_client([])
     sg.config.on_compatibility_warning = events.append
-    alias = getattr(sg, alias_name)
+    alias = cast('Callable[..., object]', getattr(sg, method_name))
 
-    with pytest.warns(DeprecationWarning, match=rf'^{re.escape(message)}$'):
-        result = alias('caller-secret-type') if alias_name == 'schema' else alias()
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with pytest.raises(_errors.ShotgunError, match=f'^{re.escape(message)}$') as raised:
+            alias(*args)
 
-    assert result == response
-    assert events == [
-        CompatibilityWarningEvent(
-            code=cast('Any', code),
-            message=(
-                'The schema alias is deprecated.'
-                if alias_name == 'schema'
-                else 'The entity_types alias is deprecated.'
-            ),
-        )
-    ]
-    serialized = repr(events)
-    for secret in (
-        'caller-secret-type',
-        'caller-secret-result',
-        'script_name',
-        'script_key',
-        'https://',
-    ):
-        assert secret not in serialized
-
-
-def test_entity_types_alias_calls_public_target_with_ordinary_arguments(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[ObserverEvent] = []
-    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    sg = _fake_client([_make_response({'Shot': {}})])
-    original = sg.schema_entity_read
-    sg.config.on_compatibility_warning = events.append
-
-    def spy(*args: object, **kwargs: object) -> dict[str, object]:
-        calls.append((args, kwargs))
-        return original()
-
-    monkeypatch.setattr(sg, 'schema_entity_read', spy)
-
-    with pytest.warns(
-        DeprecationWarning,
-        match=r'^entity_types\(\) is deprecated; use schema_entity_read\(\)$',
-    ):
-        result = sg.entity_types()
-
-    assert result == {'Shot': {}}
-    assert calls == [((), {})]
-    assert events == [
-        CompatibilityWarningEvent(
-            code='deprecated-entity-types-alias',
-            message='The entity_types alias is deprecated.',
-        )
-    ]
-
-
-def test_schema_alias_calls_public_target_with_ordinary_arguments(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[ObserverEvent] = []
-    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
-    sg = _fake_client([_make_response({'code': {}})])
-    original = sg.schema_field_read
-    sg.config.on_compatibility_warning = events.append
-
-    def spy(
-        entity_type: str,
-        *args: object,
-        **kwargs: object,
-    ) -> dict[str, object]:
-        calls.append((entity_type, args, kwargs))
-        return original(entity_type)
-
-    monkeypatch.setattr(sg, 'schema_field_read', spy)
-
-    with pytest.warns(
-        DeprecationWarning,
-        match=r'^schema\(\) is deprecated; use schema_field_read\(\)$',
-    ):
-        result = sg.schema('Shot')
-
-    assert result == {'code': {}}
-    assert calls == [('Shot', (), {})]
-    assert events == [
-        CompatibilityWarningEvent(
-            code='deprecated-schema-alias',
-            message='The schema alias is deprecated.',
-        )
-    ]
+    assert type(raised.value) is _errors.ShotgunError
+    assert events == []
+    assert not _fake_transport(sg).requests
 
 
 def test_schema_field_create_builds_properties_without_mutation() -> None:
@@ -496,14 +250,14 @@ def test_schema_field_update_builds_properties_and_project() -> None:
             ('self', 'entity_type'),
             (inspect.Parameter.empty, inspect.Parameter.empty),
             (inspect.Parameter.empty, str),
-            dict[str, object],
+            Never,
         ),
         (
             'entity_types',
             ('self',),
             (inspect.Parameter.empty,),
             (inspect.Parameter.empty,),
-            dict[str, object],
+            Never,
         ),
     ],
 )

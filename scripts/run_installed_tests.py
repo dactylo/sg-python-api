@@ -144,7 +144,7 @@ _EXPECTED_URLS = {
     'Issues': 'https://github.com/dactylo/sg-python-api/issues',
     'Repository': 'https://github.com/dactylo/sg-python-api',
 }
-_EXPECTED_VERSION = '0.1.0'
+_EXPECTED_VERSION = '0.1.1'
 _PACKAGE_NAME = 'shotgun_api3'
 _Mode = Literal['async', 'base']
 

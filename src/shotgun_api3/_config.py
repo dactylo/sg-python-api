@@ -21,11 +21,7 @@ from ._sentinel import Unset as _Unset
 from ._transport import TimeoutConfig
 from ._version import PACKAGE_VERSION
 
-CompatibilityWarningCode: TypeAlias = Literal[
-    'deprecated-entity-types-alias',
-    'deprecated-schema-alias',
-    'legacy-infinite-timeout',
-]
+CompatibilityWarningCode: TypeAlias = Literal['legacy-infinite-timeout']
 EventRoute: TypeAlias = Literal[
     'allocation',
     'download',
@@ -85,8 +81,6 @@ _ORIGIN_FIELDS = frozenset({'api_path', 'scheme', 'server'})
 _ORIGIN_STRING_FIELDS = frozenset({'scheme', 'server'})
 _UNSET: Final = _Unset()
 _WARNING_MESSAGES: Mapping[CompatibilityWarningCode, str] = {
-    'deprecated-entity-types-alias': 'The entity_types alias is deprecated.',
-    'deprecated-schema-alias': 'The schema alias is deprecated.',
     'legacy-infinite-timeout': 'Explicit None timeout enables legacy infinite waits.',
 }
 _PUBLIC_FIELDS = frozenset(
@@ -1021,19 +1015,17 @@ def auth_spec(config: Config) -> _protocol.AuthSpec:
 
 
 def compatibility_warning_events(
-    warning_codes: tuple[CompatibilityWarningCode, ...],
     timeout: TimeoutConfig,
 ) -> tuple[CompatibilityWarningEvent, ...]:
     """Build fixed-message compatibility warnings for one operation.
 
     Args:
-        warning_codes: Sanitized compatibility notices from the client.
         timeout: Captured operation timeout semantics.
 
     Returns:
         Immutable compatibility-warning events in publication order.
     """
-    codes = list(warning_codes)
+    codes: list[CompatibilityWarningCode] = []
     if timeout.connect is None and timeout.read is None:
         codes.append('legacy-infinite-timeout')
     return tuple(

@@ -14,7 +14,6 @@ from shotgun_api3 import _driver as driver_module
 from shotgun_api3 import _errors, _protocol
 from shotgun_api3 import _transport as transport_module
 from shotgun_api3._config import (
-    CompatibilityWarningCode,
     CompatibilityWarningEvent,
     Config,
     ObserverEvent,
@@ -436,34 +435,6 @@ def test_callbacks_and_sleep_run_without_configuration_lock() -> None:
     assert transitions.count('observe') == 3
 
 
-@pytest.mark.parametrize(
-    'code',
-    ['deprecated-schema-alias', 'deprecated-entity-types-alias'],
-)
-def test_compatibility_warnings_include_alias_and_infinite_timeout_codes(
-    code: CompatibilityWarningCode,
-) -> None:
-    events: list[ObserverEvent] = []
-    config = _config()
-    config.update_fields(timeout_secs=None, on_compatibility_warning=events.append)
-    fake = _FakeTransport([_INFO])
-
-    result = Driver(fake, _DriverTiming(sleep=lambda _delay: None)).call(
-        'info',
-        {},
-        config_module.snapshot(config),
-        compatibility_warning_codes=(code,),
-    )
-
-    assert result == {'version': [8, 0]}
-    assert [cast('CompatibilityWarningEvent', event).code for event in events] == [
-        code,
-        'legacy-infinite-timeout',
-    ]
-    assert 'script' not in repr(events)
-    assert 'key' not in repr(events)
-
-
 def test_consumer_base_exception_closes_once_then_emits_terminal_response() -> None:
     order: list[str] = []
     events: list[ObserverEvent] = []
@@ -630,6 +601,26 @@ def test_generic_consumer_reports_progress_and_enforces_cumulative_total_deadlin
     progress = [event for event in events if isinstance(event, ProgressEvent)]
     assert [event.bytes_transferred for event in progress] == [1, 2]
     assert len(fake.requests) == 1
+
+
+def test_infinite_timeout_publishes_sanitized_compatibility_warning() -> None:
+    events: list[ObserverEvent] = []
+    config = _config()
+    config.update_fields(timeout_secs=None, on_compatibility_warning=events.append)
+    fake = _FakeTransport([_INFO])
+
+    result = Driver(fake, _DriverTiming(sleep=lambda _delay: None)).call(
+        'info',
+        {},
+        config_module.snapshot(config),
+    )
+
+    assert result == {'version': [8, 0]}
+    assert [cast('CompatibilityWarningEvent', event).code for event in events] == [
+        'legacy-infinite-timeout',
+    ]
+    assert 'script' not in repr(events)
+    assert 'key' not in repr(events)
 
 
 def test_info_retries_without_changing_protocol_classification() -> None:

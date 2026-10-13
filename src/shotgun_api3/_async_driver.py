@@ -15,7 +15,6 @@ from typing import Protocol, TypeVar, cast
 from . import _protocol, _transport
 from ._async_transport import AsyncTransport
 from ._config import (
-    CompatibilityWarningCode,
     EventRoute,
     ObserverCallback,
     Outcome,
@@ -200,14 +199,11 @@ class AsyncExecutionOptions:
     """Control async executor transport choreography.
 
     Attributes:
-        compatibility_warning_codes: Compatibility warnings emitted before
-            attempts.
         logical_method_name: Optional observer-facing operation name.
         redirect_factory: Optional request factory for redirect responses.
         streaming: Whether the response body is consumed as a stream.
     """
 
-    compatibility_warning_codes: tuple[CompatibilityWarningCode, ...] = ()
     logical_method_name: str | None = None
     redirect_factory: Callable[['AsyncLiveResponse'], TransportRequest] | None = None
     streaming: bool = False
@@ -486,10 +482,7 @@ class AsyncDriver:
                 consumption, or cleanup fails.
         """
         execution_options = options or AsyncExecutionOptions()
-        for event in compatibility_warning_events(
-            execution_options.compatibility_warning_codes,
-            context.timeout,
-        ):
+        for event in compatibility_warning_events(context.timeout):
             notify_observer(context.on_compatibility_warning, event)
         route = event_route(operation)
         self._transport.checkout()
@@ -590,7 +583,6 @@ class AsyncDriver:
         params: object,
         context: RequestContext,
         include_auth: bool = True,
-        compatibility_warning_codes: tuple[CompatibilityWarningCode, ...] = (),
         *,
         _logical_method_name: str | None = None,
     ) -> object:
@@ -601,7 +593,6 @@ class AsyncDriver:
             params: Normalized method parameters.
             context: Immutable operation configuration.
             include_auth: Whether to include captured authentication.
-            compatibility_warning_codes: Sanitized compatibility notices.
             _logical_method_name: Optional logical operation name when it
                 differs from the wire method.
 
@@ -615,10 +606,7 @@ class AsyncDriver:
                 consumption, or cleanup fails.
         """
         normalized_params = copy.deepcopy(params)
-        options = AsyncExecutionOptions(
-            compatibility_warning_codes=compatibility_warning_codes,
-            logical_method_name=_logical_method_name,
-        )
+        options = AsyncExecutionOptions(logical_method_name=_logical_method_name)
         return await self._execute_rpc(
             method_name,
             normalized_params,

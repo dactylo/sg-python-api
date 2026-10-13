@@ -197,14 +197,6 @@ _EXPECTATIONS = {
         "self.assertRaises(shotgun_api3.ShotgunError, self.sg.export_page, None, 'csv', "
         "layout_name='Conformance')\n"
     ),
-    'TestShotgunApi.test_deprecated_functions': (
-        'with self.assertWarns(DeprecationWarning):\n'
-        '    entity_schema = self.sg.entity_types()\n'
-        'self.assertEqual(entity_schema, self.sg.schema_entity_read())\n'
-        'with self.assertWarns(DeprecationWarning):\n'
-        "    field_schema = self.sg.schema('Asset')\n"
-        "self.assertEqual(field_schema, self.sg.schema_field_read('Asset'))\n"
-    ),
 }
 _SCHEMA_INPUTS = {
     'TestFind.test_zero_is_not_none': (

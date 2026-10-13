@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -66,7 +66,7 @@ if [ "${1:-}" = '-m' ] && [ "${2:-}" = 'installer' ]; then
     [ -n "$destination" ]
     package_root="$destination/opt/custom/lib/python3.13/site-packages"
     mkdir -p "$package_root/shotgun_api3"
-    printf '%s\n' "__version__ = '0.1.0'" >"$package_root/shotgun_api3/__init__.py"
+    printf '%s\n' "__version__ = '0.1.1'" >"$package_root/shotgun_api3/__init__.py"
     exit 0
 fi
 
@@ -134,7 +134,7 @@ _SEPARATOR = (
     '------------------ | --------------------- | ------ | ------ | '
     '------- | ----- |'
 )
-_WHEEL_NAME = 'sg_python_api-0.1.0-py3-none-any.whl'
+_WHEEL_NAME = 'sg_python_api-0.1.1-py3-none-any.whl'
 
 
 def _credential_env() -> dict[str, str]:
@@ -178,6 +178,21 @@ def _ledger_lines(candidate: Path) -> list[str]:
     return ledger.read_text(encoding='ascii').splitlines()
 
 
+def _ledger_rows(
+    run_dates: tuple[date, date],
+    candidate_commit: str,
+    wheel_hash: str,
+    tally: str,
+) -> set[str]:
+    # The gate stamps its own UTC date between the two bounds, so it matches one of them even
+    # when a run crosses midnight.
+    return {
+        f'| {day.isoformat()} | {candidate_commit} | 0.1.1 | {wheel_hash} | '
+        f'v3.10.2 | db056df3fb663efa6a69a2c07d2d0b69db35c336 | {tally} |'
+        for day in run_dates
+    }
+
+
 def _run_driver_collection(
     tmp_path: Path,
     module_name: str,
@@ -193,7 +208,7 @@ def _run_driver_collection(
     package_root = site_packages / 'shotgun_api3'
     library_root = package_root / 'lib'
     library_root.mkdir(parents=True)
-    (package_root / '__init__.py').write_text("__version__ = '0.1.0'\n", encoding='ascii')
+    (package_root / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
     (library_root / '__init__.py').write_text('', encoding='ascii')
     if module_present:
         module_basename = module_name.rsplit('.', maxsplit=1)[1]
@@ -220,7 +235,7 @@ def _run_driver_collection(
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.0',
+            '0.1.1',
         ],
         capture_output=True,
         text=True,
@@ -244,13 +259,13 @@ def _write_wheel_fixture(candidate: Path) -> str:
     wheel = candidate / 'dist' / 'validated-artifacts' / 'source' / _WHEEL_NAME
     wheel.parent.mkdir(parents=True)
     metadata = zipfile.ZipInfo(
-        'sg_python_api-0.1.0.dist-info/METADATA',
+        'sg_python_api-0.1.1.dist-info/METADATA',
         date_time=(1980, 1, 1, 0, 0, 0),
     )
     with zipfile.ZipFile(wheel, mode='w') as archive:
         archive.writestr(
             metadata,
-            'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.0\n',
+            'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.1\n',
         )
     return hashlib.sha256(wheel.read_bytes()).hexdigest()
 
@@ -346,19 +361,19 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
     site_packages = install_root / 'lib' / 'python' / 'site-packages'
     candidate = site_packages / 'shotgun_api3'
     candidate.mkdir(parents=True)
-    (candidate / '__init__.py').write_text("__version__ = '0.1.0'\n", encoding='ascii')
+    (candidate / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
 
     competing_site = tmp_path / 'competing-site'
     competitor = competing_site / 'shotgun_api3'
     competitor.mkdir(parents=True)
-    (competitor / '__init__.py').write_text("__version__ = '0.1.0'\n", encoding='ascii')
+    (competitor / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
 
     tests_root = tmp_path / 'tests'
     tests_root.mkdir()
     (tests_root / 'test_candidate.py').write_text(
         'def test_candidate_is_importable():\n'
         '    import shotgun_api3\n'
-        "    assert shotgun_api3.__version__ == '0.1.0'\n",
+        "    assert shotgun_api3.__version__ == '0.1.1'\n",
         encoding='ascii',
     )
     results_xml = tmp_path / 'results.xml'
@@ -382,7 +397,7 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.0',
+            '0.1.1',
         ],
         capture_output=True,
         text=True,
@@ -548,7 +563,9 @@ def test_pytest_failures_produce_a_valid_sanitized_tally(tmp_path: Path) -> None
     candidate_commit = _git(candidate, 'rev-parse', 'HEAD').stdout.strip()
     ledger_before = _ledger_lines(candidate)
 
+    started = datetime.now(UTC).date()
     result = _run_gate(candidate, env)
+    run_dates = (started, datetime.now(UTC).date())
 
     assert result.returncode == 1, result.stderr
     assert 'passed: 1\nfailed: 2\nskipped: 1\n' in result.stdout
@@ -558,11 +575,8 @@ def test_pytest_failures_produce_a_valid_sanitized_tally(tmp_path: Path) -> None
     assert 'human-secret' not in combined_output
     ledger_after = _ledger_lines(candidate)
     assert ledger_after[:-1] == ledger_before
-    assert ledger_after[-1] == (
-        f'| {datetime.now(UTC).date().isoformat()} | {candidate_commit} | 0.1.0 | '
-        f'{wheel_hash} | '
-        'v3.10.2 | db056df3fb663efa6a69a2c07d2d0b69db35c336 | 1 | 2 | 1 | '
-        'FAIL (pytest exit 1) |'
+    assert ledger_after[-1] in _ledger_rows(
+        run_dates, candidate_commit, wheel_hash, '1 | 2 | 1 | FAIL (pytest exit 1)'
     )
     assert 'RAW AUTODESK' not in ledger_after[-1]
     assert 'script-secret' not in ledger_after[-1]
@@ -624,20 +638,14 @@ def test_success_creates_a_missing_ledger(tmp_path: Path) -> None:
     (candidate / 'dist' / 'conformance-results.md').unlink()
     candidate_commit = _git(candidate, 'rev-parse', 'HEAD').stdout.strip()
 
+    started = datetime.now(UTC).date()
     result = _run_gate(candidate, env)
+    run_dates = (started, datetime.now(UTC).date())
 
     assert result.returncode == 0, result.stderr
-    assert _ledger_lines(candidate) == [
-        '# Conformance results',
-        '',
-        _HEADER,
-        _SEPARATOR,
-        (
-            f'| {datetime.now(UTC).date().isoformat()} | {candidate_commit} | 0.1.0 | '
-            f'{wheel_hash} | '
-            'v3.10.2 | db056df3fb663efa6a69a2c07d2d0b69db35c336 | 2 | 0 | 1 | PASS |'
-        ),
-    ]
+    ledger = _ledger_lines(candidate)
+    assert ledger[:-1] == ['# Conformance results', '', _HEADER, _SEPARATOR]
+    assert ledger[-1] in _ledger_rows(run_dates, candidate_commit, wheel_hash, '2 | 0 | 1 | PASS')
 
 
 def test_success_prints_only_sanitized_tally_and_cleans_workspace(
@@ -653,12 +661,14 @@ def test_success_prints_only_sanitized_tally_and_cleans_workspace(
     candidate_commit = _git(candidate, 'rev-parse', 'HEAD').stdout.strip()
     ledger_before = _ledger_lines(candidate)
 
+    started = datetime.now(UTC).date()
     result = _run_gate(candidate, env)
+    run_dates = (started, datetime.now(UTC).date())
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         f'candidate commit: {candidate_commit}',
-        'candidate version: 0.1.0',
+        'candidate version: 0.1.1',
         f'artifact sha256: {wheel_hash}',
         'official suite ref: v3.10.2',
         'official suite commit: db056df3fb663efa6a69a2c07d2d0b69db35c336',
@@ -672,10 +682,8 @@ def test_success_prints_only_sanitized_tally_and_cleans_workspace(
     assert 'human-secret' not in combined_output
     ledger_after = _ledger_lines(candidate)
     assert ledger_after[:-1] == ledger_before
-    assert ledger_after[-1] == (
-        f'| {datetime.now(UTC).date().isoformat()} | {candidate_commit} | 0.1.0 | '
-        f'{wheel_hash} | '
-        'v3.10.2 | db056df3fb663efa6a69a2c07d2d0b69db35c336 | 2 | 0 | 1 | PASS |'
+    assert ledger_after[-1] in _ledger_rows(
+        run_dates, candidate_commit, wheel_hash, '2 | 0 | 1 | PASS'
     )
     assert 'RAW AUTODESK' not in ledger_after[-1]
     assert 'script-secret' not in ledger_after[-1]

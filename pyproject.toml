@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-python-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client for Autodesk Flow Production Tracking"
 keywords = [ "api", "flow-production-tracking", "shotgrid", "shotgun", "shotgun-api3" ]
 license = "MIT"

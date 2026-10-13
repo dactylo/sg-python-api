@@ -168,13 +168,8 @@ import logging
 logging.getLogger('httpx2').setLevel(logging.WARNING)
 ```
 
-Compatibility warnings use stable codes and fixed messages:
-
-| Code                            | Emitted when                                                                            |
-| ------------------------------- | --------------------------------------------------------------------------------------- |
-| `deprecated-entity-types-alias` | The application calls `entity_types()`, the deprecated alias of `schema_entity_read()`. |
-| `deprecated-schema-alias`       | The application calls `schema()`, the deprecated alias of `schema_field_read()`.        |
-| `legacy-infinite-timeout`       | An operation runs with `sg.config.timeout_secs` set to `None`.                          |
+Compatibility warnings use stable codes and fixed messages. The client emits one code,
+`legacy-infinite-timeout`, when an operation runs with `sg.config.timeout_secs` set to `None`.
 
 ### Callback threads and failures
 

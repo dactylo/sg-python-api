@@ -12,7 +12,6 @@ from typing import Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from . import _protocol, _transport
 from ._config import (
-    CompatibilityWarningCode,
     EventRoute,
     ObserverCallback,
     Outcome,
@@ -181,14 +180,11 @@ class ExecutionOptions:
     """Control executor behavior that is not part of retry classification.
 
     Attributes:
-        compatibility_warning_codes: Compatibility warnings emitted before
-            attempts.
         logical_method_name: Optional observer-facing operation name.
         redirect_factory: Optional request factory for redirect responses.
         streaming: Whether the response body is consumed as a stream.
     """
 
-    compatibility_warning_codes: tuple[CompatibilityWarningCode, ...] = ()
     logical_method_name: str | None = None
     redirect_factory: 'Callable[[LiveResponse], TransportRequest] | None' = None
     streaming: bool = False
@@ -443,13 +439,9 @@ class Driver:
             raise AssertionError('response consumption ended without an outcome')
         return attempt_result
 
-    def _emit_warnings(
-        self,
-        context: RequestContext,
-        warning_codes: tuple[CompatibilityWarningCode, ...],
-    ) -> None:
+    def _emit_warnings(self, context: RequestContext) -> None:
         """Publish fixed-message compatibility warnings."""
-        for event in compatibility_warning_events(warning_codes, context.timeout):
+        for event in compatibility_warning_events(context.timeout):
             notify_observer(context.on_compatibility_warning, event)
 
     def _execute_rpc(
@@ -623,7 +615,6 @@ class Driver:
         params: object,
         context: RequestContext,
         include_auth: bool = True,
-        compatibility_warning_codes: tuple[CompatibilityWarningCode, ...] = (),
         *,
         _logical_method_name: str | None = None,
     ) -> object:
@@ -635,8 +626,6 @@ class Driver:
             context: Immutable operation configuration.
             include_auth: Whether to include the captured authentication
                 payload.
-            compatibility_warning_codes: Sanitized compatibility notices
-                attached by the client surface.
             _logical_method_name: Optional logical operation name when it
                 differs from the wire method.
 
@@ -648,10 +637,7 @@ class Driver:
                 response contract (`reason` and `content`).
         """
         normalized_params = copy.deepcopy(params)
-        options = ExecutionOptions(
-            compatibility_warning_codes=compatibility_warning_codes,
-            logical_method_name=_logical_method_name,
-        )
+        options = ExecutionOptions(logical_method_name=_logical_method_name)
         return self._execute_rpc(
             method_name,
             normalized_params,
@@ -745,7 +731,7 @@ class Driver:
             Exception: If status validation or response consumption fails.
         """
         execution_options = options or ExecutionOptions()
-        self._emit_warnings(context, execution_options.compatibility_warning_codes)
+        self._emit_warnings(context)
         route = event_route(operation)
         for attempt in range(1, context.max_rpc_attempts + 1):
             state = self._attempt_state(operation, context, route, attempt)

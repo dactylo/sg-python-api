@@ -37,7 +37,7 @@ def _run_result_contract_case(sg: Shotgun, operation: str) -> object:
     if operation == 'create':
         return sg.create('Shot', {})
     if operation == 'update':
-        return sg.update('Shot', 1, {})
+        return sg.update('Shot', 1, {'code': 'x'})
     if operation == 'delete':
         return sg.delete('Shot', 1)
     if operation == 'revive':
@@ -1220,7 +1220,6 @@ def test_result_annotations_preserve_only_validated_topology(
             {
                 "activity_stream_read('Shot', 1)": 'dict[str, object]',
                 "authenticate_human_user('user', 'password')": 'dict[str, object] | None',
-                'entity_types()': 'dict[str, object]',
                 'follow({}, {})': 'dict[str, object]',
                 'followers({})': 'list[dict[str, object]]',
                 'following({})': 'list[dict[str, object]]',
@@ -1229,7 +1228,6 @@ def test_result_annotations_preserve_only_validated_topology(
                 "nav_search_string('/', 'shot')": 'list[dict[str, object]]',
                 'note_thread_read(1)': 'list[dict[str, object]]',
                 'preferences_read()': 'dict[str, object]',
-                "schema('Shot')": 'dict[str, object]',
                 "summarize('Shot', [], [])": 'dict[str, object]',
                 "text_search('shot', {'Shot': []})": 'dict[str, object]',
                 'unfollow({}, {})': 'dict[str, object]',

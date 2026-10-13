@@ -26,21 +26,15 @@ these:
 
 Use your application's package manager to remove `shotgun-api3` and install `sg-python-api`. Both
 provide `shotgun_api3`, so they cannot coexist in one environment. In a pip-managed environment,
-use these commands when a release is available on your package index:
+run these commands from a checkout of `sg-python-api`:
 
 ```sh
 python -m pip uninstall shotgun-api3
-python -m pip install sg-python-api
-```
-
-To install from a checkout instead, run the second command there as:
-
-```sh
 python -m pip install .
 ```
 
-When the application needs native async support, install `sg-python-api[async]` from the index or
-`'.[async]'` from a checkout. Existing `import shotgun_api3` statements stay as they are.
+When the application needs native async support, run `python -m pip install '.[async]'` instead of
+the second command. Existing `import shotgun_api3` statements stay as they are.
 
 Next, [confirm which client loads](testing.md#verify-the-import-target) and run the
 [read-only smoke test](testing.md#run-a-read-only-smoke-test) with a test-site credential. A

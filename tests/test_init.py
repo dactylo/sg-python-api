@@ -285,7 +285,7 @@ def test_project_metadata() -> None:
     with pyproject_path.open('rb') as pyproject_file:
         project = tomllib.load(pyproject_file)['project']
 
-    assert shotgun_api3.__version__ == shotgun_module.__version__ == '0.1.0'
+    assert shotgun_api3.__version__ == shotgun_module.__version__ == '0.1.1'
     assert project['version'] == shotgun_api3.__version__
     assert project['license'] == 'MIT'
     assert project['urls'] == {

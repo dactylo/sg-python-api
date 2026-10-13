@@ -468,7 +468,7 @@ def test_config_defaults(
     assert config.pool_maxsize == 10
     assert config.records_per_page == 500
     assert config.user_agents == (
-        'shotgun-json (0.1.0)',
+        'shotgun-json (0.1.1)',
         f'Python {sys.version_info.major}.{sys.version_info.minor}',
         'sg-python-api',
     )
@@ -658,7 +658,7 @@ def test_locked_mutators_have_next_snapshot_visibility() -> None:
 
     config.reset_user_agent()
     assert config_module.snapshot(config).user_agent == '; '.join(
-        _protocol.default_user_agent('0.1.0')
+        _protocol.default_user_agent('0.1.1')
     )
 
 

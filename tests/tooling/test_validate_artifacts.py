@@ -67,7 +67,7 @@ fi
 
 if [[ ${1:-} == '-m' && ${2:-} == 'tarfile' && ${3:-} == '-e' ]]; then
     if [[ $4 == *.tar.gz ]]; then
-        mkdir -p -- "$5/sg_python_api-0.1.0"
+        mkdir -p -- "$5/sg_python_api-0.1.1"
         exit 0
     fi
     exec "$REAL_PYTHON" "$@"
@@ -82,9 +82,9 @@ if [[ ${1:-} == '-m' && ${2:-} == 'hatchling' ]]; then
         fi
     done
     mkdir -p -- "$output_dir"
-    printf '%s\n' 'wheel bytes' >"$output_dir/sg_python_api-0.1.0-py3-none-any.whl"
+    printf '%s\n' 'wheel bytes' >"$output_dir/sg_python_api-0.1.1-py3-none-any.whl"
     if [[ " $* " == *' sdist '* ]]; then
-        printf '%s\n' 'sdist bytes' >"$output_dir/sg_python_api-0.1.0.tar.gz"
+        printf '%s\n' 'sdist bytes' >"$output_dir/sg_python_api-0.1.1.tar.gz"
     fi
     exit 0
 fi
@@ -99,7 +99,7 @@ if [[ ${1:-} == '-I' && ${2:-} == */scripts/_sdist_contract.py && ${3:-} != '--a
         exit 1
     fi
     work_root=${4%/artifacts/*}
-    if [[ -e $work_root/sdist/sg_python_api-0.1.0 ]]; then
+    if [[ -e $work_root/sdist/sg_python_api-0.1.1 ]]; then
         printf '%s\n' 'sdist contract ran after extraction' >&2
         exit 1
     fi
@@ -130,7 +130,7 @@ exec "$REAL_PYTHON" "$@"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SDIST_CONTRACT = _REPO_ROOT / 'scripts' / '_sdist_contract.py'
 _SDIST_METADATA = b"""Metadata-Version: 2.4
-Version: 0.1.0
+Version: 0.1.1
 Name: sg-python-api
 Requires-Python: >=3.11
 License-Expression: MIT
@@ -151,11 +151,11 @@ Project-URL: Issues, https://github.com/dactylo/sg-python-api/issues
 Project-URL: Repository, https://github.com/dactylo/sg-python-api
 
 """
-_SDIST_NAME = 'sg_python_api-0.1.0.tar.gz'
+_SDIST_NAME = 'sg_python_api-0.1.1.tar.gz'
 _VALIDATOR = _REPO_ROOT / 'scripts' / 'validate_artifacts.sh'
 _WHEEL_METADATA = b"""Metadata-Version: 2.4
 Name: sg-python-api
-Version: 0.1.0
+Version: 0.1.1
 License-Expression: MIT
 License-File: LICENSE
 Requires-Python: >=3.11
@@ -175,7 +175,7 @@ Project-URL: Issues, https://github.com/dactylo/sg-python-api/issues
 Project-URL: Repository, https://github.com/dactylo/sg-python-api
 
 """
-_WHEEL_NAME = 'sg_python_api-0.1.0-py3-none-any.whl'
+_WHEEL_NAME = 'sg_python_api-0.1.1-py3-none-any.whl'
 
 
 def _git_bash() -> str:
@@ -381,7 +381,7 @@ def _valid_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             *(_sdist_file(f'src/{name}', contents) for name, contents in package_files.items()),
         ],
     )
-    dist_info = 'sg_python_api-0.1.0.dist-info'
+    dist_info = 'sg_python_api-0.1.1.dist-info'
     wheel_files = {
         **package_files,
         f'{dist_info}/METADATA': _WHEEL_METADATA,
@@ -512,13 +512,13 @@ def test_artifact_contract_rejects_nonpublic_members(
 def test_artifact_contract_rejects_record_mismatch(tmp_path: Path, field: str) -> None:
     source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
     with zipfile.ZipFile(source_wheel) as archive:
-        record = archive.read('sg_python_api-0.1.0.dist-info/RECORD')
+        record = archive.read('sg_python_api-0.1.1.dist-info/RECORD')
     if field == 'hash':
         damaged = record.replace(b'sha256=', b'sha256=x', 1)
     else:
         damaged = record.replace(b',12\r\n', b',999\r\n', 1)
         assert damaged != record
-    _replace_wheel_member(source_wheel, 'sg_python_api-0.1.0.dist-info/RECORD', damaged)
+    _replace_wheel_member(source_wheel, 'sg_python_api-0.1.1.dist-info/RECORD', damaged)
 
     with pytest.raises(AssertionError, match='RECORD entry differs'):
         contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
@@ -539,7 +539,7 @@ def test_artifact_contract_rejects_source_drift(tmp_path: Path, *, missing: bool
 
 def test_artifact_contract_rejects_unsupported_sdist_member(tmp_path: Path) -> None:
     source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    fifo = tarfile.TarInfo('sg_python_api-0.1.0/src/fifo')
+    fifo = tarfile.TarInfo('sg_python_api-0.1.1/src/fifo')
     fifo.type = tarfile.FIFOTYPE
     _write_sdist(sdist, [(fifo, None)])
 
@@ -1144,7 +1144,7 @@ def test_validator_runs_sdist_contract_from_candidate_export(tmp_path: Path) -> 
     helper, export_root, sdist_path = marker.read_text(encoding='ascii').splitlines()
     assert helper.endswith('/export/scripts/_sdist_contract.py')
     assert export_root.endswith('/export')
-    assert sdist_path.endswith('/artifacts/sg_python_api-0.1.0.tar.gz')
+    assert sdist_path.endswith('/artifacts/sg_python_api-0.1.1.tar.gz')
 
 
 @pytest.mark.parametrize('git_directory', ['cmd', 'bin', 'mingw64/bin', 'clangarm64/bin'])

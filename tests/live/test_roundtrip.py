@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+import zlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -17,6 +19,21 @@ pytestmark = pytest.mark.live
 
 def _local_now() -> datetime:
     return datetime.now(tz=UTC).astimezone().replace(microsecond=0)
+
+
+def _png(width: int, height: int) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body))
+
+    header = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
+    pixels = zlib.compress((b'\x00' + b'\x80\x40\x20' * width) * height)
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', header)
+        + chunk(b'IDAT', pixels)
+        + chunk(b'IEND', b'')
+    )
 
 
 def test_crud_roundtrip(
@@ -98,6 +115,36 @@ def test_paging_and_ordering_roundtrip(
 
     assert [entity['code'] for entity in first_page] == expected_codes[:2]
     assert [entity['code'] for entity in second_page] == expected_codes[2:]
+
+
+def test_thumbnail_paths_upload_on_create_and_update(
+    live_sg: Shotgun,
+    live_project: dict[str, object],
+    live_namespace: str,
+    live_resources: _LiveResources,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / f'{live_namespace}-thumbnail.png'
+    image.write_bytes(_png(64, 64))
+    strip = tmp_path / f'{live_namespace}-filmstrip.png'
+    strip.write_bytes(_png(480, 135))
+
+    shot = live_resources.create(
+        'Shot',
+        {'code': f'{live_namespace}-thumbnail', 'project': live_project, 'image': str(image)},
+    )
+    shot_id = shot['id']
+    assert isinstance(shot_id, int)
+    assert isinstance(shot['image'], str)
+    assert shot['image'].startswith('https://')
+
+    updated = live_sg.update('Shot', shot_id, {'filmstrip_image': str(strip)})
+    assert set(updated) == {'type', 'id', 'filmstrip_image'}
+    assert isinstance(updated['filmstrip_image'], str)
+    assert updated['filmstrip_image'].startswith('https://')
+
+    cleared = live_sg.update('Shot', shot_id, {'image': None})
+    assert cleared['image'] is None
 
 
 def test_upload_download_roundtrip(

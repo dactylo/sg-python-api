@@ -25,7 +25,7 @@ class _DistributionOriginStub:
     def __init__(self, origin: Path) -> None:
         self.files = [
             PackagePath('shotgun_api3/py.typed'),
-            PackagePath('sg_python_api-0.1.0.dist-info/METADATA'),
+            PackagePath('sg_python_api-0.1.1.dist-info/METADATA'),
         ]
         self._origin = origin
 
@@ -112,7 +112,7 @@ class _MainStageRecorder:
 
 
 class _VersionDistributionStub:
-    version = '0.1.0'
+    version = '0.1.1'
 
 
 def _arguments(mode: _Mode, target: Path, tests: Path) -> _Arguments:
@@ -392,7 +392,7 @@ def test_public_import_validation_rejects_missing_typing_marker(
     purelib = tmp_path / 'target-purelib'
     (purelib / 'shotgun_api3').mkdir(parents=True)
     package = ModuleType('shotgun_api3')
-    monkeypatch.setattr(package, '__version__', '0.1.0', raising=False)
+    monkeypatch.setattr(package, '__version__', '0.1.1', raising=False)
     imported_module = ModuleType('installed-public-module')
     distribution = cast('Distribution', _VersionDistributionStub())
 

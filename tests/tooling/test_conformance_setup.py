@@ -6,7 +6,6 @@ import runpy
 import subprocess
 import sys
 import unittest
-import warnings
 from pathlib import Path
 from typing import cast
 
@@ -19,7 +18,7 @@ _API_SOURCE = (
     'import unittest\nimport shotgun_api3\n'
     'class TestShotgunApi(unittest.TestCase):\n'
     '    def test_deprecated_functions(self):\n'
-    '        raise AssertionError("unadapted alias expectation")\n'
+    '        raise AssertionError("upstream alias expectation")\n'
     'class TestExportPage(unittest.TestCase):\n'
     '    def test_export_page_format_missing(self):\n'
     '        raise AssertionError("unadapted message expectation")\n'
@@ -53,24 +52,6 @@ class _ContractClient:
         if self.defect == 'wrong_error':
             raise ValueError('invalid export')
         raise ShotgunError('candidate-specific validation text')
-
-    def schema_entity_read(self) -> dict[str, object]:
-        return {'Asset': {}}
-
-    def entity_types(self) -> dict[str, object]:
-        self.calls.append('entity_types')
-        if self.defect != 'missing_warning':
-            warnings.warn('deprecated alias', DeprecationWarning, stacklevel=2)
-        return {} if self.defect == 'wrong_alias' else self.schema_entity_read()
-
-    def schema_field_read(self, entity: str) -> dict[str, object]:
-        assert entity == 'Asset'
-        return {'code': {}}
-
-    def schema(self, entity: str) -> dict[str, object]:
-        self.calls.append('schema')
-        warnings.warn('deprecated alias', DeprecationWarning, stacklevel=2)
-        return self.schema_field_read(entity)
 
 
 class _ContractCase(unittest.TestCase):
@@ -118,9 +99,7 @@ def test_contract_adaptations_reject_a_missing_test() -> None:
         setup._adapt_expectations(ast.parse('class TestMissing: pass'))
 
 
-@pytest.mark.parametrize(
-    'defect', ['', 'missing_warning', 'wrong_alias', 'missing_error', 'wrong_error']
-)
+@pytest.mark.parametrize('defect', ['', 'missing_error', 'wrong_error'])
 def test_contract_adaptations_still_detect_behavior_failures(tmp_path: Path, defect: str) -> None:
     tree = ast.parse(_API_SOURCE)
     setup._adapt_expectations(tree)
@@ -129,13 +108,12 @@ def test_contract_adaptations_still_detect_behavior_failures(tmp_path: Path, def
     namespace = runpy.run_path(str(path))
     client = _ContractClient(defect)
     result = unittest.TestResult()
-    for name in ('TestShotgunApi', 'TestExportPage'):
-        case_type = cast('type[unittest.TestCase]', namespace[name])
-        for case in unittest.defaultTestLoader.loadTestsFromTestCase(case_type):
-            assert isinstance(case, unittest.TestCase)
-            cast('_ContractCase', case).sg = client
-            case.run(result)
-    assert result.testsRun == 3
+    case_type = cast('type[unittest.TestCase]', namespace['TestExportPage'])
+    for case in unittest.defaultTestLoader.loadTestsFromTestCase(case_type):
+        assert isinstance(case, unittest.TestCase)
+        cast('_ContractCase', case).sg = client
+        case.run(result)
+    assert result.testsRun == 2
     assert result.wasSuccessful() is (not defect)
     assert not result.skipped
     assert client.calls.count('export_page') >= 2
@@ -195,7 +173,7 @@ def test_preparation_installs_restoration_and_contract_adaptations(
 
     runtime = Path(setup.__file__).with_name('_conformance_runtime.py')
     assert (tmp_path / 'conftest.py').read_bytes() == runtime.read_bytes()
-    assert 'self.assertWarns(DeprecationWarning)' in api.read_text()
+    assert 'upstream alias expectation' in api.read_text()
     assert 'unadapted' not in api.read_text()
     assert 'self._conformance_number_field' in api.read_text()
     assert 'self._conformance_visibility_label' in api.read_text()

@@ -33,14 +33,7 @@ requests to a remote site require HTTPS.
 exactly one of them in a Python environment. If the official client is already installed, follow
 the [migration steps](docs/migration-guide.md#install-the-replacement) to replace it.
 
-When a release is available on your package index, install into the Python environment that runs
-your application:
-
-```sh
-python -m pip install sg-python-api
-```
-
-To install from a checkout instead, run:
+From a checkout, install into the Python environment that runs your application:
 
 ```sh
 python -m pip install .
@@ -49,12 +42,6 @@ python -m pip install .
 The base installation provides the synchronous `Shotgun` client and both `mockgun` test clients. To
 use the native asynchronous client, `AsyncShotgun`, install the `async` extra, which adds the
 `httpx2` HTTP library:
-
-```sh
-python -m pip install 'sg-python-api[async]'
-```
-
-From a checkout, use:
 
 ```sh
 python -m pip install '.[async]'

@@ -137,9 +137,8 @@ API tests without the official client's legacy transport. Individual tests tied 
 private methods, bundled `httplib2`, or unsupported server versions are explicitly skipped. Their
 exact names and reasons are recorded in `scripts/_conformance_setup.py`; unexpected imports still
 fail. Four tests use a reduced setup because their assertions do not require the legacy transport
-mocks. Three test methods have explicit expectation adaptations: deprecated aliases must return the
-documented schema and emit a warning, and invalid export arguments must raise `ShotgunError`
-without requiring Autodesk's exact message text.
+mocks. Two test methods have explicit expectation adaptations: invalid export arguments must raise
+`ShotgunError` without requiring Autodesk's exact message text.
 
 The runtime fixtures snapshot and restore the existing user fields, custom schema and visibility,
 and schedule exceptions changed by the tests. The two schema tests use unique field names on each

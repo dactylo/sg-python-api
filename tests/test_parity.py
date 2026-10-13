@@ -115,7 +115,6 @@ class _Scenario:
     expected_response_outcomes: tuple[str, ...] = ('success', 'success')
     expected_sleeps: tuple[float, ...] = ()
     expected_warning_codes: tuple[CompatibilityWarningCode, ...] = ()
-    expected_deprecation_messages: tuple[str, ...] = ()
     expected_operation_auth: dict[str, object] | None = None
     legacy_infinite_timeout: bool = False
     localized: bool = False
@@ -277,12 +276,7 @@ async def _observe_async(
                 await scenario.async_call(sg)
             assert type(raised.value) is scenario.expected.exception
             observed = _Failure(type(raised.value))
-    assert tuple(str(warning.message) for warning in caught) == (
-        scenario.expected_deprecation_messages
-    )
-    assert tuple(warning.category for warning in caught) == (DeprecationWarning,) * len(
-        scenario.expected_deprecation_messages
-    )
+    assert [str(warning.message) for warning in caught] == []
     return observed
 
 
@@ -296,12 +290,7 @@ def _observe_sync(sg: Shotgun, scenario: _Scenario) -> _Failure | _Success:
                 scenario.sync_call(sg)
             assert type(raised.value) is scenario.expected.exception
             observed = _Failure(type(raised.value))
-    assert tuple(str(warning.message) for warning in caught) == (
-        scenario.expected_deprecation_messages
-    )
-    assert tuple(warning.category for warning in caught) == (DeprecationWarning,) * len(
-        scenario.expected_deprecation_messages
-    )
+    assert [str(warning.message) for warning in caught] == []
     return observed
 
 
@@ -687,25 +676,23 @@ def _scenarios() -> tuple[_Scenario, ...]:
         ),
         _Scenario(
             async_call=lambda sg: sg.entity_types(),
-            expected=_Success({'Shot': {}}),
-            expected_methods=('info', 'schema_entity_read'),
+            expected=_Failure(_errors.ShotgunError),
+            expected_methods=(),
             name='entity_types_alias',
-            script=lambda trace: [_response(trace, 'result', {'Shot': {}})],
+            script=lambda _trace: [],
             sync_call=lambda sg: sg.entity_types(),
-            expected_deprecation_messages=(
-                'entity_types() is deprecated; use schema_entity_read()',
-            ),
-            expected_warning_codes=('deprecated-entity-types-alias',),
+            expected_closed_responses=(),
+            expected_response_outcomes=(),
         ),
         _Scenario(
             async_call=lambda sg: sg.schema('Shot'),
-            expected=_Success({'code': {}}),
-            expected_methods=('info', 'schema_field_read'),
+            expected=_Failure(_errors.ShotgunError),
+            expected_methods=(),
             name='schema_alias',
-            script=lambda trace: [_response(trace, 'result', {'code': {}})],
+            script=lambda _trace: [],
             sync_call=lambda sg: sg.schema('Shot'),
-            expected_deprecation_messages=('schema() is deprecated; use schema_field_read()',),
-            expected_warning_codes=('deprecated-schema-alias',),
+            expected_closed_responses=(),
+            expected_response_outcomes=(),
         ),
         _Scenario(
             async_call=lambda sg: sg.activity_stream_read(
@@ -1145,7 +1132,6 @@ from shotgun_api3 import AsyncShotgun
 async def probe(sg: AsyncShotgun) -> None:
     assert_type(await sg.activity_stream_read('Shot', 1), dict[str, object])
     assert_type(await sg.authenticate_human_user('me', 'pw'), dict[str, object] | None)
-    assert_type(await sg.entity_types(), dict[str, object])
     assert_type(await sg.export_page(1, 'csv'), str)
     assert_type(
         await sg.follow({'type': 'HumanUser', 'id': 1}, {'type': 'Shot', 'id': 2}),
@@ -1161,7 +1147,6 @@ async def probe(sg: AsyncShotgun) -> None:
     assert_type(await sg.nav_search_string('/', 'boat'), list[dict[str, object]])
     assert_type(await sg.note_thread_read(1), list[dict[str, object]])
     assert_type(await sg.preferences_read(), dict[str, object])
-    assert_type(await sg.schema('Shot'), dict[str, object])
     assert_type(await sg.schema_entity_read(), dict[str, object])
     assert_type(await sg.schema_field_create('Shot', 'text', 'Label'), str)
     assert_type(await sg.schema_field_delete('Shot', 'sg_field'), bool)

@@ -1,16 +1,12 @@
 """Shared pure plans for synchronous and asynchronous client methods."""
 
-import contextvars
 import dataclasses
 import datetime
 import inspect
-import warnings
-from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import Any, NotRequired, TypedDict, cast
 
 from . import _crud, _protocol
-from ._config import CompatibilityWarningCode
 from ._errors import ShotgunError
 from ._signatures import bind_arguments, expose_signature
 
@@ -111,10 +107,6 @@ _METHOD_EXPORT_PAGE_SIGNATURE = inspect.Signature(
     ),
     return_annotation=str,
 )
-_PENDING_COMPATIBILITY_WARNINGS = tuple[
-    object,
-    tuple[CompatibilityWarningCode, ...],
-]
 _SCHEDULE_DATE_LENGTH = 10
 _SUMMARIZE_DOCSTRING = """Summarize field data returned by a query.
 
@@ -240,12 +232,6 @@ _METHOD_WORK_SCHEDULE_UPDATE_SIGNATURE = inspect.Signature(
 _WORK_SCHEDULE_UPDATE_SIGNATURE = inspect.Signature(
     _WORK_SCHEDULE_UPDATE_PARAMETERS,
     return_annotation=dict[str, object],
-)
-SCHEMA_ENTITY_READ_WARNINGS: contextvars.ContextVar[_PENDING_COMPATIBILITY_WARNINGS | None] = (
-    contextvars.ContextVar('SCHEMA_ENTITY_READ_WARNINGS', default=None)
-)
-SCHEMA_FIELD_READ_WARNINGS: contextvars.ContextVar[_PENDING_COMPATIBILITY_WARNINGS | None] = (
-    contextvars.ContextVar('SCHEMA_FIELD_READ_WARNINGS', default=None)
 )
 
 
@@ -1007,43 +993,13 @@ def build_work_schedule_update_params(
     return params
 
 
-def consume_compatibility_warnings(
-    warning_context: contextvars.ContextVar[_PENDING_COMPATIBILITY_WARNINGS | None],
-    owner: object,
-) -> tuple[CompatibilityWarningCode, ...]:
-    """Consume operation-local compatibility warnings exactly once.
-
-    Args:
-        warning_context: Context-local warning state.
-        owner: Client instance expected to own the warning.
+def entity_types_alias_error() -> ShotgunError:
+    """Build the error raised by the deprecated `entity_types` alias.
 
     Returns:
-        Compatibility warning codes for the target call.
+        A `ShotgunError` naming `schema_entity_read()` as the replacement.
     """
-    pending = warning_context.get()
-    if pending is None or pending[0] is not owner:
-        return ()
-    warning_context.set(None)
-    return pending[1]
-
-
-@contextmanager
-def entity_types_alias(owner: object) -> Generator[None, None, None]:
-    """Scope the deprecated `entity_types` compatibility notice.
-
-    Args:
-        owner: Client instance invoking the alias.
-
-    Yields:
-        Control while the public target method consumes the warning.
-    """
-    token = SCHEMA_ENTITY_READ_WARNINGS.set(
-        (owner, ('deprecated-entity-types-alias',)),
-    )
-    try:
-        yield
-    finally:
-        SCHEMA_ENTITY_READ_WARNINGS.reset(token)
+    return ShotgunError('Deprecated: use schema_entity_read() instead')
 
 
 def expose_activity_stream_read_signature(
@@ -1168,38 +1124,13 @@ def require_string_result(value: object, method_name: str) -> str:
     return value
 
 
-@contextmanager
-def schema_alias(owner: object) -> Generator[None, None, None]:
-    """Scope the deprecated `schema` compatibility notice.
+def schema_alias_error(entity_type: object) -> ShotgunError:
+    """Build the error raised by the deprecated `schema` alias.
 
     Args:
-        owner: Client instance invoking the alias.
+        entity_type: Caller-supplied entity type, rendered with `str()`.
 
-    Yields:
-        Control while the public target method consumes the warning.
+    Returns:
+        A `ShotgunError` naming the equivalent `schema_field_read()` call.
     """
-    token = SCHEMA_FIELD_READ_WARNINGS.set(
-        (owner, ('deprecated-schema-alias',)),
-    )
-    try:
-        yield
-    finally:
-        SCHEMA_FIELD_READ_WARNINGS.reset(token)
-
-
-def warn_entity_types_alias() -> None:
-    """Warn at the caller of the deprecated `entity_types` method."""
-    warnings.warn(
-        'entity_types() is deprecated; use schema_entity_read()',
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
-def warn_schema_alias() -> None:
-    """Warn at the caller of the deprecated `schema` method."""
-    warnings.warn(
-        'schema() is deprecated; use schema_field_read()',
-        DeprecationWarning,
-        stacklevel=3,
-    )
+    return ShotgunError(f"Deprecated: use schema_field_read('{entity_type}') instead")

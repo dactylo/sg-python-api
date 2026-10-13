@@ -40,6 +40,8 @@ _FORM_INFO: dict[str, object] = {
 }
 _FORM_UPLOAD_BOUNDARY = 'Task13Boundary'
 
+_TRANSIENT_IMAGE = 'https://x.example/images/status/transient/thumbnail_pending.png'
+
 
 class _ConsumingFakeTransport(_FakeTransport):
     bodies: list[bytes | None]
@@ -133,6 +135,16 @@ def _raw_upload_transcript(
         (request.method, request.url, dict(request.headers), body)
         for request, body in zip(requests, bodies, strict=True)
     ]
+
+
+def _read_response(entity: dict[str, object]) -> TransportResponse:
+    return _make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})
+
+
+def _rpc_call(sg: Shotgun, index: int) -> tuple[str, dict[str, Any]]:
+    body = cast('bytes', cast('_ConsumingFakeTransport', _fake_transport(sg)).bodies[index])
+    payload = cast('dict[str, Any]', json.loads(body))
+    return cast('str', payload['method_name']), cast('dict[str, Any]', payload['params'][1])
 
 
 def _text(
@@ -274,6 +286,81 @@ def test_build_share_thumbnail_fields_uses_current_wire_grammar() -> None:
         'filmstrip_thumbnail': '1',
         'source_entity': 'Version_2',
     }
+
+
+@pytest.mark.parametrize('value', [None, ''])
+def test_create_strips_empty_file_fields_without_uploading(value: object) -> None:
+    sg = _upload_client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
+
+    result = sg.create('Version', {'code': 'v001', 'image': value, 'filmstrip_image': value})
+
+    assert result == {'type': 'Version', 'id': 5, 'code': 'v001'}
+    method_name, params = _rpc_call(sg, 1)
+    assert method_name == 'create'
+    assert [field['field_name'] for field in params['fields']] == ['code']
+    assert len(_fake_transport(sg).requests) == 2
+
+
+@pytest.mark.parametrize('with_filmstrip', [False, True], ids=['image', 'image-and-filmstrip'])
+def test_create_uploads_file_fields_after_create_and_returns_current_values(
+    tmp_path: Path,
+    with_filmstrip: bool,
+) -> None:
+    image = tmp_path / 'thumb.png'
+    image.write_bytes(b'image')
+    strip = tmp_path / 'strip.png'
+    strip.write_bytes(b'strip')
+    data: dict[str, object] = {'code': 'v001', 'image': str(image)}
+    current: dict[str, object] = {'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}
+    uploads = [
+        _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+        _text(),
+        _text('1:7 thumb.png'),
+    ]
+    if with_filmstrip:
+        data['filmstrip_image'] = str(strip)
+        current['filmstrip_image'] = 'https://storage.example/strip-signed'
+        uploads += [
+            _text('1 https://storage.example/strip timestamp Thumbnail upload-2'),
+            _text(),
+            _text('1:8 strip.png'),
+        ]
+    original = dict(data)
+    file_fields = [name for name in data if name != 'code']
+    sg = _upload_client(
+        [
+            _make_response({'type': 'Version', 'id': 5, 'code': 'v001', 'description': None}),
+            *uploads,
+            _read_response(current),
+        ]
+    )
+
+    result = sg.create('Version', data, ['description'])
+
+    assert data == original
+    assert result == {
+        'type': 'Version',
+        'id': 5,
+        'code': 'v001',
+        'description': None,
+        **{name: current[name] for name in file_fields},
+    }
+    method_name, params = _rpc_call(sg, 1)
+    assert method_name == 'create'
+    assert [field['field_name'] for field in params['fields']] == ['code']
+    assert params['return_fields'] == ['description']
+    bodies = cast('_ConsumingFakeTransport', _fake_transport(sg)).bodies
+    image_link = _form_fields(cast('bytes', bodies[4]))
+    assert (image_link['entity_type'], image_link['entity_id']) == ('Version', '5')
+    assert 'filmstrip' not in image_link
+    if with_filmstrip:
+        assert _form_fields(cast('bytes', bodies[7]))['filmstrip'] == 'true'
+    read_name, read_params = _rpc_call(sg, len(bodies) - 1)
+    assert read_name == 'read'
+    assert read_params['return_fields'] == file_fields
+    assert read_params['filters']['conditions'] == [
+        {'path': 'id', 'relation': 'is', 'values': [5]},
+    ]
 
 
 def test_default_direct_attachment_upload_omits_field_name(tmp_path: Path) -> None:
@@ -494,6 +581,30 @@ def test_disk_body_iterators_are_lazy_and_close_their_handles(
     assert not multipart_handle.closed
     multipart.close()
     assert multipart_handle.closed
+
+
+@pytest.mark.parametrize('method_name', ['create', 'update'])
+def test_file_field_upload_rejects_invalid_path_after_write(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    missing = str(tmp_path / 'missing.png')
+    sg = _upload_client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
+    data = {'code': 'v001', 'image': missing}
+
+    def write() -> object:
+        if method_name == 'create':
+            return sg.create('Version', data)
+        return sg.update('Version', 5, data)
+
+    with pytest.raises(
+        ShotgunError,
+        match=rf"^Path must be a valid file, got '{re.escape(missing)}'$",
+    ):
+        write()
+
+    assert _rpc_call(sg, 1)[0] == method_name
+    assert len(_fake_transport(sg).requests) == 2
 
 
 def test_form_upload_stops_at_the_observed_403_request_boundary(
@@ -1425,6 +1536,39 @@ def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(tmp_path: Path) -> 
     assert form_transport.requests[1].url.endswith(_files._UPLOAD_FILE)
 
 
+def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> None:
+    image = tmp_path / 'thumb.png'
+    image.write_bytes(b'image')
+    sg = _upload_client(
+        [
+            _make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
+            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+            _text(),
+            _text('1:7 thumb.png'),
+            _read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
+            _make_response({'type': 'Version', 'id': 5, 'image': None}),
+        ]
+    )
+
+    assert sg.update('Version', 5, {'description': 'new', 'image': str(image)}) == {
+        'type': 'Version',
+        'id': 5,
+        'description': 'new',
+        'image': _TRANSIENT_IMAGE,
+    }
+    assert sg.update('Version', 5, {'image': None}) == {'type': 'Version', 'id': 5, 'image': None}
+    for data in ({'image': ''}, {'filmstrip_image': None}, {}):
+        assert sg.update('Version', 5, data) == {'id': 5, 'type': 'Version'}
+
+    sent = [_rpc_call(sg, index) for index in (1, 6)]
+    assert [name for name, _params in sent] == ['update', 'update']
+    assert [params['fields'] for _name, params in sent] == [
+        [{'field_name': 'description', 'value': 'new'}],
+        [{'field_name': 'image', 'value': None}],
+    ]
+    assert len(_fake_transport(sg).requests) == 7
+
+
 @pytest.mark.parametrize(
     ('field_name', 'expected_extra'),
     [('image', {}), ('filmstrip_image', {'filmstrip': 'true'})],
@@ -1635,14 +1779,20 @@ def test_upload_rejects_invalid_created_at_before_network(tmp_path: Path) -> Non
     assert _fake_transport(sg).requests == []
 
 
-@pytest.mark.parametrize('kind', ['missing', 'empty'])
-def test_upload_rejects_invalid_files_before_http(tmp_path: Path, kind: str) -> None:
+@pytest.mark.parametrize(
+    ('kind', 'message'),
+    [
+        ('missing', "Path must be a valid file, got '{}'"),
+        ('empty', "Path cannot be an empty file: '{}'"),
+    ],
+)
+def test_upload_rejects_invalid_files_before_http(tmp_path: Path, kind: str, message: str) -> None:
     path = tmp_path / 'clip.mov'
     if kind == 'empty':
         path.touch()
     sg = _fake_client([])
 
-    with pytest.raises(ShotgunError, match=r'^File must exist and be non-empty$'):
+    with pytest.raises(ShotgunError, match=f'^{re.escape(message.format(path))}$'):
         sg.upload('Version', 5, str(path), field_name='sg_uploaded_movie')
 
     assert _fake_transport(sg).requests == []

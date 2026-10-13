@@ -720,7 +720,7 @@ def test_artifact_evidence_uses_real_isolated_helper(
     result = benchmark._load_artifact_evidence(candidate)
 
     assert result.candidate_commit == commit
-    assert result.version == '0.1.0'
+    assert result.version == '0.1.1'
     assert result.wheel_path == wheel.resolve()
     assert result.sha256 == digest
     wheel.write_bytes(b'tampered')
@@ -786,7 +786,7 @@ def test_atomic_report_is_ascii_formatted_sanitized_and_contains_required_eviden
                     }
                     for name in benchmark._RSS_OPERATIONS
                 },
-                'version': '0.1.0',
+                'version': '0.1.1',
             },
         },
         'cleanup': 'PASS',
@@ -1548,7 +1548,7 @@ def test_cleanup_worker_timeout_blocks_report_publication_without_leaks(
     official = tmp_path / 'official'
     (official / 'shotgun_api3').mkdir(parents=True)
     (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.0', tmp_path / 'wheel')
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.1', tmp_path / 'wheel')
     report_called = False
     for name in _REQUIRED_ENV:
         monkeypatch.setenv(name, f'SECRET-{name}')
@@ -1694,7 +1694,7 @@ def test_controller_defaults_to_bounded_workload_after_isolated_preflights(
     official = tmp_path / 'official'
     (official / 'shotgun_api3').mkdir(parents=True)
     (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.0', tmp_path / 'wheel')
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.1', tmp_path / 'wheel')
     events: list[str] = []
     configs: list[dict[str, object]] = []
     install_roots: list[Path] = []
@@ -1779,7 +1779,7 @@ def test_controller_interruption_recovers_before_removal_and_blocks_publication(
     official = tmp_path / 'official'
     (official / 'shotgun_api3').mkdir(parents=True)
     (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.0', tmp_path / 'wheel')
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.1', tmp_path / 'wheel')
     for name in _REQUIRED_ENV:
         monkeypatch.setenv(name, 'unused')
     monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
@@ -1837,7 +1837,7 @@ def test_controller_rejects_excessive_workload_before_order_allocation_or_worker
     benchmark = _load_benchmark()
     official = tmp_path / 'official'
     official.mkdir()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.0', tmp_path / 'wheel')
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.1', tmp_path / 'wheel')
     order_called = False
     worker_called = False
     for name in _REQUIRED_ENV:
@@ -2896,9 +2896,9 @@ def test_loaded_client_version_and_origin_are_both_verified(tmp_path: Path) -> N
     module_path = root / 'shotgun_api3' / '__init__.py'
     module_path.parent.mkdir(parents=True)
     module_path.touch()
-    module = SimpleNamespace(__file__=str(module_path), __version__='0.1.0')
+    module = SimpleNamespace(__file__=str(module_path), __version__='0.1.1')
 
-    benchmark._verify_loaded_client(module, root, '0.1.0')
+    benchmark._verify_loaded_client(module, root, '0.1.1')
     with pytest.raises(benchmark._BenchmarkError, match='version'):
         benchmark._verify_loaded_client(module, root, '9.9.9')
 
@@ -3327,7 +3327,7 @@ def test_parallel_read_methodology_describes_asymmetric_client_ownership() -> No
     }
     clients = {
         'official': {'version': benchmark._OFFICIAL_VERSION},
-        'ours': {'version': '0.1.0'},
+        'ours': {'version': '0.1.1'},
     }
     generated = ' '.join(
         benchmark._report_header_lines(
@@ -4578,7 +4578,7 @@ def test_successful_controller_keeps_curated_page_and_writes_private_report(
     official = tmp_path / 'official'
     (official / 'shotgun_api3').mkdir(parents=True)
     (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.0', tmp_path / 'wheel')
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.1', tmp_path / 'wheel')
     for name in _REQUIRED_ENV:
         monkeypatch.setenv(name, 'value')
     monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')

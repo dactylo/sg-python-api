@@ -3,6 +3,7 @@ import dataclasses
 import inspect
 import json
 import os
+import re
 import tempfile
 import threading
 import traceback
@@ -59,6 +60,7 @@ _FORM_UPLOAD_BOUNDARY = 'Task13Boundary'
 _MULTIPART_FIRST_FINAL_BATCH_SIZE = 77_056
 _ONE_USE_VALUE = 'one-use-value'
 _SESSION_VALUE = 'session-one'
+_TRANSIENT_IMAGE = 'https://x.example/images/status/transient/thumbnail_pending.png'
 
 FakeAsyncClient = Callable[..., AsyncShotgun]
 _CallParams = ParamSpec('_CallParams')
@@ -509,6 +511,15 @@ def _raw_upload_transcript(
     ]
 
 
+def _read_response(entity: dict[str, object]) -> TransportResponse:
+    return _make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})
+
+
+def _rpc_call(transport: '_AsyncFileTransport', index: int) -> tuple[str, dict[str, Any]]:
+    payload = cast('dict[str, Any]', json.loads(cast('bytes', transport.bodies[index])))
+    return cast('str', payload['method_name']), cast('dict[str, Any]', payload['params'][1])
+
+
 def _session_only_fields(body: bytes) -> None:
     fields = _form_fields(body)
     assert fields['session_token'] == _SESSION_VALUE
@@ -695,6 +706,55 @@ async def test_download_rejects_invalid_url_before_io(url: str, tmp_path: Path) 
 
 
 @pytest.mark.anyio
+async def test_create_uploads_file_fields_after_create_and_returns_current_values(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / 'thumb.png'
+    image.write_bytes(b'image')
+    strip = tmp_path / 'strip.png'
+    strip.write_bytes(b'strip')
+    sg, transport = _client(
+        [
+            _make_response({'type': 'Version', 'id': 5, 'code': 'v001'}),
+            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+            _text(),
+            _text('1:7 thumb.png'),
+            _text('1 https://storage.example/strip timestamp Thumbnail upload-2'),
+            _text(),
+            _text('1:8 strip.png'),
+            _read_response(
+                {
+                    'type': 'Version',
+                    'id': 5,
+                    'image': _TRANSIENT_IMAGE,
+                    'filmstrip_image': 'https://storage.example/strip-signed',
+                }
+            ),
+        ]
+    )
+
+    result = await sg.create(
+        'Version',
+        {'code': 'v001', 'image': str(image), 'filmstrip_image': str(strip), 'sg_x': None},
+    )
+
+    assert result == {
+        'type': 'Version',
+        'id': 5,
+        'code': 'v001',
+        'image': _TRANSIENT_IMAGE,
+        'filmstrip_image': 'https://storage.example/strip-signed',
+    }
+    method_name, params = _rpc_call(transport, 1)
+    assert method_name == 'create'
+    assert [field['field_name'] for field in params['fields']] == ['code', 'sg_x']
+    assert 'filmstrip' not in _form_fields(cast('bytes', transport.bodies[4]))
+    assert _form_fields(cast('bytes', transport.bodies[7]))['filmstrip'] == 'true'
+    read_name, read_params = _rpc_call(transport, 8)
+    assert (read_name, read_params['return_fields']) == ('read', ['image', 'filmstrip_image'])
+
+
+@pytest.mark.anyio
 async def test_default_multipart_upload_batches_each_storage_range(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -847,6 +907,31 @@ async def test_direct_upload_batches_worker_file_pulls(
     ]
     assert progress[-1].bytes_transferred == _FILE_TRANSFER_SIZE
     assert progress[-1].total_bytes == _FILE_TRANSFER_SIZE
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('method_name', ['create', 'update'])
+async def test_file_field_upload_rejects_invalid_path_after_write(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    missing = str(tmp_path / 'missing.png')
+    sg, transport = _client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
+    data = {'code': 'v001', 'image': missing}
+
+    async def write() -> object:
+        if method_name == 'create':
+            return await sg.create('Version', data)
+        return await sg.update('Version', 5, data)
+
+    with pytest.raises(
+        ShotgunError,
+        match=rf"^Path must be a valid file, got '{re.escape(missing)}'$",
+    ):
+        await write()
+
+    assert _rpc_call(transport, 1)[0] == method_name
+    assert len(transport.requests) == 2
 
 
 @pytest.mark.anyio
@@ -1872,7 +1957,7 @@ async def test_path_share_rejects_missing_file_before_one_use_exchange(
 ) -> None:
     sg, transport = _one_use_client([_make_response({'session_id': _SESSION_VALUE})])
 
-    with pytest.raises(ShotgunError, match='File must exist and be non-empty'):
+    with pytest.raises(ShotgunError, match=r'^Path must be a valid file, got '):
         await sg.share_thumbnail(
             [{'type': 'Version', 'id': 2}],
             thumbnail_path=str(tmp_path / 'missing.jpg'),
@@ -2056,6 +2141,40 @@ async def test_thumbnail_wrappers_forward_kwargs(
         'script_name': 'script',
         'script_key': 'key',
     }
+
+
+@pytest.mark.anyio
+async def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> None:
+    image = tmp_path / 'thumb.png'
+    image.write_bytes(b'image')
+    sg, transport = _client(
+        [
+            _make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
+            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+            _text(),
+            _text('1:7 thumb.png'),
+            _read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
+            _make_response({'type': 'Version', 'id': 5, 'image': None}),
+        ]
+    )
+
+    assert await sg.update('Version', 5, {'description': 'new', 'image': str(image)}) == {
+        'type': 'Version',
+        'id': 5,
+        'description': 'new',
+        'image': _TRANSIENT_IMAGE,
+    }
+    assert await sg.update('Version', 5, {'image': None}) == {
+        'type': 'Version',
+        'id': 5,
+        'image': None,
+    }
+    for data in ({'image': ''}, {'filmstrip_image': None}, {}):
+        assert await sg.update('Version', 5, data) == {'id': 5, 'type': 'Version'}
+
+    assert _rpc_call(transport, 1)[1]['fields'] == [{'field_name': 'description', 'value': 'new'}]
+    assert _rpc_call(transport, 6)[1]['fields'] == [{'field_name': 'image', 'value': None}]
+    assert len(transport.requests) == 7
 
 
 @pytest.mark.anyio

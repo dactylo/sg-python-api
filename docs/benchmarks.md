@@ -7,9 +7,10 @@ on your site. If you have not tried the client yet, start with the
 
 ## What the results show
 
-- **Latency was mixed.** In these samples, downloads and all three upload routes had lower medians
-  with sg-python-api. Most queries, writes, and schema reads had similar or higher medians,
-  including the four-concurrent-read comparison.
+- **Latency was mixed.** In these samples, all three upload routes had lower medians with
+  sg-python-api, cold and warm, and so did warm downloads. Cold medians were higher for writes,
+  schema reads, summaries, and the four-concurrent-read comparison. Warm medians were similar or
+  lower except for the encode-heavy batch.
 - **Transfer memory was lower in the measured workloads.** sg-python-api's peak process memory grew
   less during the measured upload and download. That observation also depends on payload shape and
   runtime.
@@ -39,7 +40,7 @@ In the tables below, "replacement" means sg-python-api and "official" means Auto
 
 | Setting                     | Value                                                                   |
 | --------------------------- | ----------------------------------------------------------------------- |
-| Replacement package version | `0.0.1`                                                                 |
+| Replacement package version | `0.1.1`                                                                 |
 | Autodesk client version     | `3.10.2`                                                                |
 | Python                      | `3.14.6`                                                                |
 | Platform                    | macOS, arm64                                                            |
@@ -55,26 +56,26 @@ estimate a reliable tail-latency distribution.
 
 | Operation                           | Replacement cold | Official cold | Replacement warm | Official warm |
 | ----------------------------------- | ---------------: | ------------: | ---------------: | ------------: |
-| First script-authenticated request  |            359.4 |         364.1 |            124.2 |         128.9 |
-| Batch                               |            419.7 |         339.2 |            202.3 |         199.9 |
-| Create                              |            431.2 |         380.3 |            228.3 |         185.2 |
-| Delete                              |            431.9 |         346.0 |            183.6 |         173.3 |
-| Download                            |            603.2 |         767.6 |            340.1 |         450.4 |
-| Medium query                        |            384.2 |         366.1 |            199.0 |         135.8 |
-| Find one                            |            401.2 |         360.3 |            134.3 |         119.1 |
-| Paged query                         |            551.0 |         499.9 |            263.8 |         256.5 |
-| Small query                         |            362.4 |         360.6 |            138.6 |         129.5 |
-| Four concurrent reads               |            551.5 |         387.7 |            191.1 |         130.4 |
-| Decode-heavy read                   |            395.4 |         371.3 |            134.9 |         130.4 |
-| Encode-heavy batch                  |            924.8 |         809.8 |            739.7 |         628.8 |
-| Entity schema                       |            360.6 |         341.5 |            140.4 |         189.8 |
-| Field schema                        |            401.6 |         304.8 |            148.8 |         143.8 |
-| First session-authenticated request |            486.5 |         462.2 |            119.7 |         120.5 |
-| Summarize                           |            374.6 |         310.1 |            132.4 |         132.8 |
-| Update                              |            384.3 |         349.2 |            147.9 |         156.7 |
-| Direct upload                       |           1026.3 |        1242.3 |            655.8 |        1006.6 |
-| Generic upload                      |            782.4 |        1169.4 |            577.0 |         743.4 |
-| Multipart upload                    |           3016.3 |        3423.4 |           2037.6 |        2906.0 |
+| First script-authenticated request  |            366.6 |         358.9 |            119.7 |         124.7 |
+| Batch                               |            410.7 |         309.8 |            160.5 |         178.6 |
+| Create                              |            407.0 |         328.3 |            175.0 |         172.1 |
+| Delete                              |            456.8 |         362.4 |            193.0 |         233.5 |
+| Download                            |            602.2 |         605.4 |            336.3 |         377.0 |
+| Medium query                        |            362.6 |         371.6 |            120.7 |         126.1 |
+| Find one                            |            354.3 |         371.3 |            128.6 |         133.4 |
+| Paged query                         |            490.2 |         484.0 |            263.8 |         254.0 |
+| Small query                         |            354.1 |         380.7 |            125.6 |         133.8 |
+| Four concurrent reads               |            520.6 |         377.5 |            129.6 |         131.1 |
+| Decode-heavy read                   |            361.0 |         365.9 |            129.9 |         138.9 |
+| Encode-heavy batch                  |            993.3 |         790.8 |            665.0 |         565.4 |
+| Entity schema                       |            346.5 |         276.7 |            117.7 |         113.9 |
+| Field schema                        |            371.4 |         303.3 |            141.2 |         146.3 |
+| First session-authenticated request |            489.3 |         477.0 |            116.3 |         127.6 |
+| Summarize                           |            370.7 |         282.8 |            122.2 |         133.5 |
+| Update                              |            394.6 |         298.1 |            163.5 |         157.2 |
+| Direct upload                       |            982.0 |        1183.9 |            652.6 |         950.1 |
+| Generic upload                      |            797.1 |        1128.5 |            596.2 |         814.0 |
+| Multipart upload                    |           2389.0 |        3118.5 |           2163.7 |        2745.0 |
 
 ## Transfer memory
 
@@ -84,8 +85,8 @@ memory use or individual Python allocations.
 
 | Workload | Replacement peak increase | Official peak increase |
 | -------- | ------------------------: | ---------------------: |
-| Download |                  3.69 MiB |               6.63 MiB |
-| Upload   |                  0.94 MiB |              24.50 MiB |
+| Download |                  3.34 MiB |               7.31 MiB |
+| Upload   |                  1.95 MiB |              24.70 MiB |
 
 The upload measurement used the multipart route. Download memory uses a fresh download-only process
 after setup so earlier work does not dominate the process's high-water mark.

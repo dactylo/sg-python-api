@@ -11,6 +11,7 @@ import pytest
 
 import shotgun_api3
 from tests._required_mode import REQUIRED_LIVE_ENV
+from tests.live.test_roundtrip import _png
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -356,5 +357,49 @@ async def test_async_live_roundtrip(request: pytest.FixtureRequest, tmp_path: Pa
             namespace = _new_run_namespace()
             resources = _AsyncLiveResources(client, project, namespace)
             await _exercise_roundtrip(client, project, resources, namespace, tmp_path)
+    finally:
+        await _finalize_live_test(resources, client, operation_capture.exception)
+
+
+@pytest.mark.anyio
+async def test_async_thumbnail_paths_upload_on_create_and_update(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    configuration = _live_configuration(request)
+    client: AsyncShotgun | None = None
+    resources: _AsyncLiveResources | None = None
+    operation_capture = _FailureCapture(suppress_base_exceptions=True)
+    try:
+        with operation_capture:
+            client = shotgun_api3.AsyncShotgun(
+                configuration.site,
+                script_name=configuration.script_name,
+                api_key=configuration.api_key,
+                connect=False,
+            )
+            project = await _resolve_project(client, request, configuration.project_name)
+            namespace = _new_run_namespace()
+            resources = _AsyncLiveResources(client, project, namespace)
+            image = tmp_path / f'{namespace}-thumbnail.png'
+            await asyncio.to_thread(image.write_bytes, _png(64, 64))
+            strip = tmp_path / f'{namespace}-filmstrip.png'
+            await asyncio.to_thread(strip.write_bytes, _png(480, 135))
+
+            shot = await client.create(
+                'Shot',
+                {'code': f'{namespace}-thumbnail', 'project': project, 'image': str(image)},
+            )
+            shot_id = resources.track_created('Shot', shot)
+            assert isinstance(shot['image'], str)
+            assert shot['image'].startswith('https://')
+
+            updated = await client.update('Shot', shot_id, {'filmstrip_image': str(strip)})
+            assert set(updated) == {'type', 'id', 'filmstrip_image'}
+            assert isinstance(updated['filmstrip_image'], str)
+            assert updated['filmstrip_image'].startswith('https://')
+
+            cleared = await client.update('Shot', shot_id, {'image': None})
+            assert cleared['image'] is None
     finally:
         await _finalize_live_test(resources, client, operation_capture.exception)

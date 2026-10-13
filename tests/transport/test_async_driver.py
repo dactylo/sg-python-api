@@ -595,7 +595,7 @@ async def test_call_detaches_nested_input_before_request_and_retry_observers() -
 
 
 @pytest.mark.anyio
-async def test_call_publishes_shared_compatibility_warning_sequence() -> None:
+async def test_call_publishes_infinite_timeout_compatibility_warning() -> None:
     events: list[ObserverEvent] = []
     config = _config()
     config.update_fields(timeout_secs=None, on_compatibility_warning=events.append)
@@ -605,14 +605,10 @@ async def test_call_publishes_shared_compatibility_warning_sequence() -> None:
         'info',
         {},
         config_module.snapshot(config),
-        compatibility_warning_codes=('deprecated-schema-alias',),
     ) == {'id': 7}
 
     warnings = [cast('CompatibilityWarningEvent', event) for event in events]
-    assert [event.code for event in warnings] == [
-        'deprecated-schema-alias',
-        'legacy-infinite-timeout',
-    ]
+    assert [event.code for event in warnings] == ['legacy-infinite-timeout']
 
 
 @pytest.mark.anyio

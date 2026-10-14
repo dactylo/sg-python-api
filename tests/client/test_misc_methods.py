@@ -1,17 +1,22 @@
 import copy
 import datetime
 import inspect
+from collections import UserDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import pytest
 
-from shotgun_api3 import _errors
+from shotgun_api3 import _errors, _methods
 from shotgun_api3._client import Shotgun
 from shotgun_api3._config import ObserverEvent, RequestEvent, ResponseEvent, RetryEvent
 from shotgun_api3._transport import SendError
 from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
 
+_CREATE_ENTRY_ERROR = (
+    'user_subscriptions_create users must contain dictionaries with '
+    'humanUserId and subscription keys'
+)
 _PROJECT = {'type': 'Project', 'id': 2, 'name': 'P'}
 _USER = {'type': 'HumanUser', 'id': 7, 'name': 'Me'}
 
@@ -237,7 +242,7 @@ def test_misc_scalar_methods_validate_exact_results() -> None:
 
     with pytest.raises(
         _errors.ShotgunError,
-        match=r'^user_subscriptions_create did not return a boolean$',
+        match=r'^user_subscriptions_create returned an invalid result mapping$',
     ):
         create_sg.user_subscriptions_create([])
     with pytest.raises(_errors.ShotgunError, match=r'^export_page did not return a string$'):
@@ -246,14 +251,14 @@ def test_misc_scalar_methods_validate_exact_results() -> None:
 
 def test_preferences_and_subscriptions_build_exact_payloads() -> None:
     prefs = ['timezone', 'thumbnail_visibility']
-    users = [{'user_id': 7, 'subscription': {'name': ['original']}}]
+    users = [{'humanUserId': '7', 'subscription': ['original'], 'label': 'extra'}]
     original = copy.deepcopy((prefs, users))
     sg = _fake_client(
         [
             _make_response({'timezone': 'UTC'}),
             _make_response({'all': True}),
-            _make_response([]),
-            _make_response(obj=True),
+            _make_response({}),
+            _make_response({'7': None}),
         ]
     )
 
@@ -268,7 +273,7 @@ def test_preferences_and_subscriptions_build_exact_payloads() -> None:
     assert _sent_payload(sg, 2)['method_name'] == 'user_subscriptions_read'
     assert _params(sg, 2) is None
     assert _sent_payload(sg, 3)['method_name'] == 'user_subscriptions_create'
-    assert _params(sg, 3) == {'users': users}
+    assert _params(sg, 3) == {'7': ['original']}
     assert (prefs, users) == original
 
 
@@ -298,48 +303,156 @@ def test_preferences_read_maps_general_falsy_values_to_empty_list(prefs: object)
     assert _params(sg) == {'prefs': []}
 
 
-def test_subscriptions_forward_and_detach_present_user_id_values() -> None:
-    users: list[dict[str, Any]] = [
-        {'user_id': None},
-        {'user_id': '7'},
-        {'user_id': True, 'subscription': {'name': ['original']}},
+def test_subscriptions_builder_preserves_order_and_copies_lists() -> None:
+    plans = ['reviewer', 'artist']
+    users = [
+        {'humanUserId': 9, 'subscription': plans, 'label': 'ignored'},
+        {'humanUserId': '7', 'subscription': 'artist'},
     ]
-    sg = _fake_client([_make_response(obj=True)])
+
+    params = _methods.build_user_subscriptions_create_params(users)
+    plans.reverse()
+
+    assert list(params) == ['9', '7']
+    assert params == {'9': ['reviewer', 'artist'], '7': 'artist'}
+    assert _methods.build_user_subscriptions_create_params([]) == {}
+
+
+def test_subscriptions_create_result_accepts_mapping_and_validates_all_keys() -> None:
+    assert _methods.require_user_subscriptions_create_result(UserDict({'7': None})) is True
+    for result in ({7: None}, {'7': 'sensitive', 9: None}):
+        with pytest.raises(
+            _errors.ShotgunError,
+            match=r'^user_subscriptions_create returned an invalid result mapping$',
+        ):
+            _methods.require_user_subscriptions_create_result(result)
+
+
+@pytest.mark.parametrize('integer_ids', [False, True])
+def test_subscriptions_forward_accepted_values_and_detach_entries(integer_ids: bool) -> None:
+    identifiers = (7, 8, 9, 10) if integer_ids else ('7', '8', '9', '10')
+    users: list[dict[str, Any]] = [
+        {'humanUserId': identifiers[0], 'subscription': None},
+        {'humanUserId': identifiers[1], 'subscription': 'artist'},
+        {'humanUserId': identifiers[2], 'subscription': ['original'], 'label': ['extra']},
+        {'humanUserId': identifiers[3], 'subscription': []},
+    ]
+    sg = _fake_client([_make_response({'7': None, '8': None, '9': None, '10': None})])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
-            users[0]['user_id'] = 99
-            users[1]['user_id'] = 'changed'
-            subscription = cast('dict[str, Any]', users[2]['subscription'])
-            cast('list[str]', subscription['name'])[0] = 'changed'
+            users[0]['humanUserId'] = 'changed'
+            users[1]['subscription'] = 'changed'
+            cast('list[str]', users[2]['subscription'])[0] = 'changed'
+            cast('list[str]', users[2]['label'])[0] = 'changed'
 
     sg.config.on_response = mutate_after_readiness
 
     assert sg.user_subscriptions_create(users) is True
 
-    assert _params(sg) == {
-        'users': [
-            {'user_id': None},
-            {'user_id': '7'},
-            {'user_id': True, 'subscription': {'name': ['original']}},
-        ]
-    }
+    assert _params(sg) == {'7': None, '8': 'artist', '9': ['original'], '10': []}
+
+
+@pytest.mark.parametrize('identifiers', [('7', '7'), (7, 7), ('7', 7), (7, '7')])
+def test_subscriptions_reject_duplicate_users_before_readiness(
+    identifiers: tuple[str | int, str | int],
+) -> None:
+    sg = _fake_client([])
+    users = [{'humanUserId': item, 'subscription': 'sensitive'} for item in identifiers]
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=r'^user_subscriptions_create users must not contain duplicate user IDs$',
+    ):
+        sg.user_subscriptions_create(users)
+
+    assert _fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize(
+    ('result', 'expected'),
+    [
+        ({}, True),
+        ({'7': None, '9': None}, True),
+        ({'7': None, '9': 'sensitive'}, False),
+        ({'7': False}, False),
+        ({'7': 0}, False),
+        ({'7': ''}, False),
+        ({'7': []}, False),
+        ({'7': {}}, False),
+    ],
+)
+def test_subscriptions_create_interprets_per_user_results(result: object, expected: bool) -> None:
+    sg = _fake_client([_make_response(result)])
+
+    assert sg.user_subscriptions_create([]) is expected
+
+
+@pytest.mark.parametrize('result', [True, False, None, 1, 'sensitive', [], [None]])
+def test_subscriptions_create_rejects_non_mapping_results(result: object) -> None:
+    sg = _fake_client([_make_response(result)])
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=r'^user_subscriptions_create returned an invalid result mapping$',
+    ):
+        sg.user_subscriptions_create([])
 
 
 @pytest.mark.parametrize(
     ('argument', 'message'),
     [
         (
-            {'user_id': 7},
+            {'humanUserId': '7', 'subscription': 'artist'},
             'user_subscriptions_create users must be a list',
         ),
         (
-            [{'user_id': 7}, 'sensitive-member'],
-            'user_subscriptions_create users must contain dictionaries with a user_id key',
+            [{'humanUserId': '7', 'subscription': 'artist'}, 'sensitive-member'],
+            _CREATE_ENTRY_ERROR,
         ),
         (
-            [{'user_id': 7}, {'subscription': 'x'}],
-            'user_subscriptions_create users must contain dictionaries with a user_id key',
+            [{'subscription': 'artist'}],
+            _CREATE_ENTRY_ERROR,
+        ),
+        (
+            [{'user_id': '7', 'subscription': 'artist'}],
+            _CREATE_ENTRY_ERROR,
+        ),
+        (
+            [{'humanUserId': '7'}],
+            _CREATE_ENTRY_ERROR,
+        ),
+        (
+            [{'humanUserId': 7.0, 'subscription': 'artist'}],
+            'user_subscriptions_create users must contain string or integer humanUserId values',
+        ),
+        (
+            [{'humanUserId': True, 'subscription': 'artist'}],
+            'user_subscriptions_create users must contain string or integer humanUserId values',
+        ),
+        (
+            [{'humanUserId': False, 'subscription': 'artist'}],
+            'user_subscriptions_create users must contain string or integer humanUserId values',
+        ),
+        (
+            [{'humanUserId': None, 'subscription': 'artist'}],
+            'user_subscriptions_create users must contain string or integer humanUserId values',
+        ),
+        (
+            [{'humanUserId': '7', 'subscription': 1}],
+            'user_subscriptions_create users must contain valid subscription values',
+        ),
+        (
+            [{'humanUserId': '7', 'subscription': True}],
+            'user_subscriptions_create users must contain valid subscription values',
+        ),
+        (
+            [{'humanUserId': '7', 'subscription': {'sensitive': 'value'}}],
+            'user_subscriptions_create users must contain valid subscription values',
+        ),
+        (
+            [{'humanUserId': '7', 'subscription': ['artist', 2]}],
+            'user_subscriptions_create users must contain valid subscription values',
         ),
     ],
 )
@@ -424,14 +537,40 @@ def test_update_project_last_accessed_is_logical_write_without_retry() -> None:
     assert _sent_payload(sg)['method_name'] == 'update_project_last_accessed_by_current_user'
 
 
+def test_user_subscriptions_read_copies_list_values_at_conversion_boundary() -> None:
+    source = ['artist']
+
+    result = _methods.require_user_subscriptions_result({'user-A': source})
+    cast('list[str]', result[0]['subscription']).append('reviewer')
+
+    assert source == ['artist']
+
+
+def test_user_subscriptions_read_preserves_keys_and_values_in_server_order() -> None:
+    sg = _fake_client(
+        [_make_response({'user-A': None, '2': 'artist', '03': ['reviewer'], '4': []})]
+    )
+
+    assert sg.user_subscriptions_read() == [
+        {'humanUserId': 'user-A', 'subscription': None},
+        {'humanUserId': '2', 'subscription': 'artist'},
+        {'humanUserId': '03', 'subscription': ['reviewer']},
+        {'humanUserId': '4', 'subscription': []},
+    ]
+
+
 @pytest.mark.parametrize(
     ('result', 'message_suffix'),
     [
-        ({'sensitive': 'container'}, 'did not return a list'),
-        ([{'user_id': 7}, 'sensitive-member'], 'returned a non-dictionary member'),
+        (['sensitive-result'], 'did not return a dictionary'),
+        ({'': 'artist'}, 'returned an invalid user ID'),
+        ({'7': {'sensitive': 'value'}}, 'returned an invalid subscription'),
+        ({'7': 1}, 'returned an invalid subscription'),
+        ({'7': True}, 'returned an invalid subscription'),
+        ({'7': ['artist', 2]}, 'returned an invalid subscription'),
     ],
 )
-def test_user_subscriptions_read_requires_a_list_of_dictionaries(
+def test_user_subscriptions_read_rejects_malformed_results(
     result: object,
     message_suffix: str,
 ) -> None:
@@ -444,6 +583,17 @@ def test_user_subscriptions_read_requires_a_list_of_dictionaries(
         sg.user_subscriptions_read()
 
     assert 'sensitive' not in str(error.value)
+
+
+@pytest.mark.parametrize('user_id', [True, 7])
+def test_user_subscriptions_read_rejects_non_string_keys_at_conversion_boundary(
+    user_id: object,
+) -> None:
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=r'^user_subscriptions_read returned an invalid user ID$',
+    ):
+        _methods.require_user_subscriptions_result({user_id: 'artist'})
 
 
 @pytest.mark.parametrize(

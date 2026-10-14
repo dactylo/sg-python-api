@@ -478,7 +478,7 @@ def test_note_thread_read_builds_exact_payload_and_omits_entity_fields() -> None
     sg.note_thread_read(41, entity_fields=entity_fields)
     sg.note_thread_read(41)
 
-    assert _sent_payload(sg)['method_name'] == 'note_thread_read'
+    assert _sent_payload(sg)['method_name'] == 'note_thread_contents'
     assert _params(sg) == {'note_id': 41, 'entity_fields': {'Note': ['created_by']}}
     assert _params(sg, 1) == {'note_id': 41}
     assert entity_fields == original

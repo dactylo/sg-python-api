@@ -63,4 +63,3 @@ def test_upload_routes_are_evidence_pinned() -> None:
     assert _files.LINK_FILE == '/upload/api_link_file'
     assert _files._MULTIPART_CHUNK_SIZE == 20_000_000
     assert _files.SHARE_THUMBNAIL == '/upload/share_thumbnail'
-    assert _files._UPLOAD_FILE == '/upload/upload_file'

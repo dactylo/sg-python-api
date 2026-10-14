@@ -66,7 +66,7 @@ if [ "${1:-}" = '-m' ] && [ "${2:-}" = 'installer' ]; then
     [ -n "$destination" ]
     package_root="$destination/opt/custom/lib/python3.13/site-packages"
     mkdir -p "$package_root/shotgun_api3"
-    printf '%s\n' "__version__ = '0.1.1'" >"$package_root/shotgun_api3/__init__.py"
+    printf '%s\n' "__version__ = '0.1.2'" >"$package_root/shotgun_api3/__init__.py"
     exit 0
 fi
 
@@ -134,7 +134,7 @@ _SEPARATOR = (
     '------------------ | --------------------- | ------ | ------ | '
     '------- | ----- |'
 )
-_WHEEL_NAME = 'sg_python_api-0.1.1-py3-none-any.whl'
+_WHEEL_NAME = 'sg_python_api-0.1.2-py3-none-any.whl'
 
 
 def _credential_env() -> dict[str, str]:
@@ -187,8 +187,8 @@ def _ledger_rows(
     # The gate stamps its own UTC date between the two bounds, so it matches one of them even
     # when a run crosses midnight.
     return {
-        f'| {day.isoformat()} | {candidate_commit} | 0.1.1 | {wheel_hash} | '
-        f'v3.10.2 | db056df3fb663efa6a69a2c07d2d0b69db35c336 | {tally} |'
+        f'| {day.isoformat()} | {candidate_commit} | 0.1.2 | {wheel_hash} | '
+        f'v3.10.3 | 6f56cf219152d0e8a8e92d7f0507b28f02f86905 | {tally} |'
         for day in run_dates
     }
 
@@ -208,7 +208,7 @@ def _run_driver_collection(
     package_root = site_packages / 'shotgun_api3'
     library_root = package_root / 'lib'
     library_root.mkdir(parents=True)
-    (package_root / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
+    (package_root / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
     (library_root / '__init__.py').write_text('', encoding='ascii')
     if module_present:
         module_basename = module_name.rsplit('.', maxsplit=1)[1]
@@ -235,7 +235,7 @@ def _run_driver_collection(
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.1',
+            '0.1.2',
         ],
         capture_output=True,
         text=True,
@@ -259,13 +259,13 @@ def _write_wheel_fixture(candidate: Path) -> str:
     wheel = candidate / 'dist' / 'validated-artifacts' / 'source' / _WHEEL_NAME
     wheel.parent.mkdir(parents=True)
     metadata = zipfile.ZipInfo(
-        'sg_python_api-0.1.1.dist-info/METADATA',
+        'sg_python_api-0.1.2.dist-info/METADATA',
         date_time=(1980, 1, 1, 0, 0, 0),
     )
     with zipfile.ZipFile(wheel, mode='w') as archive:
         archive.writestr(
             metadata,
-            'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.1\n',
+            'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.2\n',
         )
     return hashlib.sha256(wheel.read_bytes()).hexdigest()
 
@@ -320,7 +320,7 @@ def _prepare_gate_candidate(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
     env['CANDIDATE_ROOT'] = str(candidate)
     env['COMMAND_LOG'] = str(tmp_path / 'commands.log')
     Path(env['COMMAND_LOG']).write_text('', encoding='ascii')
-    env['FAKE_OFFICIAL_COMMIT'] = 'db056df3fb663efa6a69a2c07d2d0b69db35c336'
+    env['FAKE_OFFICIAL_COMMIT'] = '6f56cf219152d0e8a8e92d7f0507b28f02f86905'
     env['REAL_GIT_PATH'] = subprocess.run(
         ['sh', '-c', 'printf "%s" "$PATH"'],
         env=env,
@@ -361,19 +361,19 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
     site_packages = install_root / 'lib' / 'python' / 'site-packages'
     candidate = site_packages / 'shotgun_api3'
     candidate.mkdir(parents=True)
-    (candidate / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
+    (candidate / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
 
     competing_site = tmp_path / 'competing-site'
     competitor = competing_site / 'shotgun_api3'
     competitor.mkdir(parents=True)
-    (competitor / '__init__.py').write_text("__version__ = '0.1.1'\n", encoding='ascii')
+    (competitor / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
 
     tests_root = tmp_path / 'tests'
     tests_root.mkdir()
     (tests_root / 'test_candidate.py').write_text(
         'def test_candidate_is_importable():\n'
         '    import shotgun_api3\n'
-        "    assert shotgun_api3.__version__ == '0.1.1'\n",
+        "    assert shotgun_api3.__version__ == '0.1.2'\n",
         encoding='ascii',
     )
     results_xml = tmp_path / 'results.xml'
@@ -397,7 +397,7 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.1',
+            '0.1.2',
         ],
         capture_output=True,
         text=True,
@@ -668,10 +668,10 @@ def test_success_prints_only_sanitized_tally_and_cleans_workspace(
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         f'candidate commit: {candidate_commit}',
-        'candidate version: 0.1.1',
+        'candidate version: 0.1.2',
         f'artifact sha256: {wheel_hash}',
-        'official suite ref: v3.10.2',
-        'official suite commit: db056df3fb663efa6a69a2c07d2d0b69db35c336',
+        'official suite ref: v3.10.3',
+        'official suite commit: 6f56cf219152d0e8a8e92d7f0507b28f02f86905',
         'passed: 2',
         'failed: 0',
         'skipped: 1',
@@ -692,10 +692,10 @@ def test_success_prints_only_sanitized_tally_and_cleans_workspace(
 
     commands = Path(env['COMMAND_LOG']).read_text(encoding='ascii')
     assert (
-        'clone --quiet --no-checkout --depth 1 --branch v3.10.2 '
+        'clone --quiet --no-checkout --depth 1 --branch v3.10.3 '
         'https://github.com/shotgunsoftware/python-api'
     ) in commands
-    assert 'checkout --quiet --detach db056df3fb663efa6a69a2c07d2d0b69db35c336' in commands
+    assert 'checkout --quiet --detach 6f56cf219152d0e8a8e92d7f0507b28f02f86905' in commands
     assert '-m installer --destdir' in commands
     assert '-I ' in commands
 

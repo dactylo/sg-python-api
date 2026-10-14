@@ -24,7 +24,7 @@ the *readiness check*.
 ## Supported scope
 
 The package provides the `shotgun_api3` import name and targets the documented synchronous API of
-Autodesk's Python client `3.10.2`, including its method signatures, return shapes, errors, filters,
+Autodesk's Python client `3.10.3`, including its method signatures, return shapes, errors, filters,
 paging, schema, file, activity, navigation, and scheduling operations. It also provides the
 `shotgun_api3.lib.mockgun` and `shotgun_api3.lib.sgtimezone` modules and native async extensions.
 
@@ -112,7 +112,7 @@ operation repeats the check; the client never pages with an invalid size.
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Download setup errors          | Setup RPC faults keep their specific types. Setup or transfer HTTP failures and invalid download URLs raise `ShotgunFileDownloadError` with a generic message and no underlying exception details. Configuration and security failures keep their existing types. |
 | Multi-target thumbnail sharing | The client waits for source readiness before sharing and does not upload the source again.                                                                                                                                                                        |
-| Legacy form uploads            | A successful response from the legacy form-upload route is unsupported. Hosted direct and multipart routes are supported.                                                                                                                                         |
+| Legacy form uploads            | Servers requiring legacy form uploads are unsupported. The client raises `ShotgunError` before any upload request; capability reads may occur. Hosted direct and multipart routes are supported.                                                                  |
 | Datetime-shaped strings        | Invalid values remain unchanged strings. On platforms without pre-1970 time conversion, valid pre-epoch values use the process standard offset without historical daylight-saving accuracy.                                                                       |
 | Request diagnostics            | Structured observers omit credentials and bodies. Application `httpx2` INFO logging can include signed URLs; set that logger to WARNING.                                                                                                                          |
 | User agent                     | The default includes an `sg-python-api` marker. `add_user_agent()` preserves it, `reset_user_agent()` restores the default, and assigning `sg.config.user_agents` replaces every entry.                                                                           |

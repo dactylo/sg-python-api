@@ -136,10 +136,8 @@ _CONSTRUCTOR_PARAMETERS = (
 )
 _UPLOAD_DOCSTRING = """Upload a file or thumbnail and return its Attachment ID.
 
-A successful HTTP response from the legacy form-upload route still
-raises `ShotgunError`; no Attachment ID is established for that
-route. The form request has already been sent when this error is
-raised.
+A server requiring legacy form uploads raises `ShotgunError` before
+any upload request is sent. Server capability reads may occur.
 
 Args:
     entity_type: Entity type receiving the upload.
@@ -156,8 +154,8 @@ Returns:
 Raises:
     TypeError: If arguments do not match the documented signature.
     ShotgunError: If the file or an upload response is invalid, an RPC
-        fault or terminal transport failure occurs, or the legacy
-        form-upload route succeeds.
+        fault or terminal transport failure occurs, or the server
+        requires legacy form uploads.
     ProtocolError: If an upload endpoint returns an HTTP error.
     ValueError: If authenticated HTTP violates the configured origin policy.
 """
@@ -882,28 +880,6 @@ class Shotgun:
         )
 
     @staticmethod
-    def _upload_form(
-        driver: Driver,
-        context: RequestContext,
-        prepared: _files.PreparedUpload,
-    ) -> Never:
-        """Send the observed form request without guessing a success result."""
-        if context.canonical_origin is None:
-            raise ValueError('server parameters must be configured before upload I/O')
-        exchange = _files.build_form_upload_exchange(
-            context.canonical_origin,
-            context.user_agent,
-            prepared,
-            context.auth,
-        )
-
-        def reject_success(_text: str, _headers: Mapping[str, str]) -> Never:
-            raise ShotgunError('form upload success response is not established')
-
-        _execute_upload_exchange(driver, context, exchange, reject_success)
-        raise AssertionError('form upload response parser returned')
-
-    @staticmethod
     def _upload_link(
         driver: Driver,
         context: RequestContext,
@@ -999,14 +975,14 @@ class Shotgun:
         """Execute one prepared upload through a captured driver lease."""
         arguments = prepared.options.arguments
         capabilities = self._ensure_readiness(context, driver)
-        upload_path = _files.choose_upload_path(
-            capabilities.server_info,
-            arguments.entity_type,
-            arguments.field_name,
-            prepared.file_size,
+        upload_path = _files.require_supported_upload_path(
+            _files.choose_upload_path(
+                capabilities.server_info,
+                arguments.entity_type,
+                arguments.field_name,
+                prepared.file_size,
+            )
         )
-        if upload_path == 'form':
-            return self._upload_form(driver, context, prepared)
         multipart = upload_path == 'multipart'
         upload_info = self._upload_allocation(driver, context, prepared, multipart)
         if multipart:
@@ -1030,7 +1006,16 @@ class Shotgun:
         prepared: _files.PreparedUpload,
     ) -> int:
         """Execute the exact direct-storage thumbnail workflow."""
-        self._ensure_readiness(context, driver)
+        capabilities = self._ensure_readiness(context, driver)
+        arguments = prepared.options.arguments
+        _files.require_supported_upload_path(
+            _files.choose_upload_path(
+                capabilities.server_info,
+                arguments.entity_type,
+                arguments.field_name,
+                prepared.file_size,
+            )
+        )
         upload_info = self._upload_allocation(driver, context, prepared, multipart=False)
         self._upload_direct(driver, context, prepared, upload_info)
         return self._upload_link(driver, context, prepared, upload_info)
@@ -1480,6 +1465,9 @@ class Shotgun:
     def export_page(self, *args: object, **kwargs: object) -> str:
         """Export a page using the documented arguments.
 
+        The Page or its layout must be marked API Exportable in the web UI, or
+        the server rejects the export.
+
         Args:
             *args: Positional values from the documented `export_page`
                 signature.
@@ -1827,7 +1815,11 @@ class Shotgun:
             seed_entity_field,
         )
         return _methods.require_dictionary_list_result(
-            self._call('nav_search_entity', params),
+            self._call(
+                'nav_search',
+                params,
+                invocation_options=_InvocationOptions(logical_method_name='nav_search_entity'),
+            ),
             'nav_search_entity',
         )
 
@@ -1860,7 +1852,11 @@ class Shotgun:
             seed_entity_field,
         )
         return _methods.require_dictionary_list_result(
-            self._call('nav_search_string', params),
+            self._call(
+                'nav_search',
+                params,
+                invocation_options=_InvocationOptions(logical_method_name='nav_search_string'),
+            ),
             'nav_search_string',
         )
 
@@ -1887,7 +1883,11 @@ class Shotgun:
         """
         params = _methods.build_note_thread_read_params(note_id, entity_fields)
         return _methods.require_dictionary_list_result(
-            self._call('note_thread_read', params),
+            self._call(
+                'note_thread_contents',
+                params,
+                invocation_options=_InvocationOptions(logical_method_name='note_thread_read'),
+            ),
             'note_thread_read',
         )
 
@@ -2185,7 +2185,8 @@ class Shotgun:
 
         Supply exactly one of `thumbnail_path` and `source_entity`. A local
         thumbnail is uploaded to the first target before it is shared with the
-        remaining targets.
+        remaining targets. A local thumbnail is rejected before any upload
+        request if the server requires legacy form uploads.
 
         Args:
             entities: Nonempty list of target entities with `type` and `id`.
@@ -2202,7 +2203,8 @@ class Shotgun:
             TypeError: If forwarded arguments do not match the upload signature
                 or include `field_name`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the source selection, entities, or transport fails.
+                or if the source selection, entities, or transport fails, or a
+                local upload requires the legacy form route.
             ShotgunThumbnailNotReady: If an uploaded source stays transient.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
@@ -2468,9 +2470,8 @@ class Shotgun:
     def upload(self, *args: object, **kwargs: object) -> int:
         """Upload a file or thumbnail and return its Attachment ID.
 
-        A successful HTTP response from the legacy form-upload route still
-        raises `ShotgunError`; no Attachment ID is established for that route.
-        The form request has already been sent when this error is raised.
+        A server requiring legacy form uploads raises `ShotgunError` before any
+        upload request is sent. Server capability reads may occur.
 
         Args:
             *args: Positional arguments from the documented upload signature;
@@ -2483,8 +2484,8 @@ class Shotgun:
         Raises:
             TypeError: If arguments do not match the documented signature.
             ShotgunError: If the file or an upload response is invalid, an RPC
-                fault or terminal transport failure occurs, or the legacy
-                form-upload route succeeds.
+                fault or terminal transport failure occurs, or the server
+                requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2516,6 +2517,9 @@ class Shotgun:
     ) -> int:
         """Upload a filmstrip thumbnail through `upload`.
 
+        Servers requiring legacy form uploads are rejected before any upload
+        request is sent.
+
         Args:
             entity_type: Entity type receiving the thumbnail.
             entity_id: Numeric identifier of the receiving entity.
@@ -2528,7 +2532,8 @@ class Shotgun:
         Raises:
             TypeError: If forwarded arguments do not match `upload`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the file, upload response, or transport fails.
+                or if the file, upload response, or transport fails, or the
+                server requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2550,6 +2555,9 @@ class Shotgun:
     ) -> int:
         """Upload a static thumbnail through `upload`.
 
+        Servers requiring legacy form uploads are rejected before any upload
+        request is sent.
+
         Args:
             entity_type: Entity type receiving the thumbnail.
             entity_id: Numeric identifier of the receiving entity.
@@ -2562,7 +2570,8 @@ class Shotgun:
         Raises:
             TypeError: If forwarded arguments do not match `upload`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the file, upload response, or transport fails.
+                or if the file, upload response, or transport fails, or the
+                server requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2578,44 +2587,53 @@ class Shotgun:
     def user_subscriptions_create(self, users: list[dict[str, Any]]) -> bool:
         """Assign subscriptions to users.
 
+        The server accepts this call from scripts and from human users with
+        permission to manage subscriptions, such as members of the Admin
+        permission group. It refuses other human users.
+
         Args:
-            users: Subscription dictionaries that each contain a `user_id` key.
+            users: Subscription dictionaries with a string or integer
+                `humanUserId`; integers become decimal string keys and booleans
+                are not accepted. Each user may appear only once.
+                `subscription` is `None`, a string, or a list of strings.
+                Lists are copied in order. Other entry keys are ignored.
 
         Returns:
-            Whether the server created the subscriptions.
+            `True` when every per-user report is `None`, meaning the server
+            reported no problem; `False` when any user has a non-`None` report.
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if `users` is not a list of dictionaries that each contain a
-                `user_id` key, or the server result is not a boolean.
+                or if `users` contains invalid or duplicate entries, or the
+                server result is not a mapping with string keys.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        return _crud.require_boolean_result(
+        return _methods.require_user_subscriptions_create_result(
             self._call(
                 'user_subscriptions_create',
                 _methods.build_user_subscriptions_create_params(users),
             ),
-            'user_subscriptions_create',
         )
 
     def user_subscriptions_read(self) -> list[dict[str, object]]:
-        """List the current user's subscriptions.
+        """List user subscriptions in server order.
 
         Returns:
-            User subscription dictionaries returned by the server.
+            Subscription entries in server order, each with an unchanged string
+            `humanUserId` and a `subscription` of `None`, a string, or a copied
+            list of strings.
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the server result is not a list of dictionaries.
+                or if the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        return _methods.require_dictionary_list_result(
+        return _methods.require_user_subscriptions_result(
             self._call('user_subscriptions_read', None),
-            'user_subscriptions_read',
         )
 
     def work_schedule_read(

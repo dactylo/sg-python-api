@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "operation": "nav_search_entity",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "nav_search",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "root_path": "/Project/1",
+          "search_criteria": {
+            "entity": {
+              "type": "Asset",
+              "id": 1
+            }
+          },
+          "seed_entity_field": "Asset.project"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "W3sibGFiZWwiOiJGaXh0dXJlIHZhbHVlIiwiaW5jcmVtZW50YWxfcGF0aCI6WyJGaXh0dXJlIHZhbHVlIiwiRml4dHVyZSB2YWx1ZSIsIkZpeHR1cmUgdmFsdWUiLCJGaXh0dXJlIHZhbHVlIl0sInBhdGhfbGFiZWwiOiJGaXh0dXJlIHZhbHVlIiwicmVmIjp7ImlkIjoxLCJ0eXBlIjoiQXNzZXQifSwicHJvamVjdF9pZCI6MX1d"
+  }
+}

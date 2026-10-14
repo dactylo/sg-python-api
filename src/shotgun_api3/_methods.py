@@ -3,7 +3,7 @@
 import dataclasses
 import datetime
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NotRequired, TypedDict, cast
 
 from . import _crud, _protocol
@@ -63,6 +63,9 @@ _ACTIVITY_STREAM_READ_SIGNATURE = inspect.Signature(
     return_annotation=dict[str, object],
 )
 _EXPORT_PAGE_DOCSTRING = """Export a page using the documented arguments.
+
+The Page or its layout must be marked API Exportable in the web UI,
+or the server rejects the export.
 
 Args:
     page_id: Numeric page identifier.
@@ -326,6 +329,18 @@ def _date_str(value: object, argument: str) -> str:
 def _entity(value: object) -> object:
     """Optimize an entity value for client request preparation."""
     return _protocol.optimize_entity(value)
+
+
+def _is_subscription_value(value: object) -> bool:
+    """Check the supported subscription value forms."""
+    return (
+        value is None
+        or isinstance(value, str)
+        or (
+            isinstance(value, list)
+            and all(isinstance(item, str) for item in cast('list[object]', value))
+        )
+    )
 
 
 def _project_entity(value: object) -> object:
@@ -920,11 +935,38 @@ def build_user_subscriptions_create_params(users: object) -> dict[str, object]:
         users,
         'user_subscriptions_create users must be a list',
     )
-    message = 'user_subscriptions_create users must contain dictionaries with a user_id key'
+    entry_message = (
+        'user_subscriptions_create users must contain dictionaries with '
+        'humanUserId and subscription keys'
+    )
+    params: dict[str, object] = {}
     for member in validated:
-        if not isinstance(member, dict) or 'user_id' not in member:
-            raise ShotgunError(message)
-    return {'users': cast('list[dict[str, object]]', validated)}
+        if not isinstance(member, dict):
+            raise ShotgunError(entry_message)
+        entry = cast('dict[str, object]', member)
+        if 'humanUserId' not in entry or 'subscription' not in entry:
+            raise ShotgunError(entry_message)
+        user_id = entry['humanUserId']
+        if isinstance(user_id, bool) or not isinstance(user_id, (str, int)):
+            raise ShotgunError(
+                'user_subscriptions_create users must contain string or integer humanUserId values'
+            )
+        if not _is_subscription_value(entry['subscription']):
+            raise ShotgunError(
+                'user_subscriptions_create users must contain valid subscription values'
+            )
+        key = str(user_id)
+        if key in params:
+            raise ShotgunError(
+                'user_subscriptions_create users must not contain duplicate user IDs'
+            )
+        subscription = entry['subscription']
+        params[key] = (
+            cast('list[str]', subscription).copy()
+            if isinstance(subscription, list)
+            else subscription
+        )
+    return params
 
 
 def build_work_schedule_read_params(
@@ -1122,6 +1164,57 @@ def require_string_result(value: object, method_name: str) -> str:
     if not isinstance(value, str):
         raise ShotgunError(f'{method_name} did not return a string')
     return value
+
+
+def require_user_subscriptions_create_result(value: object) -> bool:
+    """Interpret a mapping of per-user subscription assignment reports.
+
+    Args:
+        value: Raw result returned by the server.
+
+    Returns:
+        `True` if every report is `None`, otherwise `False`.
+
+    Raises:
+        ShotgunError: If the result is not a mapping with string keys.
+    """
+    message = 'user_subscriptions_create returned an invalid result mapping'
+    if not isinstance(value, Mapping):
+        raise ShotgunError(message)
+    reports = cast('Mapping[object, object]', value)
+    if any(not isinstance(key, str) for key in reports):
+        raise ShotgunError(message)
+    return all(report is None for report in reports.values())
+
+
+def require_user_subscriptions_result(value: object) -> list[dict[str, object]]:
+    """Convert a subscription mapping to ordered public entries.
+
+    Args:
+        value: Raw subscription mapping returned by the server.
+
+    Returns:
+        Entries with unchanged string `humanUserId` and `subscription` values
+        of `None`, string, or list of strings. Lists are copied.
+
+    Raises:
+        ShotgunError: If the result is not a valid subscription mapping.
+    """
+    if not isinstance(value, Mapping):
+        raise ShotgunError('user_subscriptions_read did not return a dictionary')
+    subscriptions: list[dict[str, object]] = []
+    for user_id, subscription in cast('Mapping[object, object]', value).items():
+        if not isinstance(user_id, str) or not user_id:
+            raise ShotgunError('user_subscriptions_read returned an invalid user ID')
+        if not _is_subscription_value(subscription):
+            raise ShotgunError('user_subscriptions_read returned an invalid subscription')
+        public_subscription = (
+            cast('list[str]', subscription).copy()
+            if isinstance(subscription, list)
+            else subscription
+        )
+        subscriptions.append({'humanUserId': user_id, 'subscription': public_subscription})
+    return subscriptions
 
 
 def schema_alias_error(entity_type: object) -> ShotgunError:

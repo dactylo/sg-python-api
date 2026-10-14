@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, cast
 from scripts.probe_wire import _FixtureError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
 
+    from shotgun_api3._async_client import AsyncShotgun
     from shotgun_api3._client import Shotgun
 
 
@@ -28,6 +29,17 @@ _REPLAY_RECIPES: Mapping[
     'get_session_token': lambda sg, _body: sg.get_session_token(),
     'info': lambda sg, _body: sg.info(),
     'nav_expand': lambda sg, _body: sg.nav_expand('/'),
+    'nav_search_entity': lambda sg, body: sg.nav_search_entity(
+        _replay_str(body, 'root_path', '/Project/1'),
+        _replay_nav_entity(body),
+        _replay_str(body, 'seed_entity_field', 'Asset.project'),
+    ),
+    'nav_search_string': lambda sg, body: sg.nav_search_string(
+        _replay_str(body, 'root_path', '/Project/1'),
+        _replay_nav_text(body),
+        _replay_str(body, 'seed_entity_field', 'Asset.project'),
+    ),
+    'note_thread_read': lambda sg, body: sg.note_thread_read(_replay_int(body, 'note_id', 1)),
     'preferences_read': lambda sg, _body: sg.preferences_read(),
     'read': lambda sg, _body: sg.find('Project', [], ['name'], limit=2),
     'schema_entity_read': lambda sg, _body: sg.schema_entity_read(),
@@ -45,10 +57,29 @@ _REPLAY_RECIPES: Mapping[
         {'type': 'Project', 'id': _replay_int(body, 'project_id', 1)},
         user={'type': 'HumanUser', 'id': _replay_int(body, 'user_id', 1)},
     ),
+    'user_subscriptions_read': lambda sg, _body: sg.user_subscriptions_read(),
     'work_schedule_read': lambda sg, _body: sg.work_schedule_read(
         '2026-01-05',
         '2026-01-09',
     ),
+}
+
+_ASYNC_REPLAY_RECIPES: Mapping[
+    str,
+    Callable[[AsyncShotgun, Mapping[str, object] | None], Awaitable[object]],
+] = {
+    'nav_search_entity': lambda sg, body: sg.nav_search_entity(
+        _replay_str(body, 'root_path', '/Project/1'),
+        _replay_nav_entity(body),
+        _replay_str(body, 'seed_entity_field', 'Asset.project'),
+    ),
+    'nav_search_string': lambda sg, body: sg.nav_search_string(
+        _replay_str(body, 'root_path', '/Project/1'),
+        _replay_nav_text(body),
+        _replay_str(body, 'seed_entity_field', 'Asset.project'),
+    ),
+    'note_thread_read': lambda sg, body: sg.note_thread_read(_replay_int(body, 'note_id', 1)),
+    'user_subscriptions_read': lambda sg, _body: sg.user_subscriptions_read(),
 }
 
 
@@ -150,6 +181,30 @@ def _replay_int(body: Mapping[str, object] | None, key: str, default: int) -> in
     if isinstance(value, bool) or not isinstance(value, int):
         raise _FixtureError(f'recorded {key} argument is malformed')
     return value
+
+
+def _replay_nav_entity(body: Mapping[str, object] | None) -> dict[str, object]:
+    if body is None:
+        return {'type': 'Asset', 'id': 1}
+    criteria = _replay_param_mapping(body).get('search_criteria')
+    if not isinstance(criteria, dict):
+        raise _FixtureError('recorded navigation criteria are malformed')
+    entity = cast('dict[str, object]', criteria).get('entity')
+    if not isinstance(entity, dict):
+        raise _FixtureError('recorded navigation entity is malformed')
+    return copy.deepcopy(cast('dict[str, object]', entity))
+
+
+def _replay_nav_text(body: Mapping[str, object] | None) -> str:
+    if body is None:
+        return 'Fixture asset'
+    criteria = _replay_param_mapping(body).get('search_criteria')
+    if not isinstance(criteria, dict):
+        raise _FixtureError('recorded navigation criteria are malformed')
+    text = cast('dict[str, object]', criteria).get('search_string')
+    if not isinstance(text, str):
+        raise _FixtureError('recorded navigation text is malformed')
+    return text
 
 
 def _replay_str(body: Mapping[str, object] | None, key: str, default: str) -> str:

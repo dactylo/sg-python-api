@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import inspect
 import json
@@ -68,6 +69,9 @@ _CLIENT_METHOD_PARITY_METHODS = (
 
 _CRUD_PARITY_METHODS = ('batch', 'create', 'delete', 'find', 'find_one', 'revive', 'update')
 
+_CREATE_ENTRY_SUFFIX = 'users must contain dictionaries with humanUserId and subscription keys'
+_CREATE_ID_SUFFIX = 'users must contain string or integer humanUserId values'
+_CREATE_VALUE_SUFFIX = 'users must contain valid subscription values'
 _ENTITY = {'type': 'Shot', 'id': 1, 'code': 'X'}
 _INVALID_PAGE_ID = True
 _PAGE = {'entities': [_ENTITY], 'paging_info': {'entity_count': 1}}
@@ -771,7 +775,7 @@ def _scenarios() -> tuple[_Scenario, ...]:
                 'entity',
             ),
             expected=_Success([{'path': '/Project/3/Shot/2'}]),
-            expected_methods=('info', 'nav_search_entity'),
+            expected_methods=('info', 'nav_search'),
             name='nav_search_entity',
             script=lambda trace: [_response(trace, 'result', [{'path': '/Project/3/Shot/2'}])],
             sync_call=lambda sg: sg.nav_search_entity(
@@ -783,7 +787,7 @@ def _scenarios() -> tuple[_Scenario, ...]:
         _Scenario(
             async_call=lambda sg: sg.nav_search_string('/', 'boat', 'entity'),
             expected=_Success([{'path': '/Project/3/Shot/2'}]),
-            expected_methods=('info', 'nav_search_string'),
+            expected_methods=('info', 'nav_search'),
             name='nav_search_string',
             script=lambda trace: [_response(trace, 'result', [{'path': '/Project/3/Shot/2'}])],
             sync_call=lambda sg: sg.nav_search_string('/', 'boat', 'entity'),
@@ -791,10 +795,52 @@ def _scenarios() -> tuple[_Scenario, ...]:
         _Scenario(
             async_call=lambda sg: sg.note_thread_read(41, {'Note': ['created_by']}),
             expected=_Success([{'type': 'Note', 'id': 41}]),
-            expected_methods=('info', 'note_thread_read'),
+            expected_methods=('info', 'note_thread_contents'),
             name='note_thread_read',
             script=lambda trace: [_response(trace, 'result', [{'type': 'Note', 'id': 41}])],
             sync_call=lambda sg: sg.note_thread_read(41, {'Note': ['created_by']}),
+        ),
+        _Scenario(
+            async_call=lambda sg: sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
+            expected=_Success([{'path': '/Project/3/Shot/2'}]),
+            expected_methods=('info', 'nav_search', 'nav_search'),
+            name='nav_search_entity_retries_as_read',
+            script=lambda trace: [
+                _retry_response(trace, 'retry'),
+                _response(trace, 'result', [{'path': '/Project/3/Shot/2'}]),
+            ],
+            sync_call=lambda sg: sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
+            expected_closed_responses=('retry', 'result'),
+            expected_response_outcomes=('success', 'retry', 'success'),
+            expected_sleeps=(0.0,),
+        ),
+        _Scenario(
+            async_call=lambda sg: sg.nav_search_string('/', 'boat'),
+            expected=_Success([{'path': '/Project/3/Shot/2'}]),
+            expected_methods=('info', 'nav_search', 'nav_search'),
+            name='nav_search_string_retries_as_read',
+            script=lambda trace: [
+                _retry_response(trace, 'retry'),
+                _response(trace, 'result', [{'path': '/Project/3/Shot/2'}]),
+            ],
+            sync_call=lambda sg: sg.nav_search_string('/', 'boat'),
+            expected_closed_responses=('retry', 'result'),
+            expected_response_outcomes=('success', 'retry', 'success'),
+            expected_sleeps=(0.0,),
+        ),
+        _Scenario(
+            async_call=lambda sg: sg.note_thread_read(41),
+            expected=_Success([{'type': 'Note', 'id': 41}]),
+            expected_methods=('info', 'note_thread_contents', 'note_thread_contents'),
+            name='note_thread_read_retries_as_read',
+            script=lambda trace: [
+                _retry_response(trace, 'retry'),
+                _response(trace, 'result', [{'type': 'Note', 'id': 41}]),
+            ],
+            sync_call=lambda sg: sg.note_thread_read(41),
+            expected_closed_responses=('retry', 'result'),
+            expected_response_outcomes=('success', 'retry', 'success'),
+            expected_sleeps=(0.0,),
         ),
         _Scenario(
             async_call=lambda sg: sg.preferences_read(['timezone']),
@@ -902,22 +948,33 @@ def _scenarios() -> tuple[_Scenario, ...]:
         ),
         _Scenario(
             async_call=lambda sg: sg.user_subscriptions_create(
-                [{'user_id': 1, 'subscription': {'name': 'artist'}}]
+                [{'humanUserId': '1', 'subscription': ['artist'], 'label': 'extra'}]
             ),
             expected=_Success(result=True),
             expected_methods=('info', 'user_subscriptions_create'),
             name='user_subscriptions_create',
-            script=lambda trace: [_response(trace, 'result', result=True)],
+            script=lambda trace: [_response(trace, 'result', {'1': None})],
             sync_call=lambda sg: sg.user_subscriptions_create(
-                [{'user_id': 1, 'subscription': {'name': 'artist'}}]
+                [{'humanUserId': '1', 'subscription': ['artist'], 'label': 'extra'}]
             ),
         ),
         _Scenario(
             async_call=lambda sg: sg.user_subscriptions_read(),
-            expected=_Success([{'user_id': 1}]),
+            expected=_Success(
+                [
+                    {'humanUserId': '1', 'subscription': None},
+                    {'humanUserId': '2', 'subscription': 'artist'},
+                    {'humanUserId': 'user-A', 'subscription': ['reviewer']},
+                    {'humanUserId': '4', 'subscription': cast('list[str]', [])},
+                ]
+            ),
             expected_methods=('info', 'user_subscriptions_read'),
             name='user_subscriptions_read',
-            script=lambda trace: [_response(trace, 'result', [{'user_id': 1}])],
+            script=lambda trace: [
+                _response(
+                    trace, 'result', {'1': None, '2': 'artist', 'user-A': ['reviewer'], '4': []}
+                )
+            ],
             sync_call=lambda sg: sg.user_subscriptions_read(),
         ),
         _Scenario(
@@ -1360,6 +1417,159 @@ async def test_sync_async_scenario_parity(
     _assert_trace(scenario, async_trace)
     assert async_transcript == sync_transcript
     assert async_trace == sync_trace
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('human_user_id', ['7', 7])
+@pytest.mark.parametrize('subscription', [None, 'artist', ['artist'], []])
+async def test_user_subscriptions_create_forwards_accepted_values_and_copies_entries(
+    fake_async_client: FakeAsyncClient,
+    human_user_id: str | int,
+    subscription: object,
+) -> None:
+    users = [{'humanUserId': human_user_id, 'subscription': subscription, 'label': ['extra']}]
+    original_subscription = copy.deepcopy(subscription)
+    sg = fake_async_client([_response(_Trace(), 'result', {'7': None})])
+
+    def mutate_after_readiness(event: ObserverEvent) -> None:
+        if isinstance(event, ResponseEvent) and event.operation == 'read':
+            users[0]['humanUserId'] = 'changed'
+            users[0]['subscription'] = 'changed'
+            cast('list[str]', users[0]['label'])[0] = 'changed'
+            if isinstance(subscription, list):
+                cast('list[object]', subscription).append('changed')
+
+    sg.config.on_response = mutate_after_readiness
+
+    assert await sg.user_subscriptions_create(users) is True
+
+    request = _fake_async_transport(sg).requests[-1]
+    assert isinstance(request.body, bytes)
+    body = cast('dict[str, object]', json.loads(request.body))
+    params = cast('list[object]', body['params'])
+    assert params[-1] == {'7': original_subscription}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('identifiers', [('7', '7'), (7, 7), ('7', 7), (7, '7')])
+async def test_user_subscriptions_create_rejects_async_duplicates_before_readiness(
+    fake_async_client: FakeAsyncClient,
+    identifiers: tuple[str | int, str | int],
+) -> None:
+    sg = fake_async_client([])
+    users = [{'humanUserId': item, 'subscription': 'sensitive'} for item in identifiers]
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=r'^user_subscriptions_create users must not contain duplicate user IDs$',
+    ):
+        await sg.user_subscriptions_create(users)
+
+    assert _fake_async_transport(sg).requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('result', 'expected'),
+    [
+        ({}, True),
+        ({'7': None, '9': None}, True),
+        ({'7': None, '9': 'sensitive'}, False),
+        ({'7': False}, False),
+        ({'7': 0}, False),
+        ({'7': ''}, False),
+        ({'7': []}, False),
+        ({'7': {}}, False),
+    ],
+)
+async def test_user_subscriptions_create_interprets_async_per_user_results(
+    fake_async_client: FakeAsyncClient, result: object, expected: bool
+) -> None:
+    sg = fake_async_client([_response(_Trace(), 'result', result)])
+
+    assert await sg.user_subscriptions_create([]) is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('result', [True, False, None, 1, 'sensitive', [], [None]])
+async def test_user_subscriptions_create_rejects_async_non_mapping_results(
+    fake_async_client: FakeAsyncClient, result: object
+) -> None:
+    sg = fake_async_client([_response(_Trace(), 'result', result)])
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=r'^user_subscriptions_create returned an invalid result mapping$',
+    ):
+        await sg.user_subscriptions_create([])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('users', 'message_suffix'),
+    [
+        ({'humanUserId': '7', 'subscription': 'artist'}, 'users must be a list'),
+        (['sensitive-member'], _CREATE_ENTRY_SUFFIX),
+        ([{'subscription': 'artist'}], _CREATE_ENTRY_SUFFIX),
+        ([{'user_id': '7', 'subscription': 'artist'}], _CREATE_ENTRY_SUFFIX),
+        ([{'humanUserId': '7'}], _CREATE_ENTRY_SUFFIX),
+        ([{'humanUserId': 7.0, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
+        ([{'humanUserId': True, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
+        ([{'humanUserId': False, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
+        ([{'humanUserId': None, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
+        ([{'humanUserId': '7', 'subscription': 1}], _CREATE_VALUE_SUFFIX),
+        ([{'humanUserId': '7', 'subscription': True}], _CREATE_VALUE_SUFFIX),
+        ([{'humanUserId': '7', 'subscription': {'sensitive': 'value'}}], _CREATE_VALUE_SUFFIX),
+        ([{'humanUserId': '7', 'subscription': ['artist', 2]}], _CREATE_VALUE_SUFFIX),
+    ],
+)
+async def test_user_subscriptions_create_rejects_malformed_async_entries(
+    fake_async_client: FakeAsyncClient,
+    users: object,
+    message_suffix: str,
+) -> None:
+    sg = fake_async_client([])
+    method = cast(
+        'Callable[[object], Coroutine[object, object, object]]',
+        sg.user_subscriptions_create,
+    )
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=rf'^user_subscriptions_create {message_suffix}$',
+    ) as error:
+        await method(users)
+
+    assert 'sensitive' not in str(error.value)
+    assert _fake_async_transport(sg).requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('result', 'message_suffix'),
+    [
+        (['sensitive-result'], 'did not return a dictionary'),
+        ({'': 'artist'}, 'returned an invalid user ID'),
+        ({'7': ['artist', 2]}, 'returned an invalid subscription'),
+        ({'7': {'sensitive': 'value'}}, 'returned an invalid subscription'),
+        ({'7': 1}, 'returned an invalid subscription'),
+        ({'7': True}, 'returned an invalid subscription'),
+    ],
+)
+async def test_user_subscriptions_read_rejects_malformed_async_results(
+    fake_async_client: FakeAsyncClient,
+    result: object,
+    message_suffix: str,
+) -> None:
+    sg = fake_async_client([_response(_Trace(), 'result', result)])
+
+    with pytest.raises(
+        _errors.ShotgunError,
+        match=rf'^user_subscriptions_read {message_suffix}$',
+    ) as error:
+        await sg.user_subscriptions_read()
+
+    assert 'sensitive' not in str(error.value)
 
 
 @pytest.mark.anyio

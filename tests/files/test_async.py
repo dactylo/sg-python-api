@@ -21,7 +21,6 @@ from shotgun_api3 import (
     Shotgun,
     _errors,
     _files,
-    _protocol,
 )
 from shotgun_api3._async_transport import AsyncStreamingResponse
 from shotgun_api3._config import ProgressEvent
@@ -55,8 +54,6 @@ _FORM_INFO: dict[str, object] = {
     's3_direct_uploads_enabled': False,
     's3_enabled_upload_types': {},
 }
-_FORM_TRANSFER_SIZE = 65_537
-_FORM_UPLOAD_BOUNDARY = 'Task13Boundary'
 _MULTIPART_FIRST_FINAL_BATCH_SIZE = 77_056
 _ONE_USE_VALUE = 'one-use-value'
 _SESSION_VALUE = 'session-one'
@@ -462,20 +459,6 @@ def _fault_response(code: int) -> TransportResponse:
 
 def _form_fields(body: bytes) -> dict[str, str]:
     return dict(urllib.parse.parse_qsl(body.decode(), keep_blank_values=True))
-
-
-def _freeze_form_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
-    original = _protocol.build_multipart_plan
-
-    def build_multipart_plan(
-        fields: dict[str, str],
-        files: list[_protocol.FileSlot],
-        boundary: str | None = None,
-    ) -> _protocol.MultipartPlan:
-        assert boundary is None
-        return original(fields, files, boundary=_FORM_UPLOAD_BOUNDARY)
-
-    monkeypatch.setattr(_protocol, 'build_multipart_plan', build_multipart_plan)
 
 
 def _method_name(request: TransportRequest) -> str | None:
@@ -1615,84 +1598,61 @@ def test_file_method_descriptors_and_signatures_match_sync() -> None:
 
 
 @pytest.mark.anyio
-async def test_form_upload_forwards_async_file_batch_size(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    'method_name',
+    [
+        'upload',
+        'upload_image',
+        'upload_filmstrip',
+        'upload_thumbnail',
+        'upload_filmstrip_thumbnail',
+        'share_thumbnail',
+        'share_filmstrip',
+    ],
+)
+async def test_public_upload_refuses_legacy_form_before_upload_request(
     tmp_path: Path,
+    method_name: str,
 ) -> None:
-    source = tmp_path / 'small.mov'
-    content = b'a' * _FORM_TRANSFER_SIZE
-    source.write_bytes(content)
-    audit = _FilesystemAudit(threading.get_ident())
-    audit.install(monkeypatch)
-    captured_chunk_sizes: list[int] = []
-    original = _files.build_form_upload_exchange
+    source = tmp_path / 'private-file.png'
+    source.write_bytes(b'image')
+    sg, transport = _client([], server_info=_FORM_INFO)
 
-    def capture_chunk_size(
-        canonical_origin: str,
-        user_agent: str,
-        prepared: _files.PreparedUpload,
-        auth: Mapping[str, object],
-        chunk_size: int = 65536,
-    ) -> _files.UploadExchange:
-        captured_chunk_sizes.append(chunk_size)
-        return original(
-            canonical_origin,
-            user_agent,
-            prepared,
-            auth,
-            chunk_size=chunk_size,
-        )
+    async def invoke() -> None:
+        if method_name.startswith('share_'):
+            await sg.share_thumbnail(
+                [{'type': 'Version', 'id': 5}],
+                thumbnail_path=str(source),
+                filmstrip_thumbnail=method_name == 'share_filmstrip',
+            )
+        elif method_name in {'upload_image', 'upload_filmstrip'}:
+            await sg.upload(
+                'Version',
+                5,
+                str(source),
+                field_name=('image' if method_name == 'upload_image' else 'filmstrip_image'),
+            )
+        else:
+            method = getattr(sg, method_name)
+            await method('Version', 5, str(source))
 
-    monkeypatch.setattr(_files, 'build_form_upload_exchange', capture_chunk_size)
-    sg, transport = _client([_text()], server_info=_FORM_INFO)
+    with pytest.raises(
+        ShotgunError,
+        match=r'^server requires legacy form uploads, which this client does not support$',
+    ):
+        await invoke()
 
-    with pytest.raises(ShotgunError, match='form upload success response is not established'):
-        await sg.upload('Version', 5, str(source), field_name='sg_uploaded_movie')
-
-    assert captured_chunk_sizes == [_FILE_BATCH_SIZE]
-    assert audit.read_sizes == [_FORM_TRANSFER_SIZE, 0]
-    assert content in cast('bytes', transport.bodies[1])
+    assert len(transport.requests) == 1
+    assert _method_name(transport.requests[0]) == 'info'
 
 
 @pytest.mark.anyio
-async def test_form_and_unsafe_upload_endpoints_do_not_retry_ambiguous_send(
+async def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    _freeze_form_boundary(monkeypatch)
     small = tmp_path / 'small.mov'
-    small.write_bytes(b'form-data')
-    form, form_transport = _client(
-        [SendError('form'), _text('unused')],
-        server_info=_FORM_INFO,
-    )
-    form.config.user_agents = ('upload-transcript',)
-    with pytest.raises(SendError, match='form'):
-        await form.upload('Version', 5, str(small), field_name='sg_uploaded_movie')
-    assert len(form_transport.requests) == 2
-    form_body = (
-        b'--Task13Boundary\r\nContent-Disposition: form-data; name="entity_type"\r\n\r\n'
-        b'Version\r\n--Task13Boundary\r\nContent-Disposition: form-data; name="entity_id"'
-        b'\r\n\r\n5\r\n--Task13Boundary\r\nContent-Disposition: form-data; name="field_name"'
-        b'\r\n\r\nsg_uploaded_movie\r\n--Task13Boundary\r\nContent-Disposition: form-data; '
-        b'name="display_name"\r\n\r\nsmall.mov\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="script_name"\r\n\r\nscript\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="script_key"\r\n\r\nkey\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="file"; filename="small.mov"\r\nContent-Type: application/octet-stream'
-        b'\r\n\r\nform-data\r\n--Task13Boundary--\r\n'
-    )
-    assert _raw_upload_transcript(
-        form_transport.requests[1:],
-        form_transport.bodies[1:],
-    ) == [
-        (
-            'POST',
-            'https://x.example:443/upload/upload_file',
-            _upload_headers(form_body, 'multipart/form-data; boundary=Task13Boundary'),
-            form_body,
-        )
-    ]
-
+    small.write_bytes(b'file-data')
     direct_allocation = '1 https://storage.example/object timestamp Attachment upload-1'
     allocation, allocation_transport = _client([SendError('allocation'), _text('unused')])
     with pytest.raises(SendError, match='allocation'):

@@ -1777,7 +1777,7 @@ def test_user_agent_defaults_and_management() -> None:
     sg = _fake_client([])
 
     assert sg.config.user_agents == (
-        'shotgun-json (0.1.1)',
+        'shotgun-json (0.1.2)',
         f'Python {sg.client_caps.py_version}',
         'sg-python-api',
     )

@@ -59,7 +59,6 @@ from ._config import (
     server_host,
     server_page_limit,
 )
-from ._errors import ShotgunError
 from ._execution import SuppressedExceptionCapture, release_lease, retire_transport
 from ._signatures import bind_arguments, expose_signature
 from ._transport import (
@@ -1038,29 +1037,6 @@ class AsyncShotgun:
         )
 
     @staticmethod
-    async def _upload_form(
-        driver: AsyncDriver,
-        context: RequestContext,
-        prepared: _files.PreparedUpload,
-    ) -> Never:
-        """Send the observed form request without guessing a success result."""
-        if context.canonical_origin is None:
-            raise ValueError('server parameters must be configured before upload I/O')
-        exchange = _files.build_form_upload_exchange(
-            context.canonical_origin,
-            context.user_agent,
-            prepared,
-            context.auth,
-            chunk_size=_ASYNC_FILE_BATCH_SIZE,
-        )
-
-        def reject_success(_text: str, _headers: Mapping[str, str]) -> Never:
-            raise ShotgunError('form upload success response is not established')
-
-        await _execute_upload_exchange(driver, context, exchange, reject_success)
-        raise AssertionError('form upload response parser returned')
-
-    @staticmethod
     async def _upload_link(
         driver: AsyncDriver,
         context: RequestContext,
@@ -1162,14 +1138,14 @@ class AsyncShotgun:
         arguments = prepared.options.arguments
         capabilities = await self._ensure_readiness(context, driver)
         operation_context = await self._authenticated_context(context, driver)
-        upload_path = _files.choose_upload_path(
-            capabilities.server_info,
-            arguments.entity_type,
-            arguments.field_name,
-            prepared.file_size,
+        upload_path = _files.require_supported_upload_path(
+            _files.choose_upload_path(
+                capabilities.server_info,
+                arguments.entity_type,
+                arguments.field_name,
+                prepared.file_size,
+            )
         )
-        if upload_path == 'form':
-            return await self._upload_form(driver, operation_context, prepared)
         multipart = upload_path == 'multipart'
         upload_info = await self._upload_allocation(
             driver,
@@ -1208,6 +1184,16 @@ class AsyncShotgun:
         prepared: _files.PreparedUpload,
     ) -> int:
         """Execute the exact direct-storage thumbnail workflow."""
+        capabilities = await self._ensure_readiness(context, driver)
+        arguments = prepared.options.arguments
+        _files.require_supported_upload_path(
+            _files.choose_upload_path(
+                capabilities.server_info,
+                arguments.entity_type,
+                arguments.field_name,
+                prepared.file_size,
+            )
+        )
         upload_info = await self._upload_allocation(
             driver,
             context,
@@ -1702,6 +1688,9 @@ class AsyncShotgun:
     async def export_page(self, *args: object, **kwargs: object) -> str:
         """Export a page using the documented arguments.
 
+        The Page or its layout must be marked API Exportable in the web UI, or
+        the server rejects the export.
+
         Args:
             *args: Positional values from the documented `export_page`
                 signature.
@@ -2022,7 +2011,11 @@ class AsyncShotgun:
             entity,
             seed_entity_field,
         )
-        result = await self._call('nav_search_entity', params)
+        result = await self._call(
+            'nav_search',
+            params,
+            _InvocationOptions(logical_method_name='nav_search_entity'),
+        )
         return _methods.require_dictionary_list_result(result, 'nav_search_entity')
 
     async def nav_search_string(
@@ -2053,7 +2046,11 @@ class AsyncShotgun:
             search_string,
             seed_entity_field,
         )
-        result = await self._call('nav_search_string', params)
+        result = await self._call(
+            'nav_search',
+            params,
+            _InvocationOptions(logical_method_name='nav_search_string'),
+        )
         return _methods.require_dictionary_list_result(result, 'nav_search_string')
 
     async def note_thread_read(
@@ -2078,7 +2075,11 @@ class AsyncShotgun:
                 policy.
         """
         params = _methods.build_note_thread_read_params(note_id, entity_fields)
-        result = await self._call('note_thread_read', params)
+        result = await self._call(
+            'note_thread_contents',
+            params,
+            _InvocationOptions(logical_method_name='note_thread_read'),
+        )
         return _methods.require_dictionary_list_result(result, 'note_thread_read')
 
     async def preferences_read(self, prefs: list[str] | None = None) -> dict[str, object]:
@@ -2357,7 +2358,8 @@ class AsyncShotgun:
 
         Supply exactly one of `thumbnail_path` and `source_entity`. A local
         thumbnail is uploaded to the first target before it is shared with the
-        remaining targets.
+        remaining targets. A local thumbnail is rejected before any upload
+        request if the server requires legacy form uploads.
 
         Args:
             entities: Nonempty list of target entities with `type` and `id`.
@@ -2374,7 +2376,8 @@ class AsyncShotgun:
             TypeError: If forwarded arguments do not match the upload signature
                 or include `field_name`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the source selection, entities, or transport fails.
+                or if the source selection, entities, or transport fails, or a
+                local upload requires the legacy form route.
             ShotgunThumbnailNotReady: If an uploaded source stays transient.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
@@ -2647,9 +2650,8 @@ class AsyncShotgun:
     async def upload(self, *args: object, **kwargs: object) -> int:
         """Upload a file or thumbnail and return its Attachment ID.
 
-        A successful HTTP response from the legacy form-upload route still
-        raises `ShotgunError`; no Attachment ID is established for that route.
-        The form request has already been sent when this error is raised.
+        A server requiring legacy form uploads raises `ShotgunError` before any
+        upload request is sent. Server capability reads may occur.
 
         Args:
             *args: Positional arguments from the documented upload signature.
@@ -2661,8 +2663,8 @@ class AsyncShotgun:
         Raises:
             TypeError: If arguments do not match the documented signature.
             ShotgunError: If the file or an upload response is invalid, an RPC
-                fault or terminal transport failure occurs, or the legacy
-                form-upload route succeeds.
+                fault or terminal transport failure occurs, or the server
+                requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2694,6 +2696,9 @@ class AsyncShotgun:
     ) -> int:
         """Upload a filmstrip thumbnail through `upload`.
 
+        Servers requiring legacy form uploads are rejected before any upload
+        request is sent.
+
         Args:
             entity_type: Entity type receiving the thumbnail.
             entity_id: Numeric identifier of the receiving entity.
@@ -2706,7 +2711,8 @@ class AsyncShotgun:
         Raises:
             TypeError: If forwarded arguments do not match `upload`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the file, upload response, or transport fails.
+                or if the file, upload response, or transport fails, or the
+                server requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2728,6 +2734,9 @@ class AsyncShotgun:
     ) -> int:
         """Upload a static thumbnail through `upload`.
 
+        Servers requiring legacy form uploads are rejected before any upload
+        request is sent.
+
         Args:
             entity_type: Entity type receiving the thumbnail.
             entity_id: Numeric identifier of the receiving entity.
@@ -2740,7 +2749,8 @@ class AsyncShotgun:
         Raises:
             TypeError: If forwarded arguments do not match `upload`.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if the file, upload response, or transport fails.
+                or if the file, upload response, or transport fails, or the
+                server requires legacy form uploads.
             ProtocolError: If an upload endpoint returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2756,28 +2766,40 @@ class AsyncShotgun:
     async def user_subscriptions_create(self, users: list[dict[str, Any]]) -> bool:
         """Assign subscriptions to users.
 
+        The server accepts this call from scripts and from human users with
+        permission to manage subscriptions, such as members of the Admin
+        permission group. It refuses other human users.
+
         Args:
-            users: Subscription dictionaries containing `user_id` keys.
+            users: Subscription dictionaries with a string or integer
+                `humanUserId`; integers become decimal string keys and booleans
+                are not accepted. Each user may appear only once.
+                `subscription` is `None`, a string, or a list of strings.
+                Lists are copied in order. Other entry keys are ignored.
 
         Returns:
-            Whether the server created the subscriptions.
+            `True` when every per-user report is `None`, meaning the server
+            reported no problem; `False` when any user has a non-`None` report.
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if arguments or the server result are invalid.
+                or if `users` contains invalid or duplicate entries, or the
+                server result is not a mapping with string keys.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
         params = _methods.build_user_subscriptions_create_params(users)
         result = await self._call('user_subscriptions_create', params)
-        return _crud.require_boolean_result(result, 'user_subscriptions_create')
+        return _methods.require_user_subscriptions_create_result(result)
 
     async def user_subscriptions_read(self) -> list[dict[str, object]]:
-        """List the current user's subscriptions.
+        """List user subscriptions in server order.
 
         Returns:
-            User subscription dictionaries returned by the server.
+            Subscription entries in server order, each with an unchanged string
+            `humanUserId` and a `subscription` of `None`, a string, or a copied
+            list of strings.
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
@@ -2787,7 +2809,7 @@ class AsyncShotgun:
                 policy.
         """
         result = await self._call('user_subscriptions_read', None)
-        return _methods.require_dictionary_list_result(result, 'user_subscriptions_read')
+        return _methods.require_user_subscriptions_result(result)
 
     async def work_schedule_read(
         self,

@@ -124,7 +124,7 @@ def test_nav_search_entity_optimizes_and_detaches_entity() -> None:
 
     sg.nav_search_entity('/', entity, seed_entity_field='entity')
 
-    assert _sent_payload(sg)['method_name'] == 'nav_search_entity'
+    assert _sent_payload(sg)['method_name'] == 'nav_search'
     assert _params(sg) == {
         'root_path': '/',
         'search_criteria': {
@@ -140,7 +140,7 @@ def test_nav_search_string_builds_exact_payload_and_omits_optional() -> None:
     sg.nav_search_string('/', 'bunny', seed_entity_field='entity')
     sg.nav_search_string('/', 'bunny')
 
-    assert _sent_payload(sg)['method_name'] == 'nav_search_string'
+    assert _sent_payload(sg)['method_name'] == 'nav_search'
     assert _params(sg) == {
         'root_path': '/',
         'search_criteria': {'search_string': 'bunny'},

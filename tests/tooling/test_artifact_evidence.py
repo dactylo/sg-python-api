@@ -14,7 +14,7 @@ from tests._git import git_env
 
 HELPER = Path(__file__).resolve().parents[2] / 'scripts' / '_artifact_evidence.py'
 REPORT = 'dist/artifact-results.md'
-WHEEL_NAME = 'sg_python_api-0.1.1-py3-none-any.whl'
+WHEEL_NAME = 'sg_python_api-0.1.2-py3-none-any.whl'
 
 
 def _git(candidate: Path, *arguments: str) -> str:
@@ -72,8 +72,8 @@ def _prepare_artifact_evidence(tmp_path: Path) -> tuple[Path, str, Path, str]:
     digest = _write_wheel(
         wheel,
         {
-            'sg_python_api-0.1.1.dist-info/METADATA': (
-                'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.1\n'
+            'sg_python_api-0.1.2.dist-info/METADATA': (
+                'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.2\n'
             ),
         },
     )
@@ -164,7 +164,7 @@ def test_isolated_cli_returns_exact_evidence_tuple(
 
     assert result.returncode == 0, result.stderr
     assert result.stderr == ''
-    assert result.stdout == f'{commit}|0.1.1|{wheel.resolve()}|{digest}\n'
+    assert result.stdout == f'{commit}|0.1.2|{wheel.resolve()}|{digest}\n'
 
 
 @pytest.mark.parametrize(
@@ -316,7 +316,7 @@ def test_excluded_candidate_paths_do_not_make_evidence_stale(
     [
         ({}, 'invalid metadata contents'),
         ({'a.dist-info/METADATA': '', 'b.dist-info/METADATA': ''}, 'invalid metadata contents'),
-        ({'a.dist-info/METADATA': 'Name: other\nVersion: 0.1.1\n'}, 'wrong project name'),
+        ({'a.dist-info/METADATA': 'Name: other\nVersion: 0.1.2\n'}, 'wrong project name'),
         ({'a.dist-info/METADATA': 'Name: sg-python-api\n'}, 'invalid version'),
         (
             {'a.dist-info/METADATA': 'Name: sg-python-api\nVersion: bad|version\n'},

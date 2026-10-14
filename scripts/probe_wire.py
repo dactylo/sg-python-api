@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 """Capture sanitized RPC wire fixtures from a licensed test site.
 
-Run `python scripts/probe_wire.py` with `SG_TEST_SITE`, `SG_TEST_SCRIPT`, and
-`SG_TEST_KEY` configured. The site must contain a usable Project and active
-HumanUser.
+Run `python scripts/probe_wire.py` with `SG_TEST_SITE`, `SG_TEST_SCRIPT`,
+`SG_TEST_KEY`, and `SG_TEST_PROJECT` configured. The site must contain an
+active HumanUser and a Project whose name exactly matches `SG_TEST_PROJECT`.
 
-Capture creates temporary Notes and deletes them during cleanup. It also
-updates Project access metadata, which is not restored. Successful capture,
-cleanup, and validation precede replacement of files in `tests/fixtures`.
+Capture creates temporary Notes, a Reply, and an Asset and deletes them during
+cleanup. It also updates Project access metadata, which is not restored.
+Successful capture, cleanup, and validation precede replacement of files in
+`tests/fixtures`.
 
 Importing this module prepends the checkout's `src` directory to `sys.path`.
 """
@@ -27,7 +28,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
@@ -58,6 +59,9 @@ _CAPTURE_SPECS: Mapping[
     'get_session_token': ('get_session_token', 'script', 'success'),
     'info': ('info', 'script', 'success'),
     'nav_expand': ('nav_expand', 'script', 'success'),
+    'nav_search_entity': ('nav_search', 'script', 'success'),
+    'nav_search_string': ('nav_search', 'script', 'success'),
+    'note_thread_read': ('note_thread_contents', 'script', 'success'),
     'preferences_read': ('preferences_read', 'script', 'success'),
     'read': ('read', 'script', 'success'),
     'schema_entity_read': ('schema_entity_read', 'script', 'success'),
@@ -69,6 +73,7 @@ _CAPTURE_SPECS: Mapping[
         'script',
         'success',
     ),
+    'user_subscriptions_read': ('user_subscriptions_read', 'script', 'success'),
     'work_schedule_read': ('work_schedule_read', 'script', 'success'),
 }
 _COMMON_SENSITIVE_KEYS = frozenset(
@@ -96,6 +101,8 @@ _HTTP_STATUS_MAX = 599
 _HTTP_STATUS_MIN = 100
 _IDENTIFIER_SECRET_CATEGORIES = frozenset({'login', 'script_name', 'site', 'user_login'})
 _NORMALIZED_SESSION_VALUE = 'X' * 21
+_NORMALIZED_UTC_DATETIME = '2026-01-05T00:00:00Z'
+_NOTE_THREAD_MIN_ROWS = 2
 _READ_ENTITY_LIMIT = 2
 _REDACTED = 'REDACTED'
 _REQUEST_HEADER_ALLOWLIST = frozenset({'content-type'})
@@ -322,6 +329,15 @@ class _CleanupClient(Protocol):
         """
         ...
 
+    def find_one(
+        self,
+        entity_type: str,
+        filters: list[list[object]],
+        fields: list[str],
+    ) -> dict[str, object] | None:
+        """Find one active tracked entity by its ID."""
+        ...
+
 
 @dataclass(frozen=True)
 class _LiveState:
@@ -341,7 +357,7 @@ class _ResourceRegistry:
         self._resources: list[tuple[str, int]] = []
 
     def _cleanup(self, client: _CleanupClient) -> list[BaseException]:
-        """Delete all tracked resources while collecting every failure."""
+        """Delete and verify all tracked resources while collecting every failure."""
         failures: list[BaseException] = []
         for entity_type, entity_id in reversed(self._resources):
             deleted = False
@@ -349,7 +365,11 @@ class _ResourceRegistry:
             with _FailureCollector(failures):
                 deleted = client.delete(entity_type, entity_id)
             if len(failures) == before and not deleted:
-                failures.append(_ProbeError(f'cleanup rejected {entity_type} {entity_id}'))
+                failures.append(_ProbeError(f'cleanup rejected {entity_type}'))
+            with _FailureCollector(failures):
+                active = client.find_one(entity_type, [['id', 'is', entity_id]], ['id'])
+                if active is not None:
+                    raise _ProbeError(f'cleanup left active {entity_type}')
         return failures
 
     def _track(self, entity_type: str, entity_id: int) -> None:
@@ -493,6 +513,33 @@ def _make_recording_client(
     )
     client._transport = recorder  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # White-box fixture capture owns this transport.
     return client, recorder
+
+
+def _nav_seed_candidates(value: object) -> list[str]:
+    """Read qualified seeds from one navigation node's target metadata."""
+    if not isinstance(value, dict):
+        return []
+    target = cast('dict[str, object]', value).get('target_entities')
+    if not isinstance(target, dict):
+        return []
+    presets = cast('dict[str, object]', target).get('additional_filter_presets')
+    if not isinstance(presets, list):
+        return []
+    candidates: list[str] = []
+    for preset in cast('list[object]', presets):
+        if not isinstance(preset, dict):
+            continue
+        seed = cast('dict[str, object]', preset).get('seed')
+        if not isinstance(seed, dict):
+            continue
+        seed_type = cast('dict[str, object]', seed).get('type')
+        field = cast('dict[str, object]', seed).get('field')
+        if not isinstance(seed_type, str) or not isinstance(field, str):
+            continue
+        qualified = f'{seed_type}.{field}'
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*', qualified):
+            candidates.append(qualified)
+    return candidates
 
 
 def _normalization_error(operation: str, rule: str) -> _FixtureError:
@@ -671,10 +718,30 @@ def _normalization_params(
     return params[auth_length:], normalized
 
 
+@overload
 def _normalization_parts(
     value: Mapping[str, object],
     operation: str,
-) -> tuple[dict[str, object], dict[str, object]]:
+    *,
+    direct: Literal[False] = False,
+) -> tuple[dict[str, object], dict[str, object]]: ...
+
+
+@overload
+def _normalization_parts(
+    value: Mapping[str, object],
+    operation: str,
+    *,
+    direct: Literal[True],
+) -> tuple[dict[str, object], object]: ...
+
+
+def _normalization_parts(
+    value: Mapping[str, object],
+    operation: str,
+    *,
+    direct: bool = False,
+) -> tuple[dict[str, object], object]:
     """Validate common record surfaces and return raw request and response JSON."""
     record = _normalization_dict(
         operation,
@@ -722,12 +789,12 @@ def _normalization_parts(
     if not isinstance(content_b64, str):
         raise _normalization_error(operation, 'response content')
     try:
-        decoded = json.loads(base64.b64decode(content_b64, validate=True))
+        decoded: object = json.loads(base64.b64decode(content_b64, validate=True))
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _normalization_error(operation, 'response content') from exc
-    if not isinstance(decoded, dict):
+    if not direct and not isinstance(decoded, dict):
         raise _normalization_error(operation, 'response envelope')
-    return body, cast('dict[str, object]', decoded)
+    return body, cast('object', decoded)
 
 
 def _normalization_positive_int(operation: str, value: object, rule: str) -> None:
@@ -940,10 +1007,46 @@ def _normalization_strings(
     return cast('list[str]', items)
 
 
+def _normalize_open_result(operation: str, value: object, key: str = '') -> object:
+    """Preserve response shape while replacing every open-ended scalar."""
+    if isinstance(value, dict):
+        mapping = cast('dict[object, object]', value)
+        if any(
+            not isinstance(name, str) or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]*', name) is None
+            for name in mapping
+        ):
+            raise _normalization_error(operation, 'response field names')
+        return {
+            name: _normalize_open_result(operation, item, name)
+            for name, item in cast('dict[str, object]', mapping).items()
+        }
+    if isinstance(value, list):
+        return [
+            _normalize_open_result(operation, item, key) for item in cast('list[object]', value)
+        ]
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return 1 if isinstance(value, int) else 1.0
+    if isinstance(value, str):
+        normalized = (
+            value
+            if key == 'type'
+            and value in {'Asset', 'EventLogEntry', 'HumanUser', 'Note', 'Project', 'Reply'}
+            else 'Fixture value'
+        )
+        if _is_sensitive_key(key):
+            normalized = _REDACTED
+        elif re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', value):
+            normalized = _NORMALIZED_UTC_DATETIME
+        return normalized
+    raise _normalization_error(operation, 'response value type')
+
+
 def _normalized_record(
     operation: str,
     params: list[object],
-    response_content: Mapping[str, object],
+    response_content: object,
 ) -> dict[str, object]:
     """Build one deterministic complete record before independent controls."""
     rpc_method, auth_mode, outcome_kind = _CAPTURE_SPECS[operation]
@@ -972,7 +1075,7 @@ def _normalized_record(
 
 
 def _normalize_activity_stream_read(value: Mapping[str, object]) -> dict[str, object]:
-    """Normalize the fixed activity-stream request and empty-update response."""
+    """Normalize activity updates without retaining live record content."""
     operation = 'activity_stream_read'
     body, response = _normalization_parts(value, operation)
     tail, params = _normalization_params(operation, body, 1)
@@ -996,7 +1099,9 @@ def _normalize_activity_stream_read(value: Mapping[str, object]) -> dict[str, ob
     _normalization_exact(operation, response['entity_type'], 'Project', 'activity response type')
     for name in ('earliest_update_id', 'entity_id', 'latest_update_id'):
         _normalization_nonnegative_int(operation, response[name], 'activity response identity')
-    _normalization_list(operation, response['updates'], 'activity response updates', length=0)
+    updates = _normalization_list(operation, response['updates'], 'activity response updates')
+    if any(not isinstance(update, dict) for update in updates):
+        raise _normalization_error(operation, 'activity response updates')
     params.append(
         {
             'type': 'Project',
@@ -1015,7 +1120,7 @@ def _normalize_activity_stream_read(value: Mapping[str, object]) -> dict[str, ob
             'entity_id': 1,
             'latest_update_id': 1,
             'earliest_update_id': 1,
-            'updates': [],
+            'updates': _normalize_open_result(operation, updates),
         },
     )
 
@@ -1290,6 +1395,104 @@ def _normalize_nav_expand(value: Mapping[str, object]) -> dict[str, object]:
     )
 
 
+def _normalize_nav_search_entity(value: Mapping[str, object]) -> dict[str, object]:
+    """Normalize one entity navigation search and its result rows."""
+    operation = 'nav_search_entity'
+    body, response = _normalization_parts(value, operation, direct=True)
+    tail, params = _normalization_params(operation, body, 1)
+    request = _normalization_dict(
+        operation,
+        tail[0],
+        {'root_path', 'search_criteria', 'seed_entity_field'},
+        'nav search request',
+    )
+    if not isinstance(request['root_path'], str) or not request['root_path'].startswith('/'):
+        raise _normalization_error(operation, 'nav search root')
+    if (
+        not isinstance(request['seed_entity_field'], str)
+        or re.fullmatch(
+            r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
+            request['seed_entity_field'],
+        )
+        is None
+    ):
+        raise _normalization_error(operation, 'nav search seed')
+    criteria = _normalization_dict(
+        operation, request['search_criteria'], {'entity'}, 'nav search criteria'
+    )
+    _normalization_entity(
+        operation, criteria['entity'], 'Asset', 'nav search entity', with_name=False
+    )
+    rows = _normalization_list(operation, response, 'nav search rows')
+    if any(not isinstance(row, dict) for row in rows):
+        raise _normalization_error(operation, 'nav search rows')
+    params.append(
+        {
+            'root_path': '/Project/1',
+            'search_criteria': {'entity': {'type': 'Asset', 'id': 1}},
+            'seed_entity_field': 'Asset.project',
+        }
+    )
+    return _normalized_record(operation, params, _normalize_open_result(operation, rows))
+
+
+def _normalize_nav_search_string(value: Mapping[str, object]) -> dict[str, object]:
+    """Normalize one string navigation search and its result rows."""
+    operation = 'nav_search_string'
+    body, response = _normalization_parts(value, operation, direct=True)
+    tail, params = _normalization_params(operation, body, 1)
+    request = _normalization_dict(
+        operation,
+        tail[0],
+        {'root_path', 'search_criteria', 'seed_entity_field'},
+        'nav search request',
+    )
+    if not isinstance(request['root_path'], str) or not request['root_path'].startswith('/'):
+        raise _normalization_error(operation, 'nav search root')
+    if (
+        not isinstance(request['seed_entity_field'], str)
+        or re.fullmatch(
+            r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
+            request['seed_entity_field'],
+        )
+        is None
+    ):
+        raise _normalization_error(operation, 'nav search seed')
+    criteria = _normalization_dict(
+        operation, request['search_criteria'], {'search_string'}, 'nav search criteria'
+    )
+    if not isinstance(criteria['search_string'], str) or not criteria['search_string']:
+        raise _normalization_error(operation, 'nav search text')
+    rows = _normalization_list(operation, response, 'nav search rows')
+    if any(not isinstance(row, dict) for row in rows):
+        raise _normalization_error(operation, 'nav search rows')
+    params.append(
+        {
+            'root_path': '/Project/1',
+            'search_criteria': {'search_string': 'Fixture asset'},
+            'seed_entity_field': 'Asset.project',
+        }
+    )
+    return _normalized_record(operation, params, _normalize_open_result(operation, rows))
+
+
+def _normalize_note_thread_read(value: Mapping[str, object]) -> dict[str, object]:
+    """Normalize one Note thread with a Reply and no requested extra fields."""
+    operation = 'note_thread_read'
+    body, response = _normalization_parts(value, operation, direct=True)
+    tail, params = _normalization_params(operation, body, 1)
+    request = _normalization_dict(operation, tail[0], {'note_id'}, 'note thread request')
+    _normalization_positive_int(operation, request['note_id'], 'note ID')
+    rows = _normalization_list(operation, response, 'note thread rows')
+    if len(rows) < _NOTE_THREAD_MIN_ROWS or any(not isinstance(row, dict) for row in rows):
+        raise _normalization_error(operation, 'note thread rows')
+    types = [cast('dict[str, object]', row).get('type') for row in rows]
+    if 'Note' not in types or 'Reply' not in types:
+        raise _normalization_error(operation, 'note thread entity types')
+    params.append({'note_id': 1})
+    return _normalized_record(operation, params, _normalize_open_result(operation, rows))
+
+
 def _normalize_preferences_read(value: Mapping[str, object]) -> dict[str, object]:
     """Normalize preferences to deterministic values for the fixed key set."""
     operation = 'preferences_read'
@@ -1554,6 +1757,32 @@ def _normalize_update_project_last_accessed(
     return _normalized_record(operation, params, {'results': True})
 
 
+def _normalize_user_subscriptions_read(value: Mapping[str, object]) -> dict[str, object]:
+    """Normalize subscription rows without retaining user IDs or plan names."""
+    operation = 'user_subscriptions_read'
+    body, response = _normalization_parts(value, operation)
+    _tail, params = _normalization_params(operation, body, 0)
+    envelope = _normalization_dict(operation, response, {'results'}, 'subscriptions response')
+    result = envelope['results']
+    if not isinstance(result, dict):
+        raise _normalization_error(operation, 'subscriptions mapping')
+    mapping = cast('dict[object, object]', result)
+    if any(
+        not isinstance(user_id, str)
+        or not user_id.isascii()
+        or not user_id.isdecimal()
+        or int(user_id) <= 0
+        or not isinstance(subscription, str)
+        for user_id, subscription in mapping.items()
+    ):
+        raise _normalization_error(operation, 'subscriptions mapping')
+    normalized = {
+        str(index): f'Fixture subscription {index}'
+        for index, _entry in enumerate(mapping.items(), 1)
+    }
+    return _normalized_record(operation, params, {'results': normalized})
+
+
 def _normalize_work_schedule_read(value: Mapping[str, object]) -> dict[str, object]:
     """Normalize the fixed five-day work schedule exchange."""
     operation = 'work_schedule_read'
@@ -1657,6 +1886,9 @@ def _fixture_normalizers() -> dict[str, Callable[[Mapping[str, object]], dict[st
         'get_session_token': _normalize_get_session_token,
         'info': _normalize_info,
         'nav_expand': _normalize_nav_expand,
+        'nav_search_entity': _normalize_nav_search_entity,
+        'nav_search_string': _normalize_nav_search_string,
+        'note_thread_read': _normalize_note_thread_read,
         'preferences_read': _normalize_preferences_read,
         'read': _normalize_read,
         'schema_entity_read': _normalize_schema_entity_read,
@@ -1664,8 +1896,37 @@ def _fixture_normalizers() -> dict[str, Callable[[Mapping[str, object]], dict[st
         'summarize': _normalize_summarize,
         'text_search': _normalize_text_search,
         'update_project_last_accessed': _normalize_update_project_last_accessed,
+        'user_subscriptions_read': _normalize_user_subscriptions_read,
         'work_schedule_read': _normalize_work_schedule_read,
     }
+
+
+def _project_nav_path(value: object) -> str:
+    """Read the path returned by a selected Project navigation expansion."""
+    if not isinstance(value, dict):
+        raise _ProbeError('navigation expansion is malformed')
+    path = cast('dict[str, object]', value).get('path')
+    if isinstance(path, str) and path.startswith('/') and len(path) > 1:
+        return path
+    raise _ProbeError('configured test project has no navigation path')
+
+
+def _qualified_nav_seed(value: object) -> str:
+    """Select a qualified seed advertised by expanded navigation metadata."""
+    if not isinstance(value, dict):
+        raise _ProbeError('navigation expansion is malformed')
+    node = cast('dict[str, object]', value)
+    children = node.get('children')
+    if not isinstance(children, list):
+        raise _ProbeError('navigation expansion has malformed children')
+    candidates = [
+        seed
+        for item in [node, *cast('list[object]', children)]
+        for seed in _nav_seed_candidates(item)
+    ]
+    if not candidates:
+        raise _ProbeError('navigation expansion has no qualified seed metadata')
+    return next((seed for seed in candidates if seed.startswith('Asset.')), candidates[0])
 
 
 def _redact_text(value: str, secrets: Collection[str]) -> str:
@@ -1734,13 +1995,17 @@ def _run_live_operations(
     resources: _ResourceRegistry,
     run_name: str,
     secrets: dict[str, str],
+    project_name: str,
 ) -> list[dict[str, object]]:
     """Execute the complete required live inventory under one namespace."""
     bad_client = state.bad_client
     bad_recorder = state.bad_recorder
     client = state.client
     recorder = state.recorder
-    project = _require_entity(client.find_one('Project', [], ['id']), 'Project')
+    project_value = client.find_one('Project', [['name', 'is', project_name]], ['id'])
+    if project_value is None:
+        raise _ProbeError('configured test project is unavailable')
+    project = _require_entity(project_value, 'Project')
     user = _require_entity(
         client.find_one('HumanUser', [['sg_status_list', 'is', 'act']], ['id']),
         'HumanUser',
@@ -1757,7 +2022,8 @@ def _run_live_operations(
         resources._track('Note', cast('int', note['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         return result
 
-    _capture_call(recorder, 'create', create_note)
+    note = _require_entity(_capture_call(recorder, 'create', create_note), 'Note')
+
     _capture_call(
         recorder,
         'summarize',
@@ -1806,6 +2072,31 @@ def _run_live_operations(
         return batch_results
 
     _capture_call(recorder, 'batch', create_batch_note)
+    project_expansion = client.nav_expand(f'/Project/{project["id"]}')
+    project_path = _project_nav_path(project_expansion)
+    reply = _require_entity(client.create('Reply', {'entity': note, 'content': run_name}), 'Reply')
+    resources._track('Reply', cast('int', reply['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    _capture_call(
+        recorder,
+        'note_thread_read',
+        lambda: client.note_thread_read(cast('int', note['id'])),
+    )
+    seed = _qualified_nav_seed(project_expansion)
+    asset = _require_entity(
+        client.create('Asset', {'code': run_name, 'project': project}), 'Asset'
+    )
+    resources._track('Asset', cast('int', asset['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    _capture_call(
+        recorder,
+        'nav_search_string',
+        lambda: client.nav_search_string(project_path, run_name, seed),
+    )
+    _capture_call(
+        recorder,
+        'nav_search_entity',
+        lambda: client.nav_search_entity(project_path, asset, seed),
+    )
+    _capture_call(recorder, 'user_subscriptions_read', client.user_subscriptions_read)
     session_token = _capture_call(recorder, 'get_session_token', client.get_session_token)
     secrets['session_token'] = session_token
     recorder._add_secret('session_token', session_token)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -1907,7 +2198,8 @@ def _validate_request(value: object) -> tuple[dict[str, object], dict[str, objec
 def _validate_response(
     value: object,
     kind: Literal['success', 'fault'],
-) -> tuple[dict[str, object], dict[str, object]]:
+    operation: str,
+) -> tuple[dict[str, object], object]:
     """Validate response metadata, exact bytes, and expected envelope kind."""
     response = _expect_dict(value, 'fixture response')
     _expect_exact_keys(
@@ -1933,10 +2225,15 @@ def _validate_response(
     if not isinstance(content_b64, str):
         raise _FixtureError('fixture response content_b64 is malformed')
     try:
-        decoded = json.loads(base64.b64decode(content_b64, validate=True))
+        decoded: object = json.loads(base64.b64decode(content_b64, validate=True))
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise _FixtureError('fixture response content is not base64 JSON') from exc
-    envelope = _expect_dict(decoded, 'fixture response envelope')
+    direct_lists = {'nav_search_entity', 'nav_search_string', 'note_thread_read'}
+    if operation in direct_lists:
+        _normalization_list(operation, decoded, 'response rows')
+    else:
+        _expect_dict(decoded, 'fixture response envelope')
+    envelope = cast('dict[str, object]', decoded) if isinstance(decoded, dict) else {}
     is_fault = envelope.get('exception') is True
     if kind == 'fault' and (
         not is_fault or envelope.get('error_code') != _AUTHENTICATION_ERROR_CODE
@@ -1944,7 +2241,7 @@ def _validate_response(
         raise _FixtureError('fixture response is not the expected authentication fault')
     if kind == 'success' and is_fault:
         raise _FixtureError('successful fixture contains a fault envelope')
-    return response, envelope
+    return response, cast('object', decoded)
 
 
 def _validate_fixture(value: object) -> dict[str, object]:
@@ -1965,7 +2262,7 @@ def _validate_fixture(value: object) -> dict[str, object]:
         raise _FixtureError('fixture auth_mode is unsupported')
     _outcome, kind = _validate_outcome(record['outcome'])
     _request, body = _validate_request(record['request'])
-    _response, _envelope = _validate_response(record['response'], kind)
+    _response, _envelope = _validate_response(record['response'], kind, operation)
     _validate_operation_contract(operation, auth_mode, kind, body)
     _assert_fixture_sanitized(record)
     return record
@@ -2046,6 +2343,7 @@ def _run_live_probe(
     site: str,
     script_name: str,
     api_key: str,
+    project_name: str,
 ) -> tuple[list[dict[str, object]], dict[str, str], frozenset[str]]:
     """Create isolated clients, run the inventory, and enforce lifecycle cleanup."""
     run_name = f'sg-python-api-wire-probe-{uuid.uuid4().hex}'
@@ -2084,6 +2382,7 @@ def _run_live_probe(
             resources,
             run_name,
             secrets,
+            project_name,
         ),
         resources,
         client,
@@ -2150,7 +2449,8 @@ def main() -> int:
     site = os.environ['SG_TEST_SITE']
     script_name = os.environ['SG_TEST_SCRIPT']
     api_key = os.environ['SG_TEST_KEY']
-    records, secrets, private_canaries = _run_live_probe(site, script_name, api_key)
+    project_name = os.environ['SG_TEST_PROJECT']
+    records, secrets, private_canaries = _run_live_probe(site, script_name, api_key, project_name)
     _write_fixture_directory(
         _FIXTURE_DIRECTORY,
         records,

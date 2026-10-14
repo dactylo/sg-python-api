@@ -20,7 +20,7 @@ This documentation uses SG for Flow Production Tracking, formerly named Shotgun 
   for application tests.
 
 sg-python-api is an independent implementation of the documented API of Autodesk's Python client
-`3.10.2`. Some behavior differs on purpose, so validate your application's workflows against a test
+`3.10.3`. Some behavior differs on purpose, so validate your application's workflows against a test
 site before replacing its production client. The [migration guide](docs/migration-guide.md) walks
 through the switch, and the [compatibility reference](COMPATIBILITY.md) lists the differences.
 

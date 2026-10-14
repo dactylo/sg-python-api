@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-python-api"
-version = "0.1.1"
+version = "0.1.2"
 description = "Python client for Autodesk Flow Production Tracking"
 keywords = [ "api", "flow-production-tracking", "shotgrid", "shotgun", "shotgun-api3" ]
 license = "MIT"
@@ -138,6 +138,7 @@ max_supported_python = "3.15"
 [tool.pyright]
 pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
 typeCheckingMode = "strict"
+exclude = [ "dist" ]
 extraPaths = [ ".", "src" ]
 executionEnvironments = [
   { root = "tests", reportPrivateUsage = "none" },

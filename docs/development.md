@@ -119,7 +119,7 @@ invalidate the evidence. Both scripts need network access and a
 
 Run `scripts/run_conformance.sh` with the same `PATH` and with `SG_TEST_SITE`, `SG_TEST_SCRIPT`,
 `SG_TEST_KEY`, `SG_TEST_HUMAN_LOGIN`, and `SG_TEST_HUMAN_PASSWORD` set. It clones Autodesk's suite
-at `v3.10.2`, runs it against the validated wheel, and appends a tally to
+at `v3.10.3`, runs it against the validated wheel, and appends a tally to
 `dist/conformance-results.md`.
 
 The configured human user must already exist and authenticate with a legacy login passphrase and

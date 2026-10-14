@@ -7,7 +7,6 @@ import json
 import math
 import re
 import sys
-import uuid as _uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC
 from email.utils import parsedate_to_datetime
@@ -107,7 +106,6 @@ _IMF_FIXDATE_PATTERN = re.compile(
 _JITTER_BYTES = 8
 _JITTER_RANGE = 1 << (_JITTER_BYTES * 8)
 _MIN_CONDITION_PARTS = 2
-_MULTIPART_BOUNDARY_PATTERN = re.compile(r"[A-Za-z0-9'+._-]{1,70}")
 _OPTIMIZABLE_RELATIONS = frozenset({'is', 'is_not', 'in', 'not_in'})
 _RETRYABLE_STATUSES = frozenset({502, 503, 504})
 _RETRY_AFTER_TOO_LARGE: Final = 'too-large'
@@ -207,34 +205,6 @@ class Failure:
     category: _FailureCategory
     status: int | None
     retry_after: _RetryAfter
-
-
-@dataclasses.dataclass(frozen=True)
-class FileSlot:
-    """Placeholder for file bytes inside a multipart plan.
-
-    Attributes:
-        name: Multipart form field name.
-        filename: Filename exposed in the multipart part.
-        content_type: Media type exposed in the multipart part.
-    """
-
-    name: str
-    filename: str
-    content_type: str
-
-
-@dataclasses.dataclass(frozen=True)
-class MultipartPlan:
-    """Byte segments and file slots forming a multipart/form-data body.
-
-    Attributes:
-        content_type: Multipart content type including its boundary.
-        segments: Ordered encoded segments and file placeholders.
-    """
-
-    content_type: str
-    segments: list[bytes | FileSlot]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -365,11 +335,6 @@ def _entity_optimization_disabled() -> bool:
     return cast('bool', module.SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION)
 
 
-def _escape_disposition(value: str) -> str:
-    """Make a value safe inside a Content-Disposition quoted-string."""
-    return value.replace('\\', '\\\\').replace('"', '%22').replace('\r', '').replace('\n', '')
-
-
 def _explicit_delay_is_safe(delay: float) -> bool:
     """Return whether a delay stays within the bounded retry policy."""
     return math.isfinite(delay) and 0 <= delay <= _BACKOFF_CAP
@@ -491,13 +456,6 @@ def _parse_retry_after(headers: Mapping[str, str], now: float) -> _RetryAfter:
     return delay
 
 
-def _validate_multipart_boundary(boundary: str) -> str:
-    """Return a boundary safe for multipart framing and an unquoted header."""
-    if not _MULTIPART_BOUNDARY_PATTERN.fullmatch(boundary):
-        raise ValueError('multipart boundary must be 1 to 70 safe ASCII characters')
-    return boundary
-
-
 def _validated_nonnegative_integer(value: object, name: str) -> int:
     """Return a non-boolean, nonnegative integer paging value."""
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -612,57 +570,6 @@ def classify_endpoint(
         replay_safe=replay_safe,
         body_restartable=body_restartable,
         endpoint_role=known_role,
-    )
-
-
-def build_multipart_plan(
-    fields: dict[str, str],
-    files: list[FileSlot],
-    boundary: str | None = None,
-) -> MultipartPlan:
-    """Build a pure multipart/form-data framing plan.
-
-    Args:
-        fields: Text form fields in multipart emission order.
-        files: File placeholders in multipart emission order.
-        boundary: Explicit boundary of 1-70 ASCII letters, digits, apostrophes,
-            plus signs, periods, underscores, or hyphens; `None` generates one.
-
-    Returns:
-        A content type and ordered framing segments for the multipart body.
-
-    Raises:
-        ValueError: If an explicit boundary is empty or unsafe for unquoted
-            use.
-    """
-    multipart_boundary = (
-        _uuid.uuid4().hex if boundary is None else _validate_multipart_boundary(boundary)
-    )
-    segments: list[bytes | FileSlot] = []
-    for name, value in fields.items():
-        segments.append(
-            (
-                f'--{multipart_boundary}\r\nContent-Disposition: form-data; '
-                f'name="{_escape_disposition(name)}"'
-                f'\r\n\r\n{value}\r\n'
-            ).encode()
-        )
-    for slot in files:
-        segments.append(
-            (
-                f'--{multipart_boundary}\r\nContent-Disposition: form-data; '
-                f'name="{_escape_disposition(slot.name)}"; '
-                f'filename="{_escape_disposition(slot.filename)}"'
-                f'\r\nContent-Type: {slot.content_type}'
-                '\r\n\r\n'
-            ).encode()
-        )
-        segments.append(slot)
-        segments.append(b'\r\n')
-    segments.append(f'--{multipart_boundary}--\r\n'.encode())
-    return MultipartPlan(
-        content_type=f'multipart/form-data; boundary={multipart_boundary}',
-        segments=segments,
     )
 
 

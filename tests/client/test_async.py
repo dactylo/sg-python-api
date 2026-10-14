@@ -2523,7 +2523,7 @@ def test_sync_config_mutators_share_versioned_user_agent(
 
     assert reset_configs == []
     assert sg.base_url == 'https://x.example'
-    assert sg.config.user_agents[0] == 'shotgun-json (0.1.1)'
+    assert sg.config.user_agents[0] == 'shotgun-json (0.1.2)'
     sg.add_user_agent('integration/1')
     assert sg.config.user_agents[-1] == 'integration/1'
     sync_sg.reset_user_agent()

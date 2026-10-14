@@ -6,8 +6,8 @@ set -eu
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RESULTS_FILE="$REPO_ROOT/dist/artifact-results.md"
 LEDGER_FILE="$REPO_ROOT/dist/conformance-results.md"
-OFFICIAL_COMMIT='db056df3fb663efa6a69a2c07d2d0b69db35c336'
-OFFICIAL_REF='v3.10.2'
+OFFICIAL_COMMIT='6f56cf219152d0e8a8e92d7f0507b28f02f86905'
+OFFICIAL_REF='v3.10.3'
 OFFICIAL_REPOSITORY='https://github.com/shotgunsoftware/python-api'
 WORK_ROOT=''
 

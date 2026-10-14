@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 (2026-10-13)
+
+### Fixed
+
+- `note_thread_read()`, `nav_search_string()` and `nav_search_entity()` no longer fail with
+  `Fault`.
+- `user_subscriptions_read()` no longer raises `ShotgunError`, and returns the documented
+  `humanUserId` and `subscription` dictionaries.
+- `user_subscriptions_create()` now assigns subscriptions. Give each entry a `humanUserId`, as a
+  string or an integer, instead of `user_id`.
+
 ## 0.1.1 (2026-10-12)
 
 ### Fixed

@@ -2,7 +2,7 @@
 
 This guide is for applications that use Autodesk's `shotgun_api3` client and want to switch to
 sg-python-api. sg-python-api keeps the `shotgun_api3` import name and targets the documented API of
-Autodesk's client `3.10.2`, so migration mainly concerns installation, network policy, and failure
+Autodesk's client `3.10.3`, so migration mainly concerns installation, network policy, and failure
 handling. Work in your application's test environment first, so you can validate its actual queries
 and writes before changing a production deployment. For a new integration, start with the
 [README quick start](../README.md#quick-start) instead.

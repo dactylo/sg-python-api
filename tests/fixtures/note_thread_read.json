@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "operation": "note_thread_read",
+  "auth_mode": "script",
+  "outcome": {
+    "kind": "success"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api3/json",
+    "headers": {
+      "content-type": "application/json; charset=utf-8"
+    },
+    "body": {
+      "method_name": "note_thread_contents",
+      "params": [
+        {
+          "script_name": "REDACTED",
+          "script_key": "REDACTED"
+        },
+        {
+          "note_id": 1
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 200,
+    "reason": "OK",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "content_b64": "W3sidHlwZSI6Ik5vdGUiLCJpZCI6MSwiY29udGVudCI6bnVsbCwiY3JlYXRlZF9hdCI6IjIwMjYtMDEtMDVUMDA6MDA6MDBaIiwiY3JlYXRlZF9ieSI6eyJpZCI6MSwibmFtZSI6IkZpeHR1cmUgdmFsdWUiLCJ0eXBlIjoiRml4dHVyZSB2YWx1ZSJ9fSx7InR5cGUiOiJSZXBseSIsImlkIjoxLCJjb250ZW50IjoiRml4dHVyZSB2YWx1ZSIsInVzZXIiOnsiaWQiOjEsIm5hbWUiOiJGaXh0dXJlIHZhbHVlIiwidHlwZSI6IkZpeHR1cmUgdmFsdWUiLCJpbWFnZSI6bnVsbH0sImNyZWF0ZWRfYXQiOiIyMDI2LTAxLTA1VDAwOjAwOjAwWiJ9XQ=="
+  }
+}

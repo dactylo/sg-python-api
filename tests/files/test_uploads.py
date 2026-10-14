@@ -38,7 +38,6 @@ _FORM_INFO: dict[str, object] = {
     's3_direct_uploads_enabled': False,
     's3_enabled_upload_types': {},
 }
-_FORM_UPLOAD_BOUNDARY = 'Task13Boundary'
 
 _TRANSIENT_IMAGE = 'https://x.example/images/status/transient/thumbnail_pending.png'
 
@@ -92,39 +91,6 @@ class _PartiallyConsumingFakeTransport(_FakeTransport):
 
 def _form_fields(body: bytes) -> dict[str, str]:
     return dict(urllib.parse.parse_qsl(body.decode(), keep_blank_values=True))
-
-
-def _freeze_form_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
-    original = _protocol.build_multipart_plan
-
-    def build_multipart_plan(
-        fields: dict[str, str],
-        files: list[_protocol.FileSlot],
-        boundary: str | None = None,
-    ) -> _protocol.MultipartPlan:
-        assert boundary is None
-        return original(fields, files, boundary=_FORM_UPLOAD_BOUNDARY)
-
-    monkeypatch.setattr(_protocol, 'build_multipart_plan', build_multipart_plan)
-
-
-def _multipart_fields(body: bytes, content_type: str) -> tuple[dict[str, str], bytes]:
-    boundary = content_type.removeprefix('multipart/form-data; boundary=').encode()
-    fields: dict[str, str] = {}
-    file_content = b''
-    for part in body.split(b'--' + boundary):
-        if b'Content-Disposition: form-data;' not in part:
-            continue
-        headers, _, payload = part.partition(b'\r\n\r\n')
-        match = re.search(rb'name="([^"]+)"', headers)
-        assert match is not None
-        name = match.group(1).decode()
-        value = payload.removesuffix(b'\r\n')
-        if b'filename=' in headers:
-            file_content = value
-        else:
-            fields[name] = value.decode()
-    return fields, file_content
 
 
 def _raw_upload_transcript(
@@ -556,11 +522,9 @@ def test_disk_body_iterators_are_lazy_and_close_their_handles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     direct_handle = io.BytesIO(b'abcdef')
-    multipart_handle = io.BytesIO(b'abcdef')
-    handles = iter([direct_handle, multipart_handle])
 
     def open_file(_path: Path, _mode: str) -> BinaryIO:
-        return cast('BinaryIO', next(handles))
+        return cast('BinaryIO', direct_handle)
 
     monkeypatch.setattr(Path, 'open', open_file)
     direct = _files._iter_file('/unused/direct', chunk_size=2)
@@ -568,19 +532,6 @@ def test_disk_body_iterators_are_lazy_and_close_their_handles(
     assert next(direct) == b'ab'
     direct.close()
     assert direct_handle.closed
-
-    slot = _protocol.FileSlot(name='file', filename='clip.mov', content_type='video/quicktime')
-    plan = _protocol.build_multipart_plan({}, [slot], boundary='Boundary')
-    multipart = _files._pump_multipart_from_disk(
-        plan,
-        {'file': '/unused/multipart'},
-        chunk_size=2,
-    )
-    assert not multipart_handle.closed
-    assert next(multipart).startswith(b'--Boundary')
-    assert not multipart_handle.closed
-    multipart.close()
-    assert multipart_handle.closed
 
 
 @pytest.mark.parametrize('method_name', ['create', 'update'])
@@ -605,81 +556,6 @@ def test_file_field_upload_rejects_invalid_path_after_write(
 
     assert _rpc_call(sg, 1)[0] == method_name
     assert len(_fake_transport(sg).requests) == 2
-
-
-def test_form_upload_stops_at_the_observed_403_request_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    _freeze_form_boundary(monkeypatch)
-    movie = tmp_path / 'clip.mov'
-    movie.write_bytes(b'form-data')
-    sg = _upload_client([_text('unread', status=403)], _FORM_INFO)
-    sg.config.user_agents = ('upload-transcript',)
-
-    with pytest.raises(_errors.ProtocolError):
-        sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
-
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    assert len(transport.requests) == 2
-    request = transport.requests[1]
-    body = (
-        b'--Task13Boundary\r\nContent-Disposition: form-data; name="entity_type"\r\n\r\n'
-        b'Version\r\n--Task13Boundary\r\nContent-Disposition: form-data; name="entity_id"'
-        b'\r\n\r\n5\r\n--Task13Boundary\r\nContent-Disposition: form-data; name="field_name"'
-        b'\r\n\r\nsg_uploaded_movie\r\n--Task13Boundary\r\nContent-Disposition: form-data; '
-        b'name="display_name"\r\n\r\nclip.mov\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="script_name"\r\n\r\nscript\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="script_key"\r\n\r\nkey\r\n--Task13Boundary\r\nContent-Disposition: '
-        b'form-data; name="file"; filename="clip.mov"\r\nContent-Type: application/octet-stream'
-        b'\r\n\r\nform-data\r\n--Task13Boundary--\r\n'
-    )
-    assert _raw_upload_transcript(
-        transport.requests[1:],
-        transport.bodies[1:],
-    ) == [
-        (
-            'POST',
-            'https://x.example:443/upload/upload_file',
-            _upload_headers(body, 'multipart/form-data; boundary=Task13Boundary'),
-            body,
-        )
-    ]
-    assert request.url == 'https://x.example:443/upload/upload_file'
-    assert request.headers['content-length'] == str(len(cast('bytes', transport.bodies[1])))
-    fields, file_content = _multipart_fields(
-        cast('bytes', transport.bodies[1]),
-        request.headers['content-type'],
-    )
-    assert fields == {
-        'entity_type': 'Version',
-        'entity_id': '5',
-        'field_name': 'sg_uploaded_movie',
-        'display_name': 'clip.mov',
-        'script_name': 'script',
-        'script_key': 'key',
-    }
-    assert file_content == b'form-data'
-
-
-def test_form_upload_unsupported_success_is_driver_error_event(tmp_path: Path) -> None:
-    movie = tmp_path / 'clip.mov'
-    movie.write_bytes(b'form-data')
-    events: list[ObserverEvent] = []
-    sg = _upload_client([_text('opaque success')], _FORM_INFO)
-    sg.config.on_response = events.append
-
-    with pytest.raises(
-        ShotgunError,
-        match=r'^form upload success response is not established$',
-    ):
-        sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
-
-    response_events = [event for event in events if isinstance(event, ResponseEvent)]
-    assert len(response_events) == len(_fake_transport(sg).requests)
-    assert response_events[-1].status == 200
-    assert response_events[-1].route == 'rpc'
-    assert response_events[-1].outcome == 'error'
 
 
 def test_link_and_finalize_do_not_restart_after_ambiguous_send(
@@ -721,61 +597,6 @@ def test_link_and_finalize_do_not_restart_after_ambiguous_send(
     with pytest.raises(SendError, match='ambiguous'):
         multipart.upload('Version', 5, str(large), field_name='sg_uploaded_movie')
     assert len(_fake_transport(multipart).requests) == 7
-
-
-@pytest.mark.parametrize(
-    ('endpoint', 'expected_route'),
-    [
-        ('allocation', 'allocation'),
-        ('finalize', 'finalize'),
-        ('link', 'link'),
-        ('part-link', 'allocation'),
-    ],
-)
-def test_malformed_upload_endpoint_response_is_driver_error_event(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    endpoint: str,
-    expected_route: str,
-) -> None:
-    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
-    movie = tmp_path / 'clip.mov'
-    direct_allocation = '1 https://storage.example/object timestamp Attachment upload-1'
-    multipart_allocation = (
-        '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
-    )
-    responses: list[TransportResponse | TransportError]
-    if endpoint == 'allocation':
-        movie.write_bytes(b'data')
-        responses = [_text('malformed')]
-    elif endpoint == 'link':
-        movie.write_bytes(b'data')
-        responses = [_text(direct_allocation), _text(), _text('malformed')]
-    elif endpoint == 'part-link':
-        movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
-        responses = [_text(multipart_allocation), _text('malformed')]
-    else:
-        movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
-        responses = [
-            _text(multipart_allocation),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
-            _text('malformed'),
-        ]
-    events: list[ObserverEvent] = []
-    sg = _upload_client(responses)
-    sg.config.on_response = events.append
-
-    with pytest.raises(ShotgunError):
-        sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
-
-    response_events = [event for event in events if isinstance(event, ResponseEvent)]
-    assert len(response_events) == len(_fake_transport(sg).requests)
-    assert response_events[-1].status == 200
-    assert response_events[-1].route == expected_route
-    assert response_events[-1].outcome == 'error'
 
 
 def test_multipart_part_put_missing_etag_is_driver_error_event(
@@ -922,6 +743,122 @@ def test_multipart_upload_uses_observed_part_boundary_etags_and_order(
     ]
 
 
+def test_part_etag_parser_requires_one_case_insensitive_header() -> None:
+    assert _files.parse_part_etag('', CaseInsensitiveHeaders({'eTaG': 'etag-1'})) == 'etag-1'
+
+    with pytest.raises(
+        ShotgunError,
+        match=r'^multipart part response did not include an ETag$',
+    ):
+        _files.parse_part_etag('', CaseInsensitiveHeaders({}))
+
+
+@pytest.mark.parametrize(
+    'method_name',
+    [
+        'upload',
+        'upload_image',
+        'upload_filmstrip',
+        'upload_thumbnail',
+        'upload_filmstrip_thumbnail',
+        'share_thumbnail',
+        'share_filmstrip',
+    ],
+)
+def test_public_upload_refuses_legacy_form_before_upload_request(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    source = tmp_path / 'private-file.png'
+    source.write_bytes(b'image')
+    sg = _upload_client([], _FORM_INFO)
+
+    def invoke() -> None:
+        if method_name.startswith('share_'):
+            sg.share_thumbnail(
+                [{'type': 'Version', 'id': 5}],
+                thumbnail_path=str(source),
+                filmstrip_thumbnail=method_name == 'share_filmstrip',
+            )
+        elif method_name in {'upload_image', 'upload_filmstrip'}:
+            sg.upload(
+                'Version',
+                5,
+                str(source),
+                field_name=('image' if method_name == 'upload_image' else 'filmstrip_image'),
+            )
+        else:
+            method = getattr(sg, method_name)
+            method('Version', 5, str(source))
+
+    with pytest.raises(
+        ShotgunError,
+        match=r'^server requires legacy form uploads, which this client does not support$',
+    ):
+        invoke()
+
+    transport = _fake_transport(sg)
+    assert len(transport.requests) == 1
+    body = transport.requests[0].body
+    assert isinstance(body, bytes)
+    assert json.loads(body)['method_name'] == 'info'
+
+
+@pytest.mark.parametrize(
+    ('endpoint', 'expected_route'),
+    [
+        ('allocation', 'allocation'),
+        ('finalize', 'finalize'),
+        ('link', 'link'),
+        ('part-link', 'allocation'),
+    ],
+)
+def test_malformed_upload_endpoint_response_is_driver_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    endpoint: str,
+    expected_route: str,
+) -> None:
+    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
+    movie = tmp_path / 'clip.mov'
+    direct_allocation = '1 https://storage.example/object timestamp Attachment upload-1'
+    multipart_allocation = (
+        '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
+    )
+    responses: list[TransportResponse | TransportError]
+    if endpoint == 'allocation':
+        movie.write_bytes(b'data')
+        responses = [_text('malformed')]
+    elif endpoint == 'link':
+        movie.write_bytes(b'data')
+        responses = [_text(direct_allocation), _text(), _text('malformed')]
+    elif endpoint == 'part-link':
+        movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
+        responses = [_text(multipart_allocation), _text('malformed')]
+    else:
+        movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
+        responses = [
+            _text(multipart_allocation),
+            _text('1 https://storage.example/part-1'),
+            _text(headers={'etag': 'etag-1'}),
+            _text('1 https://storage.example/part-2'),
+            _text(headers={'etag': 'etag-2'}),
+            _text('malformed'),
+        ]
+    events: list[ObserverEvent] = []
+    sg = _upload_client(responses)
+    sg.config.on_response = events.append
+
+    with pytest.raises(ShotgunError):
+        sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
+
+    response_events = [event for event in events if isinstance(event, ResponseEvent)]
+    assert len(response_events) == len(_fake_transport(sg).requests)
+    assert response_events[-1].status == 200
+    assert response_events[-1].route == expected_route
+    assert response_events[-1].outcome == 'error'
+
+
 @pytest.mark.parametrize('public_owner', ['shotgun', 'capabilities'])
 def test_mutating_public_server_info_cannot_change_cached_upload_route(
     tmp_path: Path,
@@ -1039,16 +976,6 @@ def test_authenticated_file_share_allows_https_and_literal_loopback(
         == 42
     )
     assert b'dummy-key' in cast('bytes', transport.requests[-1].body)
-
-
-def test_part_etag_parser_requires_one_case_insensitive_header() -> None:
-    assert _files.parse_part_etag('', CaseInsensitiveHeaders({'eTaG': 'etag-1'})) == 'etag-1'
-
-    with pytest.raises(
-        ShotgunError,
-        match=r'^multipart part response did not include an ETag$',
-    ):
-        _files.parse_part_etag('', CaseInsensitiveHeaders({}))
 
 
 @pytest.mark.parametrize(
@@ -1269,37 +1196,6 @@ def test_share_thumbnail_path_uploads_and_links_one_target_once(tmp_path: Path) 
         'script_name': 's',
         'script_key': 'k',
     }
-
-
-def test_share_thumbnail_path_uses_direct_workflow_when_attachment_routing_is_form(
-    tmp_path: Path,
-) -> None:
-    image = tmp_path / 'image.jpg'
-    image.write_bytes(b'image')
-    allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg = _fake_client(
-        [_text(allocation), _text(''), _text('1:41 image.jpg')],
-        server_info={
-            'version': [9, 0, 0],
-            'api_max_entities_per_page': 500,
-            's3_direct_uploads_enabled': False,
-            's3_enabled_upload_types': {},
-        },
-    )
-
-    assert (
-        sg.share_thumbnail(
-            [{'type': 'Version', 'id': 2}],
-            thumbnail_path=str(image),
-        )
-        == 41
-    )
-
-    assert [request.url for request in _fake_transport(sg).requests[1:]] == [
-        'https://x.example:443/upload/api_get_upload_link_info',
-        'https://storage.example/image',
-        'https://x.example:443/upload/api_link_file',
-    ]
 
 
 def test_share_thumbnail_public_signature_preserves_forwarded_kwargs() -> None:
@@ -1524,16 +1420,6 @@ def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(tmp_path: Path) -> 
     transport = _fake_transport(sg)
     assert len(transport.requests) == 2
     assert transport.requests[1].url.endswith(_files.GET_UPLOAD_LINK_INFO)
-
-    form = _upload_client([SendError('ambiguous'), _text('unused')], _FORM_INFO)
-    form.config.rpc_attempt_interval = 0
-
-    with pytest.raises(SendError, match='ambiguous'):
-        form.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
-
-    form_transport = _fake_transport(form)
-    assert len(form_transport.requests) == 2
-    assert form_transport.requests[1].url.endswith(_files._UPLOAD_FILE)
 
 
 def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> None:

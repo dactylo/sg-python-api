@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Literal, TypeAlias, TypedDict, cast
 
@@ -35,7 +35,6 @@ _MULTIPART_CHUNK_SIZE = 20_000_000
 _Origin: TypeAlias = tuple[str, str, int]
 _PART_LINK_FIELD_COUNT = 2
 _THUMBNAIL_UPLOAD_FIELDS = ('image', 'filmstrip_image')
-_UPLOAD_FILE = '/upload/upload_file'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,17 +245,6 @@ class _ExactOriginCookiePolicy(http.cookiejar.DefaultCookiePolicy):
         )
 
 
-def _build_form_upload_fields(prepared: PreparedUpload) -> dict[str, str]:
-    """Build the non-authenticated legacy form-upload fields."""
-    arguments = prepared.options.arguments
-    return {
-        'entity_type': arguments.entity_type,
-        'entity_id': str(arguments.entity_id),
-        'field_name': arguments.field_name or '',
-        'display_name': arguments.display_name or prepared.filename,
-    }
-
-
 def _entity_reference(entity: Mapping[str, object]) -> str:
     """Serialize one entity as the upload endpoint reference grammar."""
     entity_type = entity.get('type')
@@ -293,48 +281,6 @@ def _iter_file(
             yield chunk
             if remaining is not None:
                 remaining -= len(chunk)
-
-
-def _multipart_content_length(
-    plan: _protocol.MultipartPlan,
-    file_sizes: Mapping[str, int],
-) -> int:
-    """Return the exact byte length of a multipart plan."""
-    return sum(
-        file_sizes[segment.name] if isinstance(segment, _protocol.FileSlot) else len(segment)
-        for segment in plan.segments
-    )
-
-
-def _pump_multipart(
-    plan: _protocol.MultipartPlan,
-    opened: Mapping[str, BinaryIO],
-    chunk_size: int = 65536,
-) -> Generator[bytes, None, None]:
-    """Yield multipart framing while reading file slots incrementally."""
-    if chunk_size <= 0:
-        raise ValueError('multipart chunk size must be positive')
-    for segment in plan.segments:
-        if isinstance(segment, _protocol.FileSlot):
-            handle = opened[segment.name]
-            while chunk := handle.read(chunk_size):
-                yield chunk
-        else:
-            yield segment
-
-
-def _pump_multipart_from_disk(
-    plan: _protocol.MultipartPlan,
-    paths: Mapping[str, str],
-    chunk_size: int = 65536,
-) -> Generator[bytes, None, None]:
-    """Pump multipart framing through lazily opened disk files."""
-    with ExitStack() as stack:
-        opened: dict[str, BinaryIO] = {}
-        for segment in plan.segments:
-            if isinstance(segment, _protocol.FileSlot) and segment.name not in opened:
-                opened[segment.name] = stack.enter_context(Path(paths[segment.name]).open('rb'))
-        yield from _pump_multipart(plan, opened, chunk_size)
 
 
 def _requires_direct_upload(
@@ -694,53 +640,6 @@ def build_download_redirect(
     return build_download_request(context, location, {'user-agent': context.user_agent})
 
 
-def build_form_upload_exchange(
-    canonical_origin: str,
-    user_agent: str,
-    prepared: PreparedUpload,
-    auth: Mapping[str, object],
-    chunk_size: int = 65536,
-) -> UploadExchange:
-    """Plan one restartable legacy multipart form upload.
-
-    The body can be rebuilt, but the operation is not replay-safe after
-    transmission.
-
-    Args:
-        canonical_origin: Captured site origin.
-        user_agent: Captured user-agent header value.
-        prepared: Validated upload metadata and arguments.
-        auth: Captured authentication form fields.
-        chunk_size: Maximum file bytes read per iteration.
-
-    Returns:
-        Complete restartable form-upload exchange.
-    """
-    fields = add_auth_fields(_build_form_upload_fields(prepared), auth)
-    slot = _protocol.FileSlot(
-        name='file',
-        filename=prepared.filename,
-        content_type='application/octet-stream',
-    )
-    plan = _protocol.build_multipart_plan(fields, [slot])
-    path = prepared.options.arguments.path
-    return UploadExchange(
-        body_factory=lambda: _pump_multipart_from_disk(
-            plan,
-            {'file': path},
-            chunk_size,
-        ),
-        headers={
-            'content-length': str(_multipart_content_length(plan, {'file': prepared.file_size})),
-            'content-type': plan.content_type,
-            'user-agent': user_agent,
-        },
-        method='POST',
-        operation=SHARE_THUMBNAIL_OPERATION,
-        url=f'{canonical_origin}{_UPLOAD_FILE}',
-    )
-
-
 def build_upload_endpoint_exchange(
     canonical_origin: str | None,
     user_agent: str,
@@ -1016,6 +915,27 @@ def prepare_upload(options: UploadOptions) -> PreparedUpload:
     if file_size <= 0:
         raise ShotgunError(f"Path cannot be an empty file: '{options.arguments.path}'")
     return PreparedUpload(filename=path.name, file_size=file_size, options=options)
+
+
+def require_supported_upload_path(
+    upload_path: Literal['form', 'direct', 'multipart'],
+) -> Literal['direct', 'multipart']:
+    """Reject the unsupported legacy form route before upload I/O.
+
+    Args:
+        upload_path: Route selected from server capabilities.
+
+    Returns:
+        The selected supported route.
+
+    Raises:
+        ShotgunError: If the server requires legacy form uploads.
+    """
+    if upload_path == 'form':
+        raise ShotgunError(
+            'server requires legacy form uploads, which this client does not support'
+        )
+    return upload_path
 
 
 def resolve_attachment_url(attachment: object, base_url: str) -> str | None:

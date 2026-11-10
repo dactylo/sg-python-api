@@ -2,245 +2,27 @@
 
 import dataclasses
 import datetime
-import inspect
-from collections.abc import Callable, Mapping
-from typing import Any, NotRequired, TypedDict, cast
+from collections.abc import Mapping
+from typing import cast
 
 from . import _crud, _protocol
 from ._errors import ShotgunError
-from ._signatures import bind_arguments, expose_signature
 
-_ACTIVITY_STREAM_READ_DOCSTRING = """Read the activity stream for one entity.
-
-Args:
-    entity_type: Entity type whose activity stream to read.
-    entity_id: Numeric identifier of the entity.
-    entity_fields: Optional fields to return for linked entity types.
-    min_id: Optional minimum activity identifier.
-    max_id: Optional maximum activity identifier.
-    limit: Optional maximum number of activity records.
-
-Returns:
-    Activity stream data returned by the server.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if the server result has the wrong type.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_ACTIVITY_STREAM_READ_PARAMETERS = (
-    inspect.Parameter('entity_type', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter('entity_id', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=int),
-    inspect.Parameter(
-        'entity_fields',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=dict[str, list[str]] | None,
-    ),
-    inspect.Parameter(
-        'min_id',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=int | None,
-    ),
-    inspect.Parameter(
-        'max_id',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=int | None,
-    ),
-    inspect.Parameter(
-        'limit',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=int | None,
-    ),
-)
-_ACTIVITY_STREAM_READ_SIGNATURE = inspect.Signature(
-    _ACTIVITY_STREAM_READ_PARAMETERS,
-    return_annotation=dict[str, object],
-)
-_EXPORT_PAGE_DOCSTRING = """Export a page using the documented arguments.
-
-The Page or its layout must be marked API Exportable in the web UI,
-or the server rejects the export.
-
-Args:
-    page_id: Numeric page identifier.
-    format: Required nonempty export format name.
-    layout_name: Optional layout name, including an empty name.
-
-Returns:
-    Exported page text returned by the server.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if `page_id`, `format`, or the server result is invalid.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_EXPORT_PAGE_PARAMETERS = (
-    inspect.Parameter('page_id', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=int),
-    inspect.Parameter('format', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter(
-        'layout_name',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-)
-_EXPORT_PAGE_SIGNATURE = inspect.Signature(
-    _EXPORT_PAGE_PARAMETERS,
-    return_annotation=str,
-)
-_METHOD_ACTIVITY_STREAM_READ_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_ACTIVITY_STREAM_READ_PARAMETERS,
-    ),
-    return_annotation=dict[str, object],
-)
-_METHOD_EXPORT_PAGE_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_EXPORT_PAGE_PARAMETERS,
-    ),
-    return_annotation=str,
-)
 _SCHEDULE_DATE_LENGTH = 10
-_SUMMARIZE_DOCSTRING = """Summarize field data returned by a query.
-
-Args:
-    entity_type: Entity type to summarize.
-    filters: Filters in list or dict syntax.
-    summary_fields: List of `{'field': ..., 'type': ...}` summaries.
-    filter_operator: `'all'` or `'any'` for list-syntax filters.
-    grouping: Optional grouping specs.
-    include_archived_projects: Include archived projects when `True`.
-
-Returns:
-    Dict with `summaries` and (when grouped) `groups`.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if `filters`, `summary_fields`, or the server result has the
-        wrong type.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_SUMMARIZE_PARAMETERS = (
-    inspect.Parameter('entity_type', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter(
-        'filters',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        annotation=list[Any] | tuple[Any, ...] | dict[str, Any],
-    ),
-    inspect.Parameter(
-        'summary_fields',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        annotation=list[dict[str, Any]],
-    ),
-    inspect.Parameter(
-        'filter_operator',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'grouping',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=list[dict[str, Any]] | None,
-    ),
-    inspect.Parameter(
-        'include_archived_projects',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=True,
-        annotation=bool,
-    ),
-)
-_METHOD_SUMMARIZE_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_SUMMARIZE_PARAMETERS,
-    ),
-    return_annotation=dict[str, object],
-)
-_SUMMARIZE_SIGNATURE = inspect.Signature(
-    _SUMMARIZE_PARAMETERS,
-    return_annotation=dict[str, object],
-)
-_WORK_SCHEDULE_UPDATE_DOCSTRING = """Update a work schedule.
-
-Args:
-    date: Date or exact `YYYY-MM-DD` string to update.
-    working: Whether the date is a working day.
-    description: Optional schedule description.
-    project: Optional project entity restriction.
-    user: Optional user entity restriction.
-    recalculate_field: Optional field to recalculate.
-
-Returns:
-    Updated work schedule data returned by the server.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if the date, project/user exclusivity, or server result is
-        invalid.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_WORK_SCHEDULE_UPDATE_PARAMETERS = (
-    inspect.Parameter(
-        'date', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=datetime.date | str
-    ),
-    inspect.Parameter('working', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=bool),
-    inspect.Parameter(
-        'description',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'project',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=dict[str, Any] | None,
-    ),
-    inspect.Parameter(
-        'user',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=dict[str, Any] | None,
-    ),
-    inspect.Parameter(
-        'recalculate_field',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-)
-_METHOD_WORK_SCHEDULE_UPDATE_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_WORK_SCHEDULE_UPDATE_PARAMETERS,
-    ),
-    return_annotation=dict[str, object],
-)
-_WORK_SCHEDULE_UPDATE_SIGNATURE = inspect.Signature(
-    _WORK_SCHEDULE_UPDATE_PARAMETERS,
-    return_annotation=dict[str, object],
-)
 
 
 @dataclasses.dataclass(frozen=True)
-class _ActivityStreamReadOptions:
-    """Collect exact public activity stream arguments for validation."""
+class ActivityStreamReadOptions:
+    """Collect exact public activity stream arguments for validation.
+
+    Attributes:
+        entity_type: Entity type whose activity stream to read.
+        entity_id: Numeric identifier of the entity.
+        entity_fields: Optional fields to return for linked entity types.
+        min_id: Optional minimum activity identifier.
+        max_id: Optional maximum activity identifier.
+        limit: Optional maximum number of activity records.
+    """
 
     entity_type: str
     entity_id: int
@@ -258,21 +40,15 @@ class _AuthenticationPlan:
     params: dict[str, object]
 
 
-class ExportPageKeywordArguments(TypedDict):
-    """Describe supported keyword calls to `export_page`.
+@dataclasses.dataclass(frozen=True)
+class ExportPageOptions:
+    """Collect exact public export-page arguments for validation.
 
     Attributes:
-        format: Required nonempty export format.
-        layout_name: Optional page layout name.
+        page_id: Numeric page identifier.
+        format: Required nonempty export format name.
+        layout_name: Optional layout name, including an empty name.
     """
-
-    format: str
-    layout_name: NotRequired[str | None]
-
-
-@dataclasses.dataclass(frozen=True)
-class _ExportPageOptions:
-    """Collect exact public export-page arguments for validation."""
 
     page_id: int
     format: str
@@ -280,8 +56,17 @@ class _ExportPageOptions:
 
 
 @dataclasses.dataclass(frozen=True)
-class _SummarizeOptions:
-    """Collect exact public `summarize` arguments for runtime validation."""
+class SummarizeOptions:
+    """Collect exact public `summarize` arguments for runtime validation.
+
+    Attributes:
+        entity_type: Entity type to summarize.
+        filters: Filters in list or dict syntax.
+        summary_fields: List of `{'field': ..., 'type': ...}` summaries.
+        filter_operator: `'all'` or `'any'` for list-syntax filters.
+        grouping: Optional grouping specs.
+        include_archived_projects: Include archived projects when `True`.
+    """
 
     entity_type: str
     filters: object
@@ -292,8 +77,17 @@ class _SummarizeOptions:
 
 
 @dataclasses.dataclass(frozen=True)
-class _WorkScheduleUpdateOptions:
-    """Collect exact public work-schedule update arguments for validation."""
+class WorkScheduleUpdateOptions:
+    """Collect exact public work-schedule update arguments for validation.
+
+    Attributes:
+        date: Date or exact `YYYY-MM-DD` string to update.
+        working: Whether the date is a working day.
+        description: Optional schedule description.
+        project: Optional project entity restriction.
+        user: Optional user entity restriction.
+        recalculate_field: Optional field to recalculate.
+    """
 
     date: object
     working: bool
@@ -369,103 +163,7 @@ def _require_nonempty_string(value: object, message: str) -> str:
     return value
 
 
-def bind_activity_stream_read(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    owner_name: str,
-) -> _ActivityStreamReadOptions:
-    """Bind runtime activity-stream arguments.
-
-    Args:
-        args: Positional arguments supplied by the caller.
-        kwargs: Keyword arguments supplied by the caller.
-        owner_name: Public client class name used in errors.
-
-    Returns:
-        Bound activity-stream options.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(
-        _ACTIVITY_STREAM_READ_SIGNATURE, args, kwargs, f'{owner_name}.activity_stream_read()'
-    )
-    options = cast('Callable[..., _ActivityStreamReadOptions]', _ActivityStreamReadOptions)
-    return options(**bound.arguments)
-
-
-def bind_export_page(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    owner_name: str,
-) -> _ExportPageOptions:
-    """Bind runtime export-page arguments.
-
-    Args:
-        args: Positional arguments supplied by the caller.
-        kwargs: Keyword arguments supplied by the caller.
-        owner_name: Public client class name used in errors.
-
-    Returns:
-        Bound export-page options.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(_EXPORT_PAGE_SIGNATURE, args, kwargs, f'{owner_name}.export_page()')
-    options = cast('Callable[..., _ExportPageOptions]', _ExportPageOptions)
-    return options(**bound.arguments)
-
-
-def bind_summarize(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    owner_name: str,
-) -> _SummarizeOptions:
-    """Bind runtime summarize arguments.
-
-    Args:
-        args: Positional arguments supplied by the caller.
-        kwargs: Keyword arguments supplied by the caller.
-        owner_name: Public client class name used in errors.
-
-    Returns:
-        Bound summarize options.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(_SUMMARIZE_SIGNATURE, args, kwargs, f'{owner_name}.summarize()')
-    options = cast('Callable[..., _SummarizeOptions]', _SummarizeOptions)
-    return options(**bound.arguments)
-
-
-def bind_work_schedule_update(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    owner_name: str,
-) -> _WorkScheduleUpdateOptions:
-    """Bind runtime work-schedule update arguments.
-
-    Args:
-        args: Positional arguments supplied by the caller.
-        kwargs: Keyword arguments supplied by the caller.
-        owner_name: Public client class name used in errors.
-
-    Returns:
-        Bound schedule-update options.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(
-        _WORK_SCHEDULE_UPDATE_SIGNATURE, args, kwargs, f'{owner_name}.work_schedule_update()'
-    )
-    options = cast('Callable[..., _WorkScheduleUpdateOptions]', _WorkScheduleUpdateOptions)
-    return options(**bound.arguments)
-
-
-def build_activity_stream_read_params(options: _ActivityStreamReadOptions) -> dict[str, object]:
+def build_activity_stream_read_params(options: ActivityStreamReadOptions) -> dict[str, object]:
     """Build activity-stream parameters.
 
     Args:
@@ -536,7 +234,7 @@ def build_authentication_plan(
     )
 
 
-def build_export_page_params(options: _ExportPageOptions) -> dict[str, object]:
+def build_export_page_params(options: ExportPageOptions) -> dict[str, object]:
     """Build validated page-export parameters.
 
     Args:
@@ -826,7 +524,7 @@ def build_schema_field_update_params(
     return params
 
 
-def build_summarize_params(options: _SummarizeOptions) -> dict[str, object]:
+def build_summarize_params(options: SummarizeOptions) -> dict[str, object]:
     """Build validated summarize parameters.
 
     Args:
@@ -882,7 +580,8 @@ def build_text_search_params(
         RPC parameters copied by the client before dispatch.
 
     Raises:
-        ShotgunError: If `entity_types` is not a dictionary.
+        ShotgunError: If `entity_types` is not a dictionary or an entity filter
+            has invalid container or filter syntax.
     """
     validated_entity_types = _crud.require_dictionary(
         entity_types,
@@ -912,10 +611,19 @@ def build_update_project_last_accessed_params(
 
     Returns:
         RPC parameters copied by the client before dispatch.
+
+    Raises:
+        ShotgunError: If a project or user ID is missing or invalid.
     """
-    params: dict[str, object] = {'project_id': project['id']}
+    params: dict[str, object] = {
+        'project_id': _crud.require_entity_id(
+            project.get('id'), 'update_project_last_accessed project id must be an integer'
+        )
+    }
     if user is not None:
-        params['user_id'] = user['id']
+        params['user_id'] = _crud.require_entity_id(
+            user.get('id'), 'update_project_last_accessed user id must be an integer'
+        )
     return params
 
 
@@ -1003,7 +711,7 @@ def build_work_schedule_read_params(
 
 
 def build_work_schedule_update_params(
-    options: _WorkScheduleUpdateOptions,
+    options: WorkScheduleUpdateOptions,
 ) -> dict[str, object]:
     """Build validated schedule-update parameters.
 
@@ -1042,66 +750,6 @@ def entity_types_alias_error() -> ShotgunError:
         A `ShotgunError` naming `schema_entity_read()` as the replacement.
     """
     return ShotgunError('Deprecated: use schema_entity_read() instead')
-
-
-def expose_activity_stream_read_signature(
-    function: Callable[..., object],
-) -> Callable[..., object]:
-    """Expose the documented activity-stream signature.
-
-    Args:
-        function: Variadic implementation.
-
-    Returns:
-        The implementation with public reflection metadata.
-    """
-    return expose_signature(
-        function, _METHOD_ACTIVITY_STREAM_READ_SIGNATURE, _ACTIVITY_STREAM_READ_DOCSTRING
-    )
-
-
-def expose_export_page_signature(
-    function: Callable[..., object],
-) -> Callable[..., object]:
-    """Expose the documented page-export signature.
-
-    Args:
-        function: Variadic implementation.
-
-    Returns:
-        The implementation with public reflection metadata.
-    """
-    return expose_signature(function, _METHOD_EXPORT_PAGE_SIGNATURE, _EXPORT_PAGE_DOCSTRING)
-
-
-def expose_summarize_signature(
-    function: Callable[..., object],
-) -> Callable[..., object]:
-    """Expose the documented summarize signature.
-
-    Args:
-        function: Variadic implementation.
-
-    Returns:
-        The implementation with public reflection metadata.
-    """
-    return expose_signature(function, _METHOD_SUMMARIZE_SIGNATURE, _SUMMARIZE_DOCSTRING)
-
-
-def expose_work_schedule_update_signature(
-    function: Callable[..., object],
-) -> Callable[..., object]:
-    """Expose the documented schedule-update signature.
-
-    Args:
-        function: Variadic implementation.
-
-    Returns:
-        The implementation with public reflection metadata.
-    """
-    return expose_signature(
-        function, _METHOD_WORK_SCHEDULE_UPDATE_SIGNATURE, _WORK_SCHEDULE_UPDATE_DOCSTRING
-    )
 
 
 def require_dictionary_list_result(

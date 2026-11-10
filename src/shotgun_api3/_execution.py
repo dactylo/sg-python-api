@@ -1,7 +1,6 @@
 """Share pure execution, attempt, and lease logic between the sync and async twins."""
 
 import dataclasses
-import uuid
 from collections.abc import Callable, Mapping
 from typing import Generic, Literal, TypeVar
 
@@ -35,7 +34,7 @@ class AttemptState(Generic[_ControlT_co]):
 
     Attributes:
         context: Configuration captured for the logical operation.
-        control: Attempt-local deadline and progress control.
+        control: Attempt-local consumption and progress control.
         number: One-based attempt number.
         operation: Logical operation and replay classification.
         route: Observer route for the attempt.
@@ -235,7 +234,6 @@ def build_rpc_request(
         headers=headers,
         body=_protocol.encode_payload(payload),
         timeout=context.timeout,
-        token=uuid.uuid4().hex,
     )
 
 

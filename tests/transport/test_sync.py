@@ -1,4 +1,3 @@
-import concurrent.futures
 import dataclasses
 import threading
 from dataclasses import FrozenInstanceError
@@ -8,7 +7,6 @@ import pytest
 
 from shotgun_api3._errors import ShotgunError
 from shotgun_api3._transport import (
-    AbortedError,
     CaseInsensitiveHeaders,
     ConnectError,
     ProxyError,
@@ -21,18 +19,16 @@ from shotgun_api3._transport import (
     TransportResponse,
     body_close,
     content_length,
-    narrow_total_timeout,
 )
-from tests._transports import _FakeTransport
+from tests._threads import run_concurrently
+from tests._transports import FakeTransport
 
-_REQUEST_ID = 't1'
 _REQ = TransportRequest(
     method='POST',
     url='https://x.example/api3/json',
     headers={},
     body=b'{}',
     timeout=TimeoutConfig(connect=15.0, read=300.0),
-    token=_REQUEST_ID,
 )
 
 
@@ -108,15 +104,14 @@ def test_content_length_parses_only_nonnegative_values(
     assert content_length(headers) == expected
 
 
-def test_fake_transport_abort_and_close_are_noops() -> None:
-    fake = _FakeTransport([])
+def test_fake_transport_close_is_a_noop() -> None:
+    fake = FakeTransport([])
 
-    fake.abort(_REQ.token)
     fake.close()
 
 
 def test_fake_transport_raises_queued_errors() -> None:
-    fake = _FakeTransport([ConnectError('refused')])
+    fake = FakeTransport([ConnectError('refused')])
 
     with pytest.raises(ConnectError, match='refused'):
         fake.send(_REQ)
@@ -125,9 +120,9 @@ def test_fake_transport_raises_queued_errors() -> None:
 
 
 def test_fake_transport_raises_when_responses_are_exhausted() -> None:
-    fake = _FakeTransport([])
+    fake = FakeTransport([])
 
-    with pytest.raises(AssertionError, match='_FakeTransport responses exhausted'):
+    with pytest.raises(AssertionError, match='FakeTransport responses exhausted'):
         fake.send(_REQ)
 
     assert fake.requests == [_REQ]
@@ -140,51 +135,17 @@ def test_fake_transport_replays_responses_and_records_requests() -> None:
         headers={'Content-Type': 'application/json'},
         content=b'{"results": true}',
     )
-    fake = _FakeTransport([response])
+    fake = FakeTransport([response])
 
     assert fake.send(_REQ) is response
     assert fake.requests == [_REQ]
     assert response.headers['content-type'] == 'application/json'
 
 
-@pytest.mark.parametrize(
-    ('current_total', 'remaining', 'expected_total'),
-    [
-        (None, 3.0, 3.0),
-        (2.0, 3.0, 2.0),
-        (10.0, -0.5, 0.0),
-    ],
-)
-def test_narrow_total_timeout_preserves_request_fields(
-    current_total: float | None,
-    remaining: float,
-    expected_total: float,
-) -> None:
-    request = dataclasses.replace(
-        _REQ,
-        timeout=TimeoutConfig(connect=1.0, read=2.0, total=current_total),
-    )
-
-    narrowed = narrow_total_timeout(request, remaining)
-
-    assert narrowed == dataclasses.replace(
-        request,
-        timeout=TimeoutConfig(connect=1.0, read=2.0, total=expected_total),
-    )
-    assert narrowed is not request
-    assert narrowed.body is request.body
-    assert narrowed.headers is request.headers
-
-
-def test_narrow_total_timeout_returns_same_request_without_remaining_limit() -> None:
-    assert narrow_total_timeout(_REQ, None) is _REQ
-
-
-def test_timeout_config_defaults_total_and_is_frozen() -> None:
+def test_timeout_config_is_frozen() -> None:
     timeout = TimeoutConfig(connect=15.0, read=300.0)
-    field_name = 'total'
+    field_name = 'read'
 
-    assert timeout.total is None
     with pytest.raises(FrozenInstanceError):
         setattr(timeout, field_name, 60.0)
 
@@ -193,7 +154,6 @@ def test_transport_dataclass_semantic_field_order() -> None:
     assert tuple(field.name for field in dataclasses.fields(TimeoutConfig) if field.init) == (
         'connect',
         'read',
-        'total',
     )
     assert tuple(field.name for field in dataclasses.fields(TransportRequest) if field.init) == (
         'method',
@@ -201,7 +161,6 @@ def test_transport_dataclass_semantic_field_order() -> None:
         'headers',
         'body',
         'timeout',
-        'token',
     )
     assert tuple(field.name for field in dataclasses.fields(TransportResponse) if field.init) == (
         'status',
@@ -217,7 +176,6 @@ def test_transport_error_is_a_shotgun_error() -> None:
 
 def test_transport_errors_share_a_base_class() -> None:
     error_types = (
-        AbortedError,
         ConnectError,
         ProxyError,
         ReadTimeoutError,
@@ -266,8 +224,8 @@ def test_transport_response_close_invokes_callback_once_concurrently() -> None:
     callback_calls = 0
     callback_lock = threading.Lock()
 
-    def close_response(response: TransportResponse) -> None:
-        start.wait()
+    def close_response() -> None:
+        start.wait(timeout=5)
         response.close()
 
     def on_close() -> None:
@@ -284,12 +242,17 @@ def test_transport_response_close_invokes_callback_once_concurrently() -> None:
         content=b'',
         on_close=on_close,
     )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(close_response, response) for _ in range(worker_count)]
-        assert callback_entered.wait(timeout=5)
+
+    def release_after_callback_enters() -> None:
+        try:
+            assert callback_entered.wait(timeout=5)
+        finally:
+            release_callback.set()
+
+    try:
+        run_concurrently([close_response] * worker_count + [release_after_callback_enters])
+    finally:
         release_callback.set()
-        for future in futures:
-            future.result(timeout=5)
 
     assert callback_calls == 1
 

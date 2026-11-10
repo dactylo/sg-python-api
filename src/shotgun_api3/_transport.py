@@ -1,36 +1,23 @@
 """Transport vocabulary and HTTP backend implementations."""
 
-# Same-file collaboration follows module-boundary privacy.
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
-import contextvars
-import socket
 import ssl
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any, Protocol, cast
 
 import urllib3
-import urllib3.connectionpool
 import urllib3.exceptions
 from urllib3.util.ssl_match_hostname import CertificateError
 
+from ._connections import connection_pool_classes, keepalive_socket_options
 from ._errors import ShotgunError
 
-if TYPE_CHECKING:
-    from urllib3._base_connection import BaseHTTPConnection
-
 _CERTIFICATE_ERRORS = (ssl.SSLCertVerificationError, CertificateError)
-_CURRENT_ABORT: contextvars.ContextVar[tuple[_AbortRegistry, _AbortHandle] | None] = (
-    contextvars.ContextVar('_CURRENT_ABORT', default=None)
-)
 
 
 class CaseInsensitiveHeaders(Mapping[str, str]):
@@ -59,7 +46,11 @@ class CaseInsensitiveHeaders(Mapping[str, str]):
         self._lookup = MappingProxyType(values)
 
     def __getitem__(self, key: str) -> str:
-        """Return one header value by case-insensitive name."""
+        """Return one header value by case-insensitive name.
+
+        Raises:
+            KeyError: If no header matches the requested name.
+        """
         return self._lookup[key.casefold()]
 
     def __iter__(self) -> Iterator[str]:
@@ -123,7 +114,14 @@ class StreamingResponse:
         self._close_lock = threading.Lock()
 
     def close(self) -> None:
-        """Release resources associated with the streaming response."""
+        """Run the response cleanup callback at most once.
+
+        The callback is cleared before invocation, so a failed cleanup is not
+        retried by later calls.
+
+        Raises:
+            Exception: If the supplied cleanup callback fails.
+        """
         with self._close_lock:
             release = self._release
             self._release = None
@@ -170,27 +168,21 @@ class StreamingResponse:
 
 @dataclass(frozen=True)
 class TimeoutConfig:
-    """Connect/read limits and total monotonic ceiling through body consumption.
+    """Connect and read timeout limits.
 
-    The total limit applies per attempt. A `None` field has no timeout limit.
+    A `None` field has no timeout limit.
 
     Attributes:
         connect: Connection-establishment timeout in seconds.
         read: Socket-read timeout in seconds.
-        total: Total attempt timeout through body consumption.
     """
 
     connect: float | None
     read: float | None
-    total: float | None = None
 
 
 class TransportError(ShotgunError):
     """Base exception for transport-level failures."""
-
-
-class AbortedError(TransportError):
-    """Raised when a request is deliberately aborted via its token."""
 
 
 class ConnectError(TransportError):
@@ -223,7 +215,6 @@ class TransportRequest:
         headers: Request headers.
         body: Buffered or streaming request body.
         timeout: Timeout limits for this request.
-        token: Unique token used for cancellation.
     """
 
     method: str
@@ -231,7 +222,6 @@ class TransportRequest:
     headers: dict[str, str]
     body: bytes | Iterator[bytes] | None
     timeout: TimeoutConfig
-    token: str
 
 
 @dataclass(frozen=True, init=False)
@@ -282,7 +272,14 @@ class TransportResponse:
         object.__setattr__(self, '_on_close', on_close)
 
     def close(self) -> None:
-        """Release resources associated with the buffered response."""
+        """Run the response cleanup callback at most once.
+
+        The callback is cleared before invocation, so a failed cleanup is not
+        retried by later calls.
+
+        Raises:
+            Exception: If the supplied cleanup callback fails.
+        """
         with self._close_lock:
             callback = self._on_close
             object.__setattr__(self, '_on_close', None)
@@ -292,14 +289,6 @@ class TransportResponse:
 
 class Transport(Protocol):
     """HTTP backend operations required by the driver."""
-
-    def abort(self, token: str) -> None:
-        """Abort the request identified by a token.
-
-        Args:
-            token: Unique request token.
-        """
-        ...
 
     def close(self) -> None:
         """Release resources owned by the transport."""
@@ -334,146 +323,6 @@ class Transport(Protocol):
         ...
 
 
-class _AbortableConnection(Protocol):
-    """Socket operations required to abort an urllib3 connection."""
-
-    sock: socket.socket | ssl.SSLSocket | None
-
-    def close(self) -> None:
-        """Close the connection and prevent its socket from being reused."""
-
-
-@dataclass(eq=False)
-class _AbortHandle:
-    """Track one request registration independently of token reuse."""
-
-    token: str
-    generation: int
-    aborted: bool = False
-    connection: _AbortableConnection | None = None
-
-
-class _AbortRegistry:
-    """Track live connections and aborted requests under a lock."""
-
-    def __init__(self) -> None:
-        """Initialize an empty transport-abort registry."""
-        self._active: dict[str, dict[int, _AbortHandle]] = {}
-        self._generation = 0
-        self._lock = threading.Lock()
-
-    def _abort(self, token: str) -> None:
-        """Abort every active request registered for `token`."""
-        with self._lock:
-            connections: list[_AbortableConnection] = []
-            for handle in self._active.get(token, {}).values():
-                handle.aborted = True
-                if handle.connection is not None:
-                    connections.append(handle.connection)
-
-        for connection in connections:
-            live_socket = connection.sock
-            if live_socket is not None:
-                with suppress(OSError):
-                    live_socket.shutdown(socket.SHUT_RDWR)
-                if sys.platform == 'win32':
-                    # Buffered readers defer close on Windows, leaving recv blocked.
-                    # Transfer ownership so later reader closes cannot close a reused fd.
-                    with suppress(OSError):
-                        descriptor = live_socket.detach()
-                        if descriptor != -1:
-                            socket.close(descriptor)
-            connection.close()
-
-    def _attach(
-        self,
-        handle: _AbortHandle,
-        connection: _AbortableConnection,
-    ) -> bool:
-        """Attach a checked-out connection and report an earlier abort."""
-        with self._lock:
-            active = self._active.get(handle.token, {}).get(handle.generation)
-            if active is handle:
-                handle.connection = connection
-            return handle.aborted
-
-    def _begin(self, token: str) -> _AbortHandle:
-        """Begin tracking a request before it checks out a connection."""
-        with self._lock:
-            self._generation += 1
-            handle = _AbortHandle(token=token, generation=self._generation)
-            self._active.setdefault(token, {})[handle.generation] = handle
-            return handle
-
-    def _detach(self, handle: _AbortHandle) -> bool:
-        """Detach a connection before urllib3 can return it to the pool."""
-        with self._lock:
-            handle.connection = None
-            return handle.aborted
-
-    def _release(self, handle: _AbortHandle) -> None:
-        """Release exactly one request generation."""
-        with self._lock:
-            active = self._active.get(handle.token)
-            if active is not None and active.get(handle.generation) is handle:
-                active.pop(handle.generation)
-                if not active:
-                    self._active.pop(handle.token)
-            handle.connection = None
-
-    def _was_aborted(self, handle: _AbortHandle) -> bool:
-        """Return whether a particular request was aborted."""
-        with self._lock:
-            return handle.aborted
-
-
-@dataclass(frozen=True)
-class _StartedUrllib3Request:
-    """Hold request-start state whose lifetime remains caller-owned."""
-
-    response: urllib3.response.HTTPResponse
-    handle: _AbortHandle
-    started: float
-
-
-class _HTTPPool(urllib3.connectionpool.HTTPConnectionPool):
-    """HTTP pool that aligns abort registration with connection ownership."""
-
-    def _get_conn(self, timeout: float | None = None) -> BaseHTTPConnection:
-        """Attach a request handle when a connection is checked out."""
-        return _attach_checked_out_connection(super()._get_conn(timeout))
-
-    def _put_conn(self, conn: BaseHTTPConnection | None) -> None:
-        """Detach a request handle before returning a connection."""
-        super()._put_conn(_detach_returned_connection(conn))
-
-    def _validate_conn(self, conn: BaseHTTPConnection) -> None:
-        """Connect while checking abort state before and after socket creation."""
-        _raise_if_current_aborted(conn)
-        super()._validate_conn(conn)
-        if conn.is_closed:
-            conn.connect()
-        _raise_if_current_aborted(conn)
-
-
-class _HTTPSPool(urllib3.connectionpool.HTTPSConnectionPool):
-    """HTTPS pool that aligns abort registration with connection ownership."""
-
-    def _get_conn(self, timeout: float | None = None) -> BaseHTTPConnection:
-        """Attach a request handle when a connection is checked out."""
-        return _attach_checked_out_connection(super()._get_conn(timeout))
-
-    def _put_conn(self, conn: BaseHTTPConnection | None) -> None:
-        """Detach a request handle before returning a connection."""
-        super()._put_conn(_detach_returned_connection(conn))
-
-    def _validate_conn(self, conn: BaseHTTPConnection) -> None:
-        """Validate TLS while checking abort state around socket creation."""
-        _raise_if_current_aborted(conn)
-        super()._validate_conn(conn)
-        _raise_if_current_aborted(conn)
-
-
 class Urllib3Transport:
     """Transport implementation on a urllib3 connection pool.
 
@@ -481,12 +330,16 @@ class Urllib3Transport:
         proxy_info: Compatibility proxy metadata for a direct connection.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         ca_certs: str | None = None,
         proxy_url: str | None = None,
         proxy_headers: dict[str, str] | None = None,
         pool_maxsize: int = 10,
+        *,
+        max_connection_idle_secs: float | None = 60.0,
+        tcp_keepalive_timeout_secs: int | None = 60,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize a urllib3 connection pool transport.
 
@@ -495,8 +348,13 @@ class Urllib3Transport:
             proxy_url: Optional proxy URL.
             proxy_headers: Optional headers sent to the proxy.
             pool_maxsize: Maximum connections retained by the pool.
+            max_connection_idle_secs: Validated idle limit in seconds, or
+                `None` to disable expiry. Counted after body preload for
+                buffered responses, or after headers for streamed responses.
+            tcp_keepalive_timeout_secs: Validated nominal keepalive target in
+                seconds, or `None` to disable tuning.
+            clock: Monotonic clock returning seconds.
         """
-        self._abort_registry = _AbortRegistry()
         common: dict[str, Any] = {'maxsize': pool_maxsize}
         if ca_certs is not None:
             common['ca_certs'] = ca_certs
@@ -508,71 +366,41 @@ class Urllib3Transport:
             )
         else:
             self._pool = urllib3.PoolManager(**common)
-        pool_classes: dict[
-            str,
-            type[
-                urllib3.connectionpool.HTTPConnectionPool
-                | urllib3.connectionpool.HTTPSConnectionPool
-            ],
-        ] = {
-            'http': _HTTPPool,
-            'https': _HTTPSPool,
-        }
-        self._pool.pool_classes_by_scheme = pool_classes
+        self._pool.pool_classes_by_scheme = connection_pool_classes(
+            max_connection_idle_secs, keepalive_socket_options(tcp_keepalive_timeout_secs), clock
+        )
 
     def _start_request(
         self,
         request: TransportRequest,
         *,
         preload_content: bool,
-    ) -> _StartedUrllib3Request:
-        """Start one urllib3 request and leave its live handle caller-owned."""
+    ) -> urllib3.response.HTTPResponse:
+        """Start one urllib3 request and return its response."""
         timeout = urllib3.Timeout(
             connect=request.timeout.connect,
             read=request.timeout.read,
-            total=request.timeout.total,
         )
-        handle = self._abort_registry._begin(request.token)
-        context_token = _CURRENT_ABORT.set((self._abort_registry, handle))
         try:
-            try:
-                started = time.monotonic()
-                response = cast(
-                    'urllib3.response.HTTPResponse',
-                    self._pool.request(
-                        request.method,
-                        request.url,
-                        body=request.body,
-                        headers=request.headers,
-                        timeout=timeout,
-                        retries=False,
-                        preload_content=preload_content,
-                    ),
-                )
-            except urllib3.exceptions.HTTPError as exc:
-                if self._abort_registry._was_aborted(handle):
-                    raise AbortedError(request.token) from exc
-                raise _map_urllib3_error(exc) from exc
-            except urllib3.exceptions.ProxySchemeUnsupported as exc:
-                raise ProxyError(str(exc)) from exc
-            except Exception as exc:
-                raise _map_unexpected_request_error(
-                    exc, self._abort_registry, handle, request.token
-                ) from exc
-        except BaseException:
-            self._abort_registry._release(handle)
-            raise
-        finally:
-            _CURRENT_ABORT.reset(context_token)
-        return _StartedUrllib3Request(response=response, handle=handle, started=started)
-
-    def abort(self, token: str) -> None:
-        """Abort the in-flight request identified by a token.
-
-        Args:
-            token: Unique request token.
-        """
-        self._abort_registry._abort(token)
+            response = cast(
+                'urllib3.response.HTTPResponse',
+                self._pool.request(
+                    request.method,
+                    request.url,
+                    body=request.body,
+                    headers=request.headers,
+                    timeout=timeout,
+                    retries=False,
+                    preload_content=preload_content,
+                ),
+            )
+        except urllib3.exceptions.HTTPError as exc:
+            raise _map_urllib3_error(exc) from exc
+        except urllib3.exceptions.ProxySchemeUnsupported as exc:
+            raise ProxyError(str(exc)) from exc
+        except Exception as exc:
+            raise SendError(str(exc)) from exc
+        return response
 
     def close(self) -> None:
         """Release pooled connections owned by the transport."""
@@ -603,16 +431,13 @@ class Urllib3Transport:
         Raises:
             TransportError: If urllib3 reports a transport failure.
         """
-        started = self._start_request(request, preload_content=True)
-        try:
-            return TransportResponse(
-                status=started.response.status,
-                reason=started.response.reason or '',
-                headers=dict(started.response.headers),
-                content=started.response.data,
-            )
-        finally:
-            self._abort_registry._release(started.handle)
+        response = self._start_request(request, preload_content=True)
+        return TransportResponse(
+            status=response.status,
+            reason=response.reason or '',
+            headers=dict(response.headers),
+            content=response.data,
+        )
 
     def send_streaming(self, request: TransportRequest) -> StreamingResponse:
         """Send one request and return its single-use streaming response.
@@ -627,26 +452,13 @@ class Urllib3Transport:
             TransportError: If urllib3 reports a transport failure while
                 receiving response headers.
         """
-        started = self._start_request(request, preload_content=False)
-        response = started.response
-
-        deadline = (
-            None if request.timeout.total is None else started.started + request.timeout.total
-        )
+        response = self._start_request(request, preload_content=False)
 
         def release() -> None:
-            _release_urllib3_stream(response, self._abort_registry, started.handle)
+            _release_urllib3_stream(response)
 
         def stream(size: int) -> Iterator[bytes]:
-            attempt = _Urllib3StreamingAttempt(
-                deadline=deadline,
-                handle=started.handle,
-                read_timeout=request.timeout.read,
-                registry=self._abort_registry,
-                response=response,
-                token=request.token,
-            )
-            return _stream_urllib3_response(attempt, size)
+            return _stream_urllib3_response(response, size)
 
         try:
             return StreamingResponse(
@@ -661,66 +473,12 @@ class Urllib3Transport:
             raise
 
 
-@dataclass(frozen=True)
-class _Urllib3StreamingAttempt:
-    """Bundle state that remains live through streaming body consumption."""
-
-    deadline: float | None
-    handle: _AbortHandle
-    read_timeout: float | None
-    registry: _AbortRegistry
-    response: urllib3.response.HTTPResponse
-    token: str
-
-
-def _attach_checked_out_connection(
-    connection: BaseHTTPConnection,
-) -> BaseHTTPConnection:
-    """Attach the active request handle to a checked-out connection."""
-    current = _CURRENT_ABORT.get()
-    if current is None:
-        return connection
-    registry, handle = current
-    abortable = cast('_AbortableConnection', connection)
-    if registry._attach(handle, abortable):
-        connection.close()
-        raise AbortedError(handle.token)
-    return connection
-
-
-def _detach_returned_connection(
-    connection: BaseHTTPConnection | None,
-) -> BaseHTTPConnection | None:
-    """Detach the active handle and discard a connection lost to abort."""
-    current = _CURRENT_ABORT.get()
-    if current is None:
-        return connection
-    registry, handle = current
-    if not registry._detach(handle):
-        return connection
-    if connection is not None:
-        connection.close()
-    return None
-
-
 def _is_certificate_failure(exc: BaseException) -> bool:
     """Return whether an exception contains certificate-verification evidence."""
     if isinstance(exc, _CERTIFICATE_ERRORS):
         return True
     nested = (exc.__cause__, exc.__context__, *exc.args)
     return any(isinstance(item, _CERTIFICATE_ERRORS) for item in nested)
-
-
-def _map_unexpected_request_error(
-    exc: Exception,
-    registry: _AbortRegistry,
-    handle: _AbortHandle,
-    token: str,
-) -> TransportError:
-    """Translate an unexpected request failure into transport vocabulary."""
-    if registry._was_aborted(handle):
-        return AbortedError(token)
-    return SendError(str(exc))
 
 
 def _map_urllib3_error(exc: urllib3.exceptions.HTTPError) -> TransportError:
@@ -743,9 +501,7 @@ def _map_urllib3_error(exc: urllib3.exceptions.HTTPError) -> TransportError:
 
 
 def _next_urllib3_stream_chunk(
-    attempt: _Urllib3StreamingAttempt,
     chunks: Iterator[bytes],
-    total_limited: bool,
 ) -> bytes:
     """Read one chunk while translating every backend body failure."""
     try:
@@ -753,38 +509,17 @@ def _next_urllib3_stream_chunk(
     except StopIteration:
         raise
     except urllib3.exceptions.HTTPError as exc:
-        if attempt.registry._was_aborted(attempt.handle):
-            raise AbortedError(attempt.token) from exc
-        mapped = _map_urllib3_error(exc)
-        if total_limited and isinstance(mapped, ReadTimeoutError):
-            raise ReadTimeoutError('total streaming timeout exceeded') from exc
-        raise mapped from exc
+        raise _map_urllib3_error(exc) from exc
     except urllib3.exceptions.ProxySchemeUnsupported as exc:
         raise ProxyError(str(exc)) from exc
     except Exception as exc:
-        if attempt.registry._was_aborted(attempt.handle):
-            raise AbortedError(attempt.token) from exc
         raise SendError(str(exc)) from exc
-
-
-def _raise_if_current_aborted(connection: BaseHTTPConnection) -> None:
-    """Close a connection and raise when its active request was aborted."""
-    current = _CURRENT_ABORT.get()
-    if current is None:
-        return
-    registry, handle = current
-    if registry._was_aborted(handle):
-        connection.close()
-        raise AbortedError(handle.token)
 
 
 def _release_urllib3_stream(
     response: urllib3.response.HTTPResponse,
-    registry: _AbortRegistry,
-    handle: _AbortHandle,
 ) -> None:
-    """Release one streaming registry handle and any owned connection."""
-    registry._release(handle)
+    """Close a streaming response and return its owned connection."""
     if response.connection is None:
         return
     try:
@@ -793,53 +528,17 @@ def _release_urllib3_stream(
         response.release_conn()
 
 
-def _set_stream_read_timeout(
-    attempt: _Urllib3StreamingAttempt,
-) -> bool:
-    """Apply the active timeout and report whether total is the limiter."""
-    if attempt.deadline is None:
-        return False
-    remaining = attempt.deadline - time.monotonic()
-    if remaining <= 0:
-        raise ReadTimeoutError('total streaming timeout exceeded')
-    total_limited = attempt.read_timeout is None or remaining <= attempt.read_timeout
-    connection = attempt.response.connection
-    if connection is None:
-        return total_limited
-    live_socket = connection.sock
-    if live_socket is None:
-        return total_limited
-    try:
-        live_socket.settimeout(
-            remaining if attempt.read_timeout is None else min(attempt.read_timeout, remaining)
-        )
-    except Exception as exc:
-        raise _map_unexpected_request_error(
-            exc, attempt.registry, attempt.handle, attempt.token
-        ) from exc
-    return total_limited
-
-
 def _stream_urllib3_response(
-    attempt: _Urllib3StreamingAttempt,
+    response: urllib3.response.HTTPResponse,
     size: int,
 ) -> Iterator[bytes]:
-    """Yield body chunks while mapping errors and enforcing the deadline."""
-    chunks = attempt.response.stream(size)
+    """Yield body chunks while mapping backend errors."""
+    chunks = response.stream(size)
     while True:
-        if attempt.registry._was_aborted(attempt.handle):
-            raise AbortedError(attempt.token)
-        total_limited = _set_stream_read_timeout(attempt)
-        context_token = _CURRENT_ABORT.set((attempt.registry, attempt.handle))
         try:
-            try:
-                chunk = _next_urllib3_stream_chunk(attempt, chunks, total_limited)
-            except StopIteration:
-                return
-        finally:
-            _CURRENT_ABORT.reset(context_token)
-        if attempt.deadline is not None and time.monotonic() > attempt.deadline:
-            raise ReadTimeoutError('total streaming timeout exceeded')
+            chunk = _next_urllib3_stream_chunk(chunks)
+        except StopIteration:
+            return
         yield chunk
 
 
@@ -858,6 +557,9 @@ def body_close(body: object) -> Callable[[], object] | None:
 def content_length(headers: Mapping[str, str]) -> int | None:
     """Parse a nonnegative content length when present.
 
+    Args:
+        headers: Response headers whose names are matched case-insensitively.
+
     Returns:
         Parsed nonnegative length, or `None` when absent or invalid.
     """
@@ -872,30 +574,3 @@ def content_length(headers: Mapping[str, str]) -> int | None:
     except ValueError:
         return None
     return length if length >= 0 else None
-
-
-def narrow_total_timeout(
-    request: TransportRequest,
-    remaining: float | None,
-) -> TransportRequest:
-    """Restrict a request to its nonnegative remaining total timeout.
-
-    Args:
-        request: Original transport request.
-        remaining: Remaining total timeout in seconds, when limited.
-
-    Returns:
-        The original request when `remaining` is `None`. Otherwise, a
-        replacement whose total timeout is `remaining` clamped to zero and
-        capped by any existing total timeout. Headers and body are shared with
-        the original request.
-    """
-    if remaining is None:
-        return request
-    narrowed_total = max(remaining, 0.0)
-    if request.timeout.total is not None:
-        narrowed_total = min(request.timeout.total, narrowed_total)
-    return replace(
-        request,
-        timeout=replace(request.timeout, total=narrowed_total),
-    )

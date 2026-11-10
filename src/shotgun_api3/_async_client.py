@@ -1,18 +1,13 @@
 """Native-async Shotgun client and lifecycle."""
 
-# Same-file collaboration follows module-boundary privacy.
-# pyright: reportPrivateUsage=false
-
 import asyncio
 import copy
 import dataclasses
 import datetime as _dt_module
 import importlib
-import inspect
 import os
 import threading
 import urllib.request
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from contextlib import ExitStack, asynccontextmanager, suppress
 from pathlib import Path
@@ -21,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     BinaryIO,
+    ClassVar,
     Literal,
     Never,
     ParamSpec,
@@ -43,12 +39,8 @@ from ._async_driver import (
 from ._async_transport import AsyncStreamingResponse, AsyncTransport
 from ._capabilities import ClientCapabilities, ServerCapabilities
 from ._client import (
-    CONSTRUCTOR_SIGNATURE,
     ConstructorOptions,
-    Shotgun,
-    bind_constructor,
     build_config,
-    expose_constructor_signature,
 )
 from ._config import (
     Config,
@@ -60,7 +52,6 @@ from ._config import (
     server_page_limit,
 )
 from ._execution import SuppressedExceptionCapture, release_lease, retire_transport
-from ._signatures import bind_arguments, expose_signature
 from ._transport import (
     ReadTimeoutError,
     SendError,
@@ -80,11 +71,6 @@ _FilesystemParams = ParamSpec('_FilesystemParams')
 _FilesystemResult = TypeVar('_FilesystemResult')
 _UploadResult = TypeVar('_UploadResult')
 
-_METHOD_UPLOAD_SIGNATURE = inspect.signature(Shotgun.upload)
-_UPLOAD_SIGNATURE = inspect.signature(Shotgun.upload).replace(
-    parameters=tuple(inspect.signature(Shotgun.upload).parameters.values())[1:]
-)
-
 
 class _AsyncDownloadCancellationScope:
     """Own and join every filesystem worker started by one transfer."""
@@ -94,12 +80,17 @@ class _AsyncDownloadCancellationScope:
         self._captured_cancellation: asyncio.CancelledError | None = None
 
     @property
-    def _cancellation(self) -> asyncio.CancelledError | None:
+    def cancellation(self) -> asyncio.CancelledError | None:
         """Return the first cancellation captured while joining a worker."""
         return self._captured_cancellation
 
-    def _capture_cancellation(self, error: BaseException) -> None:
-        """Retain one actively delivered caller cancellation."""
+    def capture_cancellation(self, error: BaseException) -> None:
+        """Retain one actively delivered caller cancellation.
+
+        Args:
+            error: Failure to retain if it is an active caller cancellation;
+                other failures are ignored.
+        """
         current = asyncio.current_task()
         if (
             not isinstance(error, asyncio.CancelledError)
@@ -111,28 +102,45 @@ class _AsyncDownloadCancellationScope:
             self._captured_cancellation = error
         current.uncancel()
 
-    def _raise_if_cancelled(self) -> None:
-        """Propagate a captured cancellation only between worker phases."""
+    def raise_if_cancelled(self) -> None:
+        """Propagate a captured cancellation only between worker phases.
+
+        Raises:
+            asyncio.CancelledError: If caller cancellation was captured.
+        """
         if self._captured_cancellation is not None:
             raise self._captured_cancellation
 
-    async def _run(
+    async def run(
         self,
         function: Callable[_FilesystemParams, _FilesystemResult],
         *args: _FilesystemParams.args,
         **kwargs: _FilesystemParams.kwargs,
     ) -> _FilesystemResult:
-        """Run one worker to completion while retaining cancellation."""
+        """Run one worker to completion while retaining cancellation.
+
+        Args:
+            function: Blocking operation to execute off-loop.
+            *args: Positional arguments forwarded to the operation.
+            **kwargs: Keyword arguments forwarded to the operation.
+
+        Returns:
+            The operation's result after its worker finishes.
+
+        Raises:
+            BaseException: If the worker fails. A captured caller cancellation
+                takes precedence over the worker's failure.
+        """
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         while not task.done():
             try:
                 await asyncio.wait({task})
             except asyncio.CancelledError as error:
-                self._capture_cancellation(error)
+                self.capture_cancellation(error)
         try:
             return task.result()
         except BaseException:
-            self._raise_if_cancelled()
+            self.raise_if_cancelled()
             raise
 
 
@@ -155,7 +163,7 @@ class _AsyncDownloadCleanupCapture:
         _traceback: TracebackType | None,
     ) -> bool:
         """Capture and suppress one async download-cleanup exception."""
-        self.exception = self._workers._cancellation or exception
+        self.exception = self._workers.cancellation or exception
         return exception is not None
 
 
@@ -193,35 +201,38 @@ class _AsyncDownloadExchange:
         workers = _AsyncDownloadCancellationScope()
         try:
             try:
-                stack, handle, temporary = await workers._run(
-                    _open_download_temporary,
-                    destination,
-                )
-                workers._raise_if_cancelled()
+                with _files.download_destination_io(destination):
+                    stack, handle, temporary = await workers.run(
+                        _open_download_temporary,
+                        destination,
+                    )
+                workers.raise_if_cancelled()
                 opened_handle = handle
 
                 async def write(chunk: bytes) -> None:
-                    await workers._run(opened_handle.write, chunk)
-                    workers._raise_if_cancelled()
+                    with _files.download_destination_io(destination):
+                        await workers.run(opened_handle.write, chunk)
+                    workers.raise_if_cancelled()
 
                 await control.consume_into(chunks, write, total_bytes=total_bytes)
-                await workers._run(handle.flush)
-                workers._raise_if_cancelled()
+                with _files.download_destination_io(destination):
+                    await workers.run(handle.flush)
+                workers.raise_if_cancelled()
                 close_exception = await _capture_download_cleanup(workers, stack.close)
-                stack = None
-                handle = None
-                workers._raise_if_cancelled()
+                stack, handle = None, None
+                workers.raise_if_cancelled()
                 if close_exception is not None:
                     _raise_download_cleanup_error()
                 # This is the final cancellation checkpoint before atomic commit.
                 # Once `replace` starts, its worker is joined before cancellation
                 # propagates, so the destination cannot change after return.
                 await asyncio.sleep(0)
-                await workers._run(temporary.replace, destination)
-                workers._raise_if_cancelled()
+                with _files.download_destination_io(destination):
+                    await workers.run(temporary.replace, destination)
+                workers.raise_if_cancelled()
             except BaseException as error:
                 operation_exception = error
-                workers._capture_cancellation(error)
+                workers.capture_cancellation(error)
                 raise
         finally:
             close_exception: BaseException | None = None
@@ -234,7 +245,7 @@ class _AsyncDownloadExchange:
                     temporary.unlink,
                     missing_ok=True,
                 )
-            workers._raise_if_cancelled()
+            workers.raise_if_cancelled()
             if operation_exception is None:
                 if close_exception is not None:
                     raise _AsyncDownloadCleanupError from None
@@ -258,12 +269,23 @@ class _AsyncDownloadExchange:
         chunks = streaming.aiter_chunks(_ASYNC_FILE_BATCH_SIZE)
         return await self._write_file(chunks, control, total_bytes)
 
-    async def _execute(
+    async def execute(
         self,
         driver: AsyncDriver,
         operation: _protocol.OperationDescriptor,
     ) -> bytes | str:
-        """Execute the workflow through the common async attempt loop."""
+        """Execute the workflow through the common async attempt loop.
+
+        Returns:
+            Downloaded bytes, or the destination path for a file download.
+
+        Raises:
+            SendError: If required download cleanup fails.
+            TransportError: If the attempt loop cannot complete the transfer.
+            ShotgunFileDownloadError: If the response or redirect is invalid,
+                or creating, writing, flushing, or publishing the destination
+                file fails.
+        """
         try:
             return await driver.execute(
                 operation,
@@ -310,36 +332,6 @@ class _TokenExchangeProgress:
     token: str | None = None
 
 
-def _bind_upload(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-) -> _files.UploadArguments:
-    """Bind runtime arguments with upload-specific errors."""
-    bound = bind_arguments(_UPLOAD_SIGNATURE, args, kwargs, 'AsyncShotgun.upload()')
-    arguments = cast('Callable[..., _files.UploadArguments]', _files.UploadArguments)
-    return arguments(**bound.arguments)
-
-
-async def _capture_download_cleanup(
-    workers: _AsyncDownloadCancellationScope,
-    function: Callable[_FilesystemParams, _FilesystemResult],
-    *args: _FilesystemParams.args,
-    **kwargs: _FilesystemParams.kwargs,
-) -> BaseException | None:
-    """Run one joined cleanup operation and capture its failure."""
-    capture = _AsyncDownloadCleanupCapture(workers)
-    with capture:
-        await workers._run(function, *args, **kwargs)
-    return capture.exception
-
-
-def _expose_upload_signature(function: Callable[..., object]) -> Callable[..., object]:
-    """Attach the implemented sync upload signature and annotations."""
-    expose_signature(function, _METHOD_UPLOAD_SIGNATURE, Shotgun.upload.__doc__)
-    object.__setattr__(function, '__annotations__', Shotgun.upload.__annotations__)
-    return function
-
-
 class AsyncShotgun:
     """Provide the asynchronous Flow Production Tracking API client surface.
 
@@ -356,12 +348,8 @@ class AsyncShotgun:
         server_info: Cached raw metadata for the configured origin.
     """
 
-    __signature__ = CONSTRUCTOR_SIGNATURE
+    _in_process: ClassVar[bool] = False
 
-    @overload
-    def __init__(self, base_url: Never) -> None: ...
-
-    @overload
     def __init__(
         self,
         base_url: str,
@@ -376,10 +364,7 @@ class AsyncShotgun:
         sudo_as_login: str | None = None,
         session_token: str | None = None,
         auth_token: str | None = None,
-    ) -> None: ...
-
-    @expose_constructor_signature
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    ) -> None:
         """Initialize a client for one site and authentication mode.
 
         Supply exactly one authentication mode: `script_name` with `api_key`,
@@ -391,6 +376,8 @@ class AsyncShotgun:
         `http_proxy` accepts `[user:pass@]host[:port]`, with port 8080 when
         omitted. A truthy `ca_certs` selects a CA bundle; otherwise
         `SHOTGUN_API_CACERTS` is consulted before using system trust roots.
+        `SHOTGUN_API_RETRY_INTERVAL` supplies a nonnegative integer retry
+        interval in milliseconds, defaulting to 3000.
 
         Constructor validation is synchronous; readiness and authentication
         exchange I/O begins only through an operation, `connect()`, or an async
@@ -398,20 +385,57 @@ class AsyncShotgun:
         I/O.
 
         Args:
-            *args: Positional values from the documented constructor signature.
-            **kwargs: Keyword values from the documented constructor signature.
+            base_url: Flow Production Tracking site URL.
+            script_name: Script name for script authentication.
+            api_key: API key for script authentication.
+            convert_datetimes_to_utc: Whether to convert datetime values to
+                UTC.
+            http_proxy: Optional proxy authority in `[user:pass@]host[:port]`
+                form.
+            connect: Whether to request eager readiness during asynchronous
+                context entry.
+            ca_certs: Optional certificate-authority bundle path.
+            login: Login for human-user authentication.
+            password: Password for human-user authentication.
+            sudo_as_login: Optional user login for sudo impersonation.
+            session_token: Existing session token for authentication.
+            auth_token: Optional two-factor authentication token.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
-            ValueError: If authentication, URL, or proxy values are invalid.
+            ValueError: If authentication, URL, or proxy values are invalid,
+                the configured CA bundle is not a readable file, or
+                `SHOTGUN_API_RETRY_INTERVAL` is not a nonnegative integer.
         """
-        self._initialize(bind_constructor(args, kwargs, 'AsyncShotgun'))
+        self._initialize(
+            ConstructorOptions(
+                base_url,
+                script_name,
+                api_key,
+                convert_datetimes_to_utc,
+                http_proxy,
+                connect,
+                ca_certs,
+                login,
+                password,
+                sudo_as_login,
+                session_token,
+                auth_token,
+            )
+        )
 
     async def __aenter__(self) -> Self:
         """Enter this client and perform any configured eager connection.
 
         Returns:
             This client.
+
+        Raises:
+            ShotgunError: If eager connection encounters an RPC fault or
+                terminal transport failure.
+            ProtocolError: If an eager connection request returns an HTTP
+                error.
+            ValueError: If eager authenticated HTTP violates the configured
+                origin policy.
         """
         if not self._connect_on_enter:
             return self
@@ -427,6 +451,10 @@ class AsyncShotgun:
 
         Args:
             *exc: Context-manager exception details, if any.
+
+        Raises:
+            ShotgunError: If the built-in transport cannot finish cleanup.
+            Exception: If a replacement transport's cleanup fails.
         """
         await self.close()
 
@@ -482,10 +510,14 @@ class AsyncShotgun:
     def _initialize(self, options: ConstructorOptions) -> None:
         """Initialize network-free state from validated constructor options."""
         self._base_url = options.base_url.rstrip('/')
-        self._ca_certs = options.ca_certs or os.environ.get('SHOTGUN_API_CACERTS') or None
+        self._ca_certs = (
+            options.ca_certs or os.environ.get('SHOTGUN_API_CACERTS') or None
+            if self._in_process
+            else config_module.constructor_ca_certs(options.ca_certs)
+        )
         self._client_caps = ClientCapabilities()
         self._connect_on_enter = options.connect
-        self._config = build_config(options)
+        self._config = build_config(options, in_process=self._in_process)
 
         self._driver: AsyncDriver | None = None
         self._driver_generation: int | None = None
@@ -546,7 +578,11 @@ class AsyncShotgun:
             raise cancellation
 
     def _new_transport(self, context: RequestContext) -> AsyncTransport:
-        """Create an httpx2 transport from one immutable context."""
+        """Create a transport from one context; mockgun overrides this package-internal hook."""
+        if context.in_process:
+            raise RuntimeError('an in-process client must supply its own transport')
+        if context.pool_maxsize < 1:
+            raise ValueError('pool_maxsize must be at least 1')
         module = importlib.import_module(f'{__package__}._async_httpx2')
         factory = cast(
             'type[Httpx2Transport]',
@@ -557,6 +593,8 @@ class AsyncShotgun:
             proxy_headers=dict(context.proxy_headers) or None,
             proxy_url=context.proxy_url,
             pool_maxsize=context.pool_maxsize,
+            max_connection_idle_secs=context.max_connection_idle_secs,
+            tcp_keepalive_timeout_secs=context.tcp_keepalive_timeout_secs,
         )
 
     def _acquire_driver(
@@ -566,7 +604,14 @@ class AsyncShotgun:
         """Lease one generation's driver and return idle transports to close."""
         close_after_unlock: list[AsyncTransport] = []
         with self._transport_lock:
-            if self._known_transport is not self._transport:
+            decision = _files.choose_driver_lease(
+                self._known_transport,
+                self._transport,
+                self._driver_generation,
+                context.transport_generation,
+                self._transport_owned,
+            )
+            if decision.known_changed:
                 if self._known_transport is not None:
                     retired = retire_transport(
                         self._lease_counts, self._retired_transports, self._known_transport
@@ -584,16 +629,14 @@ class AsyncShotgun:
                 self._transport = transport
                 self._known_transport = transport
                 self._transport_owned = True
-            elif self._driver_generation not in {None, context.transport_generation}:
-                if self._transport_owned:
-                    retired = retire_transport(
-                        self._lease_counts, self._retired_transports, transport
-                    )
-                    if retired is not None:
-                        close_after_unlock.append(retired)
-                    transport = self._new_transport(context)
-                    self._transport = transport
-                    self._known_transport = transport
+            elif decision.replace_owned_transport:
+                retired = retire_transport(self._lease_counts, self._retired_transports, transport)
+                if retired is not None:
+                    close_after_unlock.append(retired)
+                transport = self._new_transport(context)
+                self._transport = transport
+                self._known_transport = transport
+            if decision.reset_driver:
                 self._driver = None
 
             if self._driver is None:
@@ -951,7 +994,9 @@ class AsyncShotgun:
             driver,
             context,
             exchange,
-            lambda text, _headers: _files.parse_link_completion(text),
+            lambda text, _headers: _files.parse_link_completion(
+                text, operation='share_thumbnail', entities=entities
+            ),
         )
 
     async def _thumbnail_source_ready(
@@ -1025,7 +1070,7 @@ class AsyncShotgun:
             _files.StorageRange(
                 length=prepared.file_size,
                 offset=0,
-                path=prepared.options.arguments.path,
+                path=prepared.path,
             ),
             chunk_size=_ASYNC_FILE_BATCH_SIZE,
         )
@@ -1062,7 +1107,16 @@ class AsyncShotgun:
             driver,
             context,
             exchange,
-            lambda text, _headers: _files.parse_link_completion(text),
+            lambda text, _headers: _files.parse_link_completion(
+                text,
+                operation='upload link',
+                entities=[
+                    {
+                        'type': prepared.options.arguments.entity_type,
+                        'id': prepared.options.arguments.entity_id,
+                    }
+                ],
+            ),
         )
 
     @staticmethod
@@ -1135,17 +1189,9 @@ class AsyncShotgun:
         prepared: _files.PreparedUpload,
     ) -> int:
         """Execute one prepared upload through a captured driver lease."""
-        arguments = prepared.options.arguments
         capabilities = await self._ensure_readiness(context, driver)
         operation_context = await self._authenticated_context(context, driver)
-        upload_path = _files.require_supported_upload_path(
-            _files.choose_upload_path(
-                capabilities.server_info,
-                arguments.entity_type,
-                arguments.field_name,
-                prepared.file_size,
-            )
-        )
+        upload_path = _files.choose_prepared_upload_path(capabilities.server_info, prepared)
         multipart = upload_path == 'multipart'
         upload_info = await self._upload_allocation(
             driver,
@@ -1185,14 +1231,8 @@ class AsyncShotgun:
     ) -> int:
         """Execute the exact direct-storage thumbnail workflow."""
         capabilities = await self._ensure_readiness(context, driver)
-        arguments = prepared.options.arguments
-        _files.require_supported_upload_path(
-            _files.choose_upload_path(
-                capabilities.server_info,
-                arguments.entity_type,
-                arguments.field_name,
-                prepared.file_size,
-            )
+        _files.choose_prepared_upload_path(
+            capabilities.server_info, prepared, sharing_thumbnail=True
         )
         upload_info = await self._upload_allocation(
             driver,
@@ -1225,10 +1265,6 @@ class AsyncShotgun:
             result.update({field_name: current.get(field_name) for field_name in thumbnails})
         return result
 
-    @overload
-    async def activity_stream_read(self, entity_type: Never) -> dict[str, object]: ...
-
-    @overload
     async def activity_stream_read(
         self,
         entity_type: str,
@@ -1237,34 +1273,30 @@ class AsyncShotgun:
         min_id: int | None = None,
         max_id: int | None = None,
         limit: int | None = None,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_activity_stream_read_signature
-    async def activity_stream_read(
-        self,
-        *args: object,
-        **kwargs: object,
     ) -> dict[str, object]:
         """Read the activity stream for one entity.
 
         Args:
-            *args: Positional arguments from the documented activity-stream
-                signature.
-            **kwargs: Keyword arguments from the documented activity-stream
-                signature.
+            entity_type: Entity type whose activity stream to read.
+            entity_id: Numeric identifier of the entity.
+            entity_fields: Optional fields to return for linked entity types.
+            min_id: Optional minimum activity identifier.
+            max_id: Optional maximum activity identifier.
+            limit: Optional maximum number of activity records.
 
         Returns:
             Activity stream data returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
                 or if the server result has the wrong type.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_activity_stream_read(args, kwargs, 'AsyncShotgun')
+        options = _methods.ActivityStreamReadOptions(
+            entity_type, entity_id, entity_fields, min_id, max_id, limit
+        )
         result = await self._call(
             'activity_stream',
             _methods.build_activity_stream_read_params(options),
@@ -1348,7 +1380,10 @@ class AsyncShotgun:
                 type, or if the server result is not a list.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         calls = _crud.build_batch_calls(requests)
         if not calls:
@@ -1425,7 +1460,15 @@ class AsyncShotgun:
         )
 
     async def close(self) -> None:
-        """Swap out and drain the current transport without aborting work."""
+        """Swap out and drain the current transport without aborting work.
+
+        Attempt cleanup of the remaining retired transports if one close fails,
+        then propagate the first failure.
+
+        Raises:
+            ShotgunError: If the built-in transport cannot finish cleanup.
+            Exception: If a replacement transport's cleanup fails.
+        """
         close_after_unlock: list[AsyncTransport] = []
         with self._transport_lock:
             advance_transport_generation(self._config)
@@ -1544,7 +1587,10 @@ class AsyncShotgun:
                 file. A thumbnail failure occurs after the entity is created.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=False)
         params = _crud.build_create_params(entity_type, field_data, return_fields)
@@ -1612,13 +1658,13 @@ class AsyncShotgun:
 
         Raises:
             TypeError: If no attachment is given or the reference is a string.
-            ValueError: If an entity dictionary references a different type.
+            ValueError: If an entity dictionary references a different type,
+                server settings are incomplete, or authenticated HTTP violates
+                the configured origin security policy.
             ShotgunError: If another attachment reference is unsupported or a
                 setup RPC reports a fault; the fault keeps its specific type.
             ShotgunFileDownloadError: If the resolved URL is invalid or setup,
                 transfer, or destination I/O fails.
-            ValueError: If server settings are incomplete or authenticated HTTP
-                violates the configured origin security policy.
         """
         if attachment is False:
             if attachment_id is None:
@@ -1653,7 +1699,7 @@ class AsyncShotgun:
                     headers=headers,
                     url=url,
                 )
-                return await exchange._execute(driver, operation)
+                return await exchange.execute(driver, operation)
         except _errors.ShotgunFileDownloadError:
             raise
         except (TransportError, _errors.ProtocolError, OSError):
@@ -1668,57 +1714,39 @@ class AsyncShotgun:
         """
         raise _methods.entity_types_alias_error()
 
-    @overload
     async def export_page(
         self,
         page_id: int,
-        page_format: str,
-        /,
+        format: str,  # noqa: A002
         layout_name: str | None = None,
-    ) -> str: ...
-
-    @overload
-    async def export_page(
-        self,
-        page_id: int,
-        **kwargs: Unpack[_methods.ExportPageKeywordArguments],
-    ) -> str: ...
-
-    @_methods.expose_export_page_signature
-    async def export_page(self, *args: object, **kwargs: object) -> str:
+    ) -> str:
         """Export a page using the documented arguments.
 
         The Page or its layout must be marked API Exportable in the web UI, or
         the server rejects the export.
 
         Args:
-            *args: Positional values from the documented `export_page`
-                signature.
-            **kwargs: Keyword values from the documented `export_page`
-                signature.
+            page_id: Numeric page identifier.
+            format: Required nonempty export format name.
+            layout_name: Optional layout name, including an empty name.
 
         Returns:
             Exported page text returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if an argument or the server result has the wrong type.
+                or if `page_id`, `format`, or the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_export_page(args, kwargs, 'AsyncShotgun')
+        options = _methods.ExportPageOptions(page_id, format, layout_name)
         result = await self._call(
             'export_page',
             _methods.build_export_page_params(options),
         )
         return _methods.require_string_result(result, 'export_page')
 
-    @overload
-    async def find(self, entity_type: Never) -> list[dict[str, object]]: ...
-
-    @overload
     async def find(
         self,
         entity_type: str,
@@ -1731,33 +1759,50 @@ class AsyncShotgun:
         page: int = 0,
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
-    ) -> list[dict[str, object]]: ...
-
-    @_crud.expose_find_signature
-    async def find(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+    ) -> list[dict[str, object]]:
         """Find entities matching the supplied filters.
 
         Args:
-            *args: Positional values from the documented `find` signature.
-            **kwargs: Keyword values from the documented `find` signature.
+            entity_type: Entity type to find.
+            filters: Filters in list or dict syntax.
+            fields: Optional fields to return; defaults to `id`.
+            order: Optional field and direction sort specifications.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            limit: Maximum entities to return, or `0` for no limit.
+            retired_only: Return retired entities instead of active entities.
+            page: Specific page to return, or `0` to read all pages.
+            include_archived_projects: Include entities from archived projects.
+            additional_filter_presets: Optional server-side filter presets.
 
         Returns:
             Matching entities in server order.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if filters, paging, ordering, or a server result is invalid.
+                or if filters, fields, paging, ordering, or a server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        return await self._find(_crud.bind_find(args, kwargs, 'AsyncShotgun'))
+        return await self._find(
+            _crud.FindOptions(
+                entity_type,
+                filters,
+                fields,
+                order,
+                filter_operator,
+                limit,
+                retired_only,
+                page,
+                include_archived_projects,
+                additional_filter_presets,
+            )
+        )
 
-    @overload
-    async def find_one(self, entity_type: Never) -> dict[str, object] | None: ...
-
-    @overload
     async def find_one(
         self,
         entity_type: str,
@@ -1768,28 +1813,43 @@ class AsyncShotgun:
         retired_only: bool = False,
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
-    ) -> dict[str, object] | None: ...
-
-    @_crud.expose_find_one_signature
-    async def find_one(self, *args: object, **kwargs: object) -> dict[str, object] | None:
+    ) -> dict[str, object] | None:
         """Return the first entity matching the supplied filters.
 
         Args:
-            *args: Positional values from the documented `find_one` signature.
-            **kwargs: Keyword values from the documented `find_one` signature.
+            entity_type: Entity type to find.
+            filters: Filters in list or dict syntax.
+            fields: Optional fields to return; defaults to `id`.
+            order: Optional field and direction sort specifications.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            retired_only: Return a retired entity instead of an active entity.
+            include_archived_projects: Include entities from archived projects.
+            additional_filter_presets: Optional server-side filter presets.
 
         Returns:
             The first matching entity, or `None` when no entity matches.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if filters, paging, ordering, or a server result is invalid.
+                or if filters, fields, paging, ordering, or a server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        options = _crud.bind_find_one(args, kwargs, 'AsyncShotgun')
+        options = _crud.FindOneOptions(
+            entity_type,
+            filters,
+            fields,
+            order,
+            filter_operator,
+            retired_only,
+            include_archived_projects,
+            additional_filter_presets,
+        )
         return _crud.first_result(await self._find(_crud.find_options_from_one(options)))
 
     async def follow(
@@ -2186,7 +2246,10 @@ class AsyncShotgun:
                 or if the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         params = _methods.build_schema_field_create_params(
             entity_type,
@@ -2274,7 +2337,10 @@ class AsyncShotgun:
                 or if the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         params = _methods.build_schema_field_update_params(
             entity_type,
@@ -2389,30 +2455,26 @@ class AsyncShotgun:
             source_entity,
             filmstrip_thumbnail,
         )
-        if share.thumbnail_path is not None and 'field_name' in kwargs:
-            raise TypeError("AsyncShotgun.upload() got multiple values for argument 'field_name'")
         prepared: _files.PreparedUpload | None = None
         if share.thumbnail_path is not None:
-            arguments = _bind_upload(
-                (
-                    share.source_entity_type,
-                    share.source_entity_id,
-                    share.thumbnail_path,
-                ),
-                {
-                    **kwargs,
-                    'field_name': (
-                        'filmstrip_thumb_image' if filmstrip_thumbnail else 'thumb_image'
-                    ),
-                },
+            for keyword in kwargs:
+                if keyword not in ('display_name', 'tag_list', 'created_at'):
+                    raise TypeError(
+                        'AsyncShotgun.share_thumbnail() got an unexpected keyword '
+                        f"argument '{keyword}'"
+                    )
+            arguments = _files.UploadArguments(
+                entity_type=share.source_entity_type,
+                entity_id=share.source_entity_id,
+                path=share.thumbnail_path,
+                field_name=_files.thumbnail_fields(filmstrip_thumbnail)[0],
+                display_name=cast('str | None', kwargs.get('display_name')),
+                tag_list=cast('str | None', kwargs.get('tag_list')),
+                created_at=cast('_dt_module.datetime | None', kwargs.get('created_at')),
             )
             prepared = await asyncio.to_thread(
                 _files.prepare_upload,
-                _files.UploadOptions(
-                    arguments=arguments,
-                    upload_type='Thumbnail',
-                    filmstrip=filmstrip_thumbnail,
-                ),
+                _files.upload_options(arguments),
             )
         context = config_module.snapshot(self._config)
         require_secure_rpc(context, include_auth=True)
@@ -2427,9 +2489,7 @@ class AsyncShotgun:
                 )
                 if len(share.entities) == 1:
                     return attachment_id
-                field_name: Literal['filmstrip_image', 'image'] = (
-                    'filmstrip_image' if filmstrip_thumbnail else 'image'
-                )
+                field_name = _files.thumbnail_fields(filmstrip_thumbnail)[1]
                 ready = await driver.poll(
                     lambda: self._thumbnail_source_ready(
                         driver,
@@ -2458,10 +2518,6 @@ class AsyncShotgun:
                 filmstrip_thumbnail,
             )
 
-    @overload
-    async def summarize(self, entity_type: Never) -> dict[str, object]: ...
-
-    @overload
     async def summarize(
         self,
         entity_type: str,
@@ -2470,28 +2526,39 @@ class AsyncShotgun:
         filter_operator: str | None = None,
         grouping: list[dict[str, Any]] | None = None,
         include_archived_projects: bool = True,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_summarize_signature
-    async def summarize(self, *args: object, **kwargs: object) -> dict[str, object]:
+    ) -> dict[str, object]:
         """Summarize field data returned by a query.
 
         Args:
-            *args: Positional values from the documented `summarize` signature.
-            **kwargs: Keyword values from the documented `summarize` signature.
+            entity_type: Entity type to summarize.
+            filters: Filters in list or dict syntax.
+            summary_fields: List of `{'field': ..., 'type': ...}` summaries.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            grouping: Optional grouping specs.
+            include_archived_projects: Include archived projects when `True`.
 
         Returns:
-            Dict with `summaries` and optional `groups`.
+            Dict with `summaries` and (when grouped) `groups`.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if arguments or the server result are invalid.
+                or if `filters`, `summary_fields`, or the server result has the
+                wrong type.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        options = _methods.bind_summarize(args, kwargs, 'AsyncShotgun')
+        options = _methods.SummarizeOptions(
+            entity_type,
+            filters,
+            summary_fields,
+            filter_operator,
+            grouping,
+            include_archived_projects,
+        )
         params = _methods.build_summarize_params(options)
         result = await self._call('summarize', params)
         return _crud.require_dictionary_result(result, 'summarize')
@@ -2519,7 +2586,10 @@ class AsyncShotgun:
                 or if arguments or the server result are invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         params = _methods.build_text_search_params(
             text,
@@ -2589,7 +2659,10 @@ class AsyncShotgun:
                 nonempty file. A thumbnail failure occurs after the update.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=True)
         params = _crud.build_update_params(
@@ -2620,7 +2693,8 @@ class AsyncShotgun:
             user: Optional user entity to attribute the access to.
 
         Raises:
-            ShotgunError: If an RPC fault or terminal transport failure occurs.
+            ShotgunError: If a project or user ID is invalid, or an RPC fault
+                or terminal transport failure occurs.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2631,10 +2705,6 @@ class AsyncShotgun:
             _InvocationOptions(logical_method_name='update_project_last_accessed'),
         )
 
-    @overload
-    async def upload(self, entity_type: Never) -> int: ...
-
-    @overload
     async def upload(
         self,
         entity_type: str,
@@ -2644,24 +2714,26 @@ class AsyncShotgun:
         display_name: str | None = None,
         tag_list: str | None = None,
         created_at: _dt_module.datetime | None = None,
-    ) -> int: ...
-
-    @_expose_upload_signature
-    async def upload(self, *args: object, **kwargs: object) -> int:
+    ) -> int:
         """Upload a file or thumbnail and return its Attachment ID.
 
         A server requiring legacy form uploads raises `ShotgunError` before any
         upload request is sent. Server capability reads may occur.
 
         Args:
-            *args: Positional arguments from the documented upload signature.
-            **kwargs: Keyword arguments from the documented upload signature.
+            entity_type: Entity type receiving the upload.
+            entity_id: Numeric identifier of the receiving entity.
+            path: Existing non-empty file path as text or filesystem-encoded
+                bytes.
+            field_name: Optional file field receiving an Attachment.
+            display_name: Optional Attachment display name.
+            tag_list: Optional comma-delimited Attachment tags.
+            created_at: Optional Attachment creation timestamp.
 
         Returns:
             Created Attachment ID.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If the file or an upload response is invalid, an RPC
                 fault or terminal transport failure occurs, or the server
                 requires legacy form uploads.
@@ -2669,23 +2741,10 @@ class AsyncShotgun:
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        arguments = _bind_upload(args, kwargs)
-        thumbnail_fields = {
-            'filmstrip_image',
-            'filmstrip_thumb_image',
-            'image',
-            'thumb_image',
-        }
-        upload_type: Literal['Attachment', 'Thumbnail'] = (
-            'Thumbnail' if arguments.field_name in thumbnail_fields else 'Attachment'
+        arguments = _files.UploadArguments(
+            entity_type, entity_id, path, field_name, display_name, tag_list, created_at
         )
-        return await self._upload(
-            _files.UploadOptions(
-                arguments=arguments,
-                upload_type=upload_type,
-                filmstrip=arguments.field_name in {'filmstrip_image', 'filmstrip_thumb_image'},
-            )
-        )
+        return await self._upload(_files.upload_options(arguments))
 
     async def upload_filmstrip_thumbnail(
         self,
@@ -2845,10 +2904,6 @@ class AsyncShotgun:
         result = await self._call('work_schedule_read', params)
         return _crud.require_dictionary_result(result, 'work_schedule_read')
 
-    @overload
-    async def work_schedule_update(self, date: Never) -> dict[str, object]: ...
-
-    @overload
     async def work_schedule_update(
         self,
         date: _dt_module.date | str,
@@ -2857,35 +2912,47 @@ class AsyncShotgun:
         project: dict[str, Any] | None = None,
         user: dict[str, Any] | None = None,
         recalculate_field: str | None = None,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_work_schedule_update_signature
-    async def work_schedule_update(
-        self,
-        *args: object,
-        **kwargs: object,
     ) -> dict[str, object]:
-        """Update a work schedule using the documented arguments.
+        """Update a work schedule.
 
         Args:
-            *args: Positional values from the documented public signature.
-            **kwargs: Keyword values from the documented public signature.
+            date: Date or exact `YYYY-MM-DD` string to update.
+            working: Whether the date is a working day.
+            description: Optional schedule description.
+            project: Optional project entity restriction.
+            user: Optional user entity restriction.
+            recalculate_field: Optional field to recalculate.
 
         Returns:
             Updated work schedule data returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if arguments or the server result are invalid.
+                or if the date, project/user exclusivity, or server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_work_schedule_update(args, kwargs, 'AsyncShotgun')
+        options = _methods.WorkScheduleUpdateOptions(
+            date, working, description, project, user, recalculate_field
+        )
         params = _methods.build_work_schedule_update_params(options)
         result = await self._call('work_schedule_update', params)
         return _crud.require_dictionary_result(result, 'work_schedule_update')
+
+
+async def _capture_download_cleanup(
+    workers: _AsyncDownloadCancellationScope,
+    function: Callable[_FilesystemParams, _FilesystemResult],
+    *args: _FilesystemParams.args,
+    **kwargs: _FilesystemParams.kwargs,
+) -> BaseException | None:
+    """Run one joined cleanup operation and capture its failure."""
+    capture = _AsyncDownloadCleanupCapture(workers)
+    with capture:
+        await workers.run(function, *args, **kwargs)
+    return capture.exception
 
 
 def _open_download_temporary(destination: Path) -> tuple[ExitStack, BinaryIO, Path]:
@@ -2920,7 +2987,6 @@ async def _execute_upload_exchange(
             headers=dict(exchange.headers),
             body=exchange.body_factory(),
             timeout=context.timeout,
-            token=uuid.uuid4().hex,
         )
 
     async def consume(

@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-import shotgun_api3
 from scripts import run_installed_tests as _runner
+from shotgun_api3._version import COMPATIBILITY_VERSION, PACKAGE_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,7 +25,7 @@ class _DistributionOriginStub:
     def __init__(self, origin: Path) -> None:
         self.files = [
             PackagePath('shotgun_api3/py.typed'),
-            PackagePath('sg_python_api-0.1.2.dist-info/METADATA'),
+            PackagePath('sg_python_api-9.9.9.dist-info/METADATA'),
         ]
         self._origin = origin
 
@@ -40,42 +40,34 @@ class _MainStageRecorder:
         checkout: Path,
         purelib: Path,
     ) -> None:
-        self.arguments = arguments
-        self.checkout = checkout
-        self.distribution = cast('Distribution', _VersionDistributionStub())
+        self._arguments = arguments
+        self._checkout = checkout
         self.events: list[str] = []
-        self.package = ModuleType('shotgun_api3')
-        self.purelib = purelib
+        self._package = ModuleType('shotgun_api3')
+        self._purelib = purelib
 
     def assert_async_import(self, package: ModuleType, purelib: Path) -> None:
-        assert package is self.package
-        assert purelib == self.purelib
+        assert package is self._package
+        assert purelib == self._purelib
         self.events.append('async-import')
 
     def assert_base_import(self, purelib: Path) -> ModuleType:
-        assert purelib == self.purelib
+        assert purelib == self._purelib
         self.events.append('base-import')
-        return self.package
+        return self._package
 
-    def assert_metadata(self, purelib: Path) -> Distribution:
-        assert purelib == self.purelib
+    def assert_metadata(self, purelib: Path) -> None:
+        assert purelib == self._purelib
         self.events.append('metadata')
-        return self.distribution
 
-    def assert_public_imports(
-        self,
-        package: ModuleType,
-        distribution: Distribution,
-        purelib: Path,
-    ) -> None:
-        assert package is self.package
-        assert distribution is self.distribution
-        assert purelib == self.purelib
+    def assert_public_imports(self, package: ModuleType, purelib: Path) -> None:
+        assert package is self._package
+        assert purelib == self._purelib
         self.events.append('public-imports')
 
     def configure_import_path(self, purelib: Path, checkout: Path) -> None:
-        assert purelib == self.purelib
-        assert checkout == self.checkout
+        assert purelib == self._purelib
+        assert checkout == self._checkout
         self.events.append('configure-import-path')
 
     def import_module(self, name: str) -> ModuleType:
@@ -84,7 +76,7 @@ class _MainStageRecorder:
             return ModuleType(name)
         if name == 'shotgun_api3':
             self.events.append('import-package')
-            return self.package
+            return self._package
         raise AssertionError(f'unexpected import: {name}')
 
     def purge_modules(self, root: str) -> None:
@@ -98,21 +90,17 @@ class _MainStageRecorder:
         checkout: Path,
         purelib: Path,
     ) -> None:
-        assert tests == self.arguments.tests
-        assert mode == self.arguments.mode
-        assert checkout == self.checkout
-        assert purelib == self.purelib
+        assert tests == self._arguments.tests
+        assert mode == self._arguments.mode
+        assert checkout == self._checkout
+        assert purelib == self._purelib
         self.events.append('pytest')
 
     def validate_paths(self, arguments: _Arguments, purelib: Path) -> Path:
-        assert arguments == self.arguments
-        assert purelib == self.purelib
+        assert arguments == self._arguments
+        assert purelib == self._purelib
         self.events.append('validate-paths')
-        return self.checkout
-
-
-class _VersionDistributionStub:
-    version = '0.1.2'
+        return self._checkout
 
 
 def _arguments(mode: _Mode, target: Path, tests: Path) -> _Arguments:
@@ -325,10 +313,34 @@ def test_distribution_origin_outside_target_purelib_is_rejected(tmp_path: Path) 
         _runner._assert_distribution_file_origin(distribution, purelib)
 
 
-def test_example_programs_are_checkout_only() -> None:
-    assert _runner._CHECKOUT_TEST_EXCLUSIONS['test_examples.py'] == (
-        'tests checkout-only public example programs'
-    )
+@pytest.mark.parametrize(
+    ('module_name', 'expected'),
+    [
+        ('shotgun_api3', _runner._EXPECTED_PACKAGE_EXPORTS),
+        ('shotgun_api3.shotgun', _runner._EXPECTED_SHOTGUN_EXPORTS),
+        ('shotgun_api3.lib.mockgun', _runner._EXPECTED_MOCKGUN_EXPORTS),
+        ('shotgun_api3.lib.mockgun.mockgun', _runner._EXPECTED_MOCKGUN_EXPORTS),
+    ],
+)
+def test_expected_exports_match_checkout_modules(module_name: str, expected: list[str]) -> None:
+    # The installed-wheel gate runs only at release; catch drift in ordinary checks.
+    exports = importlib.import_module(module_name).__all__
+    assert len(exports) == len(set(exports))
+    assert set(exports) == set(expected)
+
+
+def test_export_validation_accepts_reordering_but_rejects_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType('synthetic_exports')
+    monkeypatch.setattr(module, '__all__', ['beta', 'alpha'], raising=False)
+    monkeypatch.setattr(module, 'alpha', object(), raising=False)
+    monkeypatch.setattr(module, 'beta', object(), raising=False)
+
+    _runner._assert_exports(module, ['alpha', 'beta'])
+    monkeypatch.setattr(module, '__all__', ['beta', 'alpha', 'beta'])
+    with pytest.raises(AssertionError, match='public exports differ'):
+        _runner._assert_exports(module, ['alpha', 'beta'])
 
 
 def test_installed_dependency_contract_accepts_current_public_metadata() -> None:
@@ -347,11 +359,6 @@ def test_installed_dependency_contract_rejects_dev_extra() -> None:
 
     with pytest.raises(AssertionError, match='declared extras differ'):
         _runner._assert_declared_dependencies(metadata)
-
-
-def test_installed_package_exports_match_static_package_surface() -> None:
-    assert 'AsyncShotgun' not in _runner._EXPECTED_PACKAGE_EXPORTS
-    assert shotgun_api3.__all__ == _runner._EXPECTED_PACKAGE_EXPORTS
 
 
 def test_installed_project_url_parser_preserves_labels_and_values() -> None:
@@ -392,9 +399,8 @@ def test_public_import_validation_rejects_missing_typing_marker(
     purelib = tmp_path / 'target-purelib'
     (purelib / 'shotgun_api3').mkdir(parents=True)
     package = ModuleType('shotgun_api3')
-    monkeypatch.setattr(package, '__version__', '0.1.2', raising=False)
+    monkeypatch.setattr(package, '__version__', COMPATIBILITY_VERSION, raising=False)
     imported_module = ModuleType('installed-public-module')
-    distribution = cast('Distribution', _VersionDistributionStub())
 
     def ignore_exports(*_args: object) -> None:
         return None
@@ -406,7 +412,49 @@ def test_public_import_validation_rejects_missing_typing_marker(
     monkeypatch.setattr(importlib, 'import_module', import_public_module)
 
     with pytest.raises(AssertionError, match='installed typing marker is missing'):
-        _runner._assert_public_imports(package, distribution, purelib)
+        _runner._assert_public_imports(package, purelib)
+
+
+def test_public_import_validation_requires_compatibility_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The package version belongs to the distribution metadata, not __version__.
+    package = ModuleType('shotgun_api3')
+    monkeypatch.setattr(package, '__version__', PACKAGE_VERSION, raising=False)
+
+    with pytest.raises(AssertionError, match='import version differs'):
+        _runner._assert_public_imports(package, tmp_path)
+
+
+def test_tests_importing_checkout_scripts_have_whole_file_exclusions() -> None:
+    tests = Path(__file__).parents[1]
+    excluded_files = {node for node in _runner._CHECKOUT_TEST_EXCLUSIONS if '::' not in node}
+    missing: list[str] = []
+    for path in tests.rglob('test_*.py'):
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        imports_scripts = any(
+            (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and (node.module == 'scripts' or node.module.startswith('scripts.'))
+            )
+            or (
+                isinstance(node, ast.Import)
+                and any(
+                    alias.name == 'scripts' or alias.name.startswith('scripts.')
+                    for alias in node.names
+                )
+            )
+            for node in ast.walk(tree)
+        )
+        relative_path = path.relative_to(tests).as_posix()
+        if imports_scripts and relative_path not in excluded_files:
+            missing.append(relative_path)
+
+    assert not missing, (
+        f'tests importing checkout scripts need whole-file exclusions: {sorted(missing)}'
+    )
 
 
 @pytest.mark.parametrize(
@@ -533,7 +581,7 @@ def test_main_validates_isolation_imports_and_mode_before_pytest(
     monkeypatch.setattr(_runner, '_assert_public_imports', recorder.assert_public_imports)
     monkeypatch.setattr(_runner, '_run_pytest', recorder.run_pytest)
 
-    assert _runner.main() == 0
+    assert _runner._main() == 0
     assert recorder.events == expected_events
 
 
@@ -596,12 +644,16 @@ def test_pytest_arguments_preserve_installed_suite_boundary(
         f'--ignore={tests / "test_examples.py"}',
         f'--ignore={tests / "tooling/test_run_conformance.py"}',
         f'--ignore={tests / "tooling/test_run_installed_tests.py"}',
+        f'--ignore={tests / "tooling/test_bootstrap_test_site.py"}',
+        f'--ignore={tests / "tooling/test_live_standin.py"}',
+        f'--ignore={tests / "tooling/test_parity_calendar.py"}',
+        f'--ignore={tests / "tooling/test_sdist_contract.py"}',
         f'--ignore={tests / "tooling/test_validate_artifacts.py"}',
     } <= ignores
     deselections = {argument for argument in arguments if argument.startswith('--deselect=')}
     assert {
         '--deselect=tests/lib/test_mockgun_async.py::test_async_mockgun_finds_is_statically_integer',
-        '--deselect=tests/client/test_crud.py::test_result_annotations_preserve_only_validated_topology',
+        '--deselect=tests/test_signature_parity.py::test_result_annotations_preserve_only_validated_topology',
         '--deselect=tests/files/test_uploads.py::test_thumbnail_forwarding_static_contract',
         '--deselect=tests/test_config.py::test_config_static_surface_rejects_invalid_fields',
         '--deselect=tests/test_datetimes.py::test_transform_annotations_preserve_only_container_topology',
@@ -609,7 +661,45 @@ def test_pytest_arguments_preserve_installed_suite_boundary(
         '--deselect=tests/test_parity.py::test_client_method_static_surface_rejects_invalid_calls',
         '--deselect=tests/test_parity.py::test_crud_static_surface_rejects_invalid_calls',
         '--deselect=tests/test_parity.py::test_supported_query_attachment_and_schedule_types',
+        '--deselect=tests/test_signature_parity.py::test_single_any_argument_call_is_rejected_by_type_checker',
     } <= deselections
     assert arguments[arguments.index('-m') + 1] == expression
     assert ('--require-no-skips' in arguments) is require_no_skips
     assert arguments[-1] == str(tests)
+
+
+@pytest.mark.parametrize('pytest_status', [0, 5])
+def test_run_pytest_propagates_actual_pytest_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pytest_status: int
+) -> None:
+    fake_pytest = ModuleType('pytest')
+    calls: list[list[str]] = []
+
+    def main(arguments: list[str]) -> int:
+        calls.append(arguments)
+        return pytest_status
+
+    monkeypatch.setattr(fake_pytest, 'main', main, raising=False)
+    original_import = importlib.import_module
+
+    def import_module(name: str) -> ModuleType:
+        return fake_pytest if name == 'pytest' else original_import(name)
+
+    def check_origin(_path: Path) -> None:
+        pass
+
+    monkeypatch.setattr(importlib, 'import_module', import_module)
+    monkeypatch.setattr(_runner, '_assert_checkout_absent', check_origin)
+    monkeypatch.setattr(_runner, '_assert_import_origins', check_origin)
+    tests = tmp_path / 'tests'
+    checkout = tmp_path / 'checkout'
+    purelib = tmp_path / 'purelib'
+
+    if pytest_status:
+        with pytest.raises(SystemExit) as captured:
+            _runner._run_pytest(tests, 'base', checkout, purelib)
+        assert captured.value.code == pytest_status
+    else:
+        assert _runner._run_pytest(tests, 'base', checkout, purelib) is None
+    assert len(calls) == 1
+    assert calls[0][-1] == str(tests)

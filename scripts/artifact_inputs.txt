@@ -1,0 +1,7 @@
+:(top,glob)*
+:(top,glob).github/**
+:(top,glob)docs/*.md
+:(top,glob)examples/**
+:(top,glob)scripts/**
+:(top,glob)src/**
+:(top,glob)tests/**

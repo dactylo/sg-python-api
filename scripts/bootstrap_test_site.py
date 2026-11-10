@@ -27,7 +27,7 @@ class _FailureCollector:
 
     def __init__(self, failures: list[BaseException]) -> None:
         """Bind the caller-owned shared cleanup-failure list."""
-        self.failures = failures
+        self._failures = failures
 
     def __enter__(self) -> None:
         """Enter the cleanup-failure capture boundary."""
@@ -42,7 +42,7 @@ class _FailureCollector:
         del exc_type, traceback
         if exc is None:
             return False
-        self.failures.append(exc)
+        self._failures.append(exc)
         return True
 
 
@@ -52,6 +52,10 @@ class _ProjectClient(Protocol):
     def create(self, entity_type: str, data: dict[str, object]) -> object:
         """Create one entity.
 
+        Args:
+            entity_type: Type of entity to create.
+            data: Field names and values for the new entity.
+
         Returns:
             The client-specific creation result.
         """
@@ -59,6 +63,10 @@ class _ProjectClient(Protocol):
 
     def find_one(self, entity_type: str, filters: list[list[object]]) -> object:
         """Find the first matching entity.
+
+        Args:
+            entity_type: Type of entity to query.
+            filters: Query filters expressed as field, relation, and values.
 
         Returns:
             The client-specific first-match result.
@@ -91,16 +99,8 @@ def _load_client_class() -> type['Shotgun']:
     return module.Shotgun
 
 
-def main() -> int:
-    """Create the stable Project fixture and close the client.
-
-    Returns:
-        Zero after the Project exists and the client closes cleanly.
-
-    Raises:
-        KeyError: If required live-site configuration is absent.
-        Exception: If setup or deterministic client closure fails.
-    """
+def _main() -> int:
+    """Create the stable Project fixture and close the client."""
     client_class = _load_client_class()
     client = client_class(
         os.environ['SG_TEST_SITE'],
@@ -125,4 +125,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

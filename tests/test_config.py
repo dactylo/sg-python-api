@@ -26,14 +26,23 @@ from shotgun_api3._config import (
     ResponseEvent,
     RetryEvent,
     _parse_http_proxy,
+    _parse_server_params,
     constructor_http_proxy_fields,
-    parse_server_params,
     readiness_key,
     server_host,
     server_page_limit,
 )
 from shotgun_api3._errors import ShotgunError
+from shotgun_api3._version import PACKAGE_VERSION
+from tests._origin_cases import (
+    ORIGIN_AUTH_VALUE,
+    ORIGIN_CASES,
+    ORIGIN_CREDENTIAL,
+    ORIGIN_PROXY_SERVERS,
+    ORIGIN_SESSION_VALUE,
+)
 from tests._pyright import run_pyright
+from tests._threads import run_concurrently
 
 _AUTH_CREDENTIAL_REPR_VALUE = 'auth-token-epsilon-2236'
 _AUTH_VALUE = 'value'
@@ -43,10 +52,7 @@ _NEW_CREDENTIAL = 'new-password'
 _OLD_AUTH_VALUE = 'old-token'
 _OLD_CREDENTIAL = 'old-password'
 _ONE_USE_VALUE = 'one-use'
-_ORIGIN_AUTH_VALUE = 'old-auth-token'
-_ORIGIN_CREDENTIAL = 'old-password'
 _ORIGIN_PROXY_CREDENTIAL = 'old-proxy-password'
-_ORIGIN_SESSION_VALUE = 'old-session'
 _PROXY_CREDENTIAL_REPR_VALUE = 'proxy-pass?#beta-3141'
 _PROXY_USER_REPR_VALUE = 'proxy user/alpha-2718'
 _PROXY_VALUE = 'p/a?s#s'
@@ -59,7 +65,7 @@ _USER_CREDENTIAL_REPR_VALUE = 'user-password-delta-5772'
 
 class _LockContainingObserver:
     def __init__(self) -> None:
-        self.lock = threading.Lock()
+        self._lock = threading.Lock()
 
     def __call__(self, _event: object) -> None:
         pass
@@ -67,10 +73,10 @@ class _LockContainingObserver:
 
 class _ReentrantAuthMapping(Mapping[str, object]):
     def __init__(self, config: Config) -> None:
-        self.config = config
+        self._config = config
 
     def __getitem__(self, _key: str) -> object:
-        config_module.snapshot(self.config)
+        config_module.snapshot(self._config)
         raise KeyError
 
     def __iter__(self) -> Iterator[str]:
@@ -90,7 +96,7 @@ class _ReentrantDestructorState:
     def __init__(self, config: Config) -> None:
         self.armed = False
         self.calls = 0
-        self.config = config
+        self._config = config
         self.helpers: list[threading.Thread] = []
         self.under_lock = False
 
@@ -101,7 +107,7 @@ class _ReentrantDestructorState:
         completed = threading.Event()
 
         def reenter() -> None:
-            self.config.update_fields(localized=True)
+            self._config.update_fields(localized=True)
             completed.set()
 
         helper = threading.Thread(target=reenter, daemon=True)
@@ -112,9 +118,9 @@ class _ReentrantDestructorState:
 
 
 class _ReentrantDestructorString(str):
-    __slots__ = ('state',)
+    __slots__ = ('_state',)
 
-    state: _ReentrantDestructorState
+    _state: _ReentrantDestructorState
 
     def __new__(
         cls,
@@ -122,30 +128,30 @@ class _ReentrantDestructorString(str):
         state: _ReentrantDestructorState,
     ) -> Self:
         instance = super().__new__(cls, value)
-        instance.state = state
+        instance._state = state
         return instance
 
     def __deepcopy__(self, _memo: dict[int, object]) -> Self:
-        return type(self)(str(self), self.state)
+        return type(self)(str(self), self._state)
 
     def __del__(self) -> None:
-        self.state.record()
+        self._state.record()
 
 
 class _ReentrantDestructorValue:
     def __init__(self, state: _ReentrantDestructorState) -> None:
-        self.state = state
+        self._state = state
 
     def __deepcopy__(self, _memo: dict[int, object]) -> '_ReentrantDestructorValue':
-        return _ReentrantDestructorValue(self.state)
+        return _ReentrantDestructorValue(self._state)
 
     def __del__(self) -> None:
-        self.state.record()
+        self._state.record()
 
 
 class _ReentrantEqualityObserver:
     def __init__(self, config: Config) -> None:
-        self.config = config
+        self._config = config
         self.enabled = False
         self.equality_calls = 0
 
@@ -158,7 +164,7 @@ class _ReentrantEqualityObserver:
     def __eq__(self, _other: object) -> bool:
         if self.enabled:
             self.equality_calls += 1
-            config_module.snapshot(self.config)
+            config_module.snapshot(self._config)
         return self is _other
 
     def __hash__(self) -> int:
@@ -173,25 +179,25 @@ class _ReentrantExtraAuthDict(dict[str, object]):
         state: _ReentrantCopyState | None = None,
     ) -> None:
         super().__init__(values)
-        self.config = config
-        self.state = state or _ReentrantCopyState()
+        self._config = config
+        self._state = state or _ReentrantCopyState()
 
     def __deepcopy__(self, memo: dict[int, object]) -> '_ReentrantExtraAuthDict':
         values = {
             copy.deepcopy(key, memo): copy.deepcopy(value, memo) for key, value in self.items()
         }
-        return _ReentrantExtraAuthDict(self.config, values, self.state)
+        return _ReentrantExtraAuthDict(self._config, values, self._state)
 
     def copy(self) -> dict[str, object]:
-        self.state.calls += 1
+        self._state.calls += 1
         completed = threading.Event()
 
         def reenter() -> None:
-            self.config.update_fields(localized=True)
+            self._config.update_fields(localized=True)
             completed.set()
 
         helper = threading.Thread(target=reenter, daemon=True)
-        self.state.helpers.append(helper)
+        self._state.helpers.append(helper)
         helper.start()
         if not completed.wait(timeout=0.2):
             raise RuntimeError('extra auth copy ran under the config lock')
@@ -200,17 +206,17 @@ class _ReentrantExtraAuthDict(dict[str, object]):
 
     @property
     def copy_calls(self) -> int:
-        return self.state.calls
+        return self._state.calls
 
     @property
     def helpers(self) -> list[threading.Thread]:
-        return self.state.helpers
+        return self._state.helpers
 
 
 class _ReentrantFieldName(str):
-    __slots__ = ('state',)
+    __slots__ = ('_state',)
 
-    state: _ReentrantDestructorState
+    _state: _ReentrantDestructorState
 
     def __new__(
         cls,
@@ -218,23 +224,23 @@ class _ReentrantFieldName(str):
         state: _ReentrantDestructorState,
     ) -> Self:
         instance = super().__new__(cls, value)
-        instance.state = state
+        instance._state = state
         return instance
 
     def __eq__(self, value: object) -> bool:
-        self.state.record()
+        self._state.record()
         result = super().__eq__(value)
         return False if result is NotImplemented else result
 
     def __hash__(self) -> int:
-        self.state.record()
+        self._state.record()
         return super().__hash__()
 
 
 class _ReentrantOriginState:
     def __init__(self, config: Config) -> None:
         self.calls = 0
-        self.config = config
+        self._config = config
         self.helpers: list[threading.Thread] = []
         self.under_lock = False
 
@@ -245,7 +251,7 @@ class _ReentrantOriginState:
         completed = threading.Event()
 
         def reenter() -> None:
-            self.config.update_fields(localized=True)
+            self._config.update_fields(localized=True)
             completed.set()
 
         helper = threading.Thread(target=reenter, daemon=True)
@@ -256,9 +262,9 @@ class _ReentrantOriginState:
 
 
 class _ReentrantOriginString(str):
-    __slots__ = ('state',)
+    __slots__ = ('_state',)
 
-    state: _ReentrantOriginState
+    _state: _ReentrantOriginState
 
     def __new__(
         cls,
@@ -266,28 +272,28 @@ class _ReentrantOriginString(str):
         state: _ReentrantOriginState,
     ) -> Self:
         instance = super().__new__(cls, value)
-        instance.state = state
+        instance._state = state
         return instance
 
     def __deepcopy__(self, _memo: dict[int, object]) -> Self:
-        return type(self)(str.__str__(self), self.state)
+        return type(self)(str.__str__(self), self._state)
 
     def __format__(self, format_spec: str) -> str:
-        self.state.record()
+        self._state.record()
         return str.__format__(str.__str__(self), format_spec)
 
     def lower(self) -> str:
-        self.state.record()
+        self._state.record()
         return str.lower(str.__str__(self))
 
 
 class _ReentrantOriginWrapper:
     def __init__(self, value: str, state: _ReentrantOriginState) -> None:
-        self.state = state
-        self.value = value
+        self._state = state
+        self._value = value
 
     def __deepcopy__(self, _memo: dict[int, object]) -> _ReentrantOriginString:
-        return _ReentrantOriginString(self.value, self.state)
+        return _ReentrantOriginString(self._value, self._state)
 
 
 class _ReentrantUserAgentString(str):
@@ -334,12 +340,12 @@ class _StatefulObserver:
 class _ToggleCopyValue:
     def __init__(self, state: dict[str, bool], label: str) -> None:
         self.label = label
-        self.state = state
+        self._state = state
 
     def __copy__(self) -> '_ToggleCopyValue':
-        if self.state['raise']:
+        if self._state['raise']:
             raise RuntimeError('extra auth copy failed')
-        return _ToggleCopyValue(self.state, self.label)
+        return _ToggleCopyValue(self._state, self.label)
 
     def __deepcopy__(self, _memo: dict[int, object]) -> '_ToggleCopyValue':
         return copy.copy(self)
@@ -392,7 +398,7 @@ def test_canonical_origin_change_clears_all_omitted_origin_authentication() -> N
     config.update_fields(
         api_key='old-key',
         api_path='/api3/json',
-        auth_token=_ORIGIN_AUTH_VALUE,
+        auth_token=ORIGIN_AUTH_VALUE,
         extra_auth_params={'claim': 'old'},
         scheme='https',
         script_name='old-script',
@@ -400,11 +406,11 @@ def test_canonical_origin_change_clears_all_omitted_origin_authentication() -> N
         proxy_pass=_ORIGIN_PROXY_CREDENTIAL,
         proxy_server='proxy.example',
         proxy_user='old-proxy-user',
-        session_token=_ORIGIN_SESSION_VALUE,
+        session_token=ORIGIN_SESSION_VALUE,
         session_uuid='old-uuid',
         sudo_as_login='old-sudo',
         user_login='old-user',
-        user_password=_ORIGIN_CREDENTIAL,
+        user_password=ORIGIN_CREDENTIAL,
     )
     before = config_module.snapshot(config)
 
@@ -425,6 +431,20 @@ def test_canonical_origin_change_clears_all_omitted_origin_authentication() -> N
     assert config.user_password is None
     assert before.auth_generation is not None
     assert after.auth_generation == before.auth_generation + 1
+
+
+def test_compatibility_warning_observer_label_is_unchanged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    event = CompatibilityWarningEvent('legacy-infinite-timeout', 'warning')
+
+    def fail_observer(received: object) -> None:
+        assert received is event
+        raise ValueError('observer failed')
+
+    config_module.notify_observer(fail_observer, event)
+
+    assert caplog.messages == ['observer callback failed for CompatibilityWarningEvent']
 
 
 @pytest.mark.parametrize('field', ['page_prefetch', 'pool_maxsize', 'proxy_port', 'server_info'])
@@ -468,10 +488,32 @@ def test_config_defaults(
     assert config.pool_maxsize == 10
     assert config.records_per_page == 500
     assert config.user_agents == (
-        'shotgun-json (0.1.2)',
+        f'shotgun-json ({PACKAGE_VERSION})',
         f'Python {sys.version_info.major}.{sys.version_info.minor}',
         'sg-python-api',
     )
+
+
+def test_config_field_declarations_agree() -> None:
+    config = Config()
+    public_annotations = set(Config.__annotations__) - vars(config).keys()
+
+    assert public_annotations == config.values.keys() == config_module._PUBLIC_FIELDS
+
+
+def test_config_internal_fields_bypass_field_validation() -> None:
+    config = Config()
+    values = dict(config.values)
+    config.values = values
+
+    assert config.values is values
+    config.max_rpc_attempts = 2
+    assert config.max_rpc_attempts == 2
+    with pytest.raises(ValueError, match='max_rpc_attempts'):
+        config.max_rpc_attempts = -1
+    unknown_name = 'unknown_field'
+    with pytest.raises(AttributeError, match='unknown_field'):
+        setattr(config, unknown_name, 1)
 
 
 def test_config_module_keeps_assignments_in_preamble() -> None:
@@ -514,6 +556,13 @@ print(config.page_preftech)
     assert {item['rule'] for item in errors} == {'reportAttributeAccessIssue'}
 
 
+def test_connection_settings_default_to_sixty_seconds() -> None:
+    config = Config()
+    context = config_module.snapshot(config)
+    assert (config.max_connection_idle_secs, config.tcp_keepalive_timeout_secs) == (60, 60)
+    assert (context.max_connection_idle_secs, context.tcp_keepalive_timeout_secs) == (60.0, 60)
+
+
 def test_constructor_http_proxy_fields_normalizes_str_subclasses() -> None:
     class DeceptiveProxy(str):
         __slots__ = ()
@@ -551,27 +600,6 @@ def test_constructor_http_proxy_fields_rejects_falsy_non_string() -> None:
 
 def test_constructor_http_proxy_fields_returns_no_update_for_none() -> None:
     assert constructor_http_proxy_fields(None) is None
-
-
-@pytest.mark.parametrize(
-    ('field_name', 'value'),
-    [('scheme', 'HTTPS'), ('server', 'X.EXAMPLE:443')],
-)
-def test_copied_origin_strings_are_owned_before_locked_canonicalization(
-    field_name: str,
-    value: str,
-) -> None:
-    config = Config()
-    config.set_server_params('https://x.example')
-    state = _ReentrantOriginState(config)
-
-    config.update_fields(**{field_name: _ReentrantOriginWrapper(value, state)})
-    for helper in state.helpers:
-        helper.join(timeout=1)
-
-    assert state.calls == 0
-    assert state.under_lock is False
-    assert type(getattr(config, field_name)) is str
 
 
 def test_default_timeout_uses_private_typed_singleton() -> None:
@@ -658,29 +686,29 @@ def test_locked_mutators_have_next_snapshot_visibility() -> None:
 
     config.reset_user_agent()
     assert config_module.snapshot(config).user_agent == '; '.join(
-        _protocol.default_user_agent('0.1.2')
+        _protocol.default_user_agent(PACKAGE_VERSION)
     )
 
 
 def test_multi_field_updates_and_snapshots_never_observe_mixed_credentials() -> None:
     config = Config()
     config.update_fields(script_name='old', api_key='old-key')
-    start = threading.Event()
+    barrier = threading.Barrier(2)
     observed: list[tuple[object, object]] = []
 
     def mutate() -> None:
-        start.wait()
+        barrier.wait(timeout=5)
         for _ in range(500):
             config.update_fields(script_name='new', api_key='new-key')
             config.update_fields(script_name='old', api_key='old-key')
 
-    thread = threading.Thread(target=mutate)
-    thread.start()
-    start.set()
-    for _ in range(1000):
-        auth = config_module.snapshot(config).auth
-        observed.append((auth['script_name'], auth['script_key']))
-    thread.join()
+    def observe() -> None:
+        barrier.wait(timeout=5)
+        for _ in range(1000):
+            auth = config_module.snapshot(config).auth
+            observed.append((auth['script_name'], auth['script_key']))
+
+    run_concurrently([mutate, observe])
 
     assert set(observed) <= {('old', 'old-key'), ('new', 'new-key')}
 
@@ -752,7 +780,7 @@ def test_origin_change_keeps_only_atomic_replacement_credentials() -> None:
         scheme='https',
         script_name='old-script',
         server='old.example',
-        session_token=_ORIGIN_SESSION_VALUE,
+        session_token=ORIGIN_SESSION_VALUE,
         session_uuid='old-uuid',
     )
 
@@ -1023,18 +1051,9 @@ def test_secure_rpc_allows_http_with_empty_authentication(proxy_server: str | No
 
 @pytest.mark.parametrize(
     ('base_url', 'rejected'),
-    [
-        ('https://remote.example', False),
-        ('http://localhost', False),
-        ('http://127.0.0.1', False),
-        ('http://[::1]', False),
-        ('http://[::ffff:127.0.0.1]', True),
-        ('http://remote.example', True),
-        ('http://192.0.2.10', True),
-        ('http://[2001:db8::10]', True),
-    ],
+    ORIGIN_CASES,
 )
-@pytest.mark.parametrize('proxy_server', [None, 'proxy.example', 'localhost'])
+@pytest.mark.parametrize('proxy_server', ORIGIN_PROXY_SERVERS)
 def test_secure_rpc_allows_https_and_literal_loopback_only(
     base_url: str,
     rejected: bool,
@@ -1060,15 +1079,21 @@ def test_secure_rpc_allows_https_and_literal_loopback_only(
     ('field_name', 'value'),
     [('scheme', 'HTTPS'), ('server', 'X.EXAMPLE:443')],
 )
+@pytest.mark.parametrize(
+    'wrapper_type',
+    [_ReentrantOriginString, _ReentrantOriginWrapper],
+    ids=['string-subclass', 'deepcopy-wrapper'],
+)
 def test_origin_strings_are_owned_before_locked_canonicalization(
     field_name: str,
     value: str,
+    wrapper_type: type[_ReentrantOriginString] | type[_ReentrantOriginWrapper],
 ) -> None:
     config = Config()
     config.set_server_params('https://x.example')
     state = _ReentrantOriginState(config)
 
-    config.update_fields(**{field_name: _ReentrantOriginString(value, state)})
+    config.update_fields(**{field_name: wrapper_type(value, state)})
     for helper in state.helpers:
         helper.join(timeout=1)
 
@@ -1090,7 +1115,7 @@ def test_parse_server_params_preserves_path_prefix(
     base_url: str,
     expected_path: str,
 ) -> None:
-    scheme, server, api_path = parse_server_params(base_url)
+    scheme, server, api_path = _parse_server_params(base_url)
     assert scheme == 'https'
     assert server == 'studio.example'
     assert api_path == expected_path
@@ -1422,6 +1447,120 @@ def test_timeout_assignment_rejects_wrong_types(value: object) -> None:
     assert config_module.snapshot(config) == before
 
 
+@pytest.mark.parametrize('value', ['3s', '-1', '', '1.5'])
+def test_configuration_errors_name_the_variable(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv('SHOTGUN_API_RETRY_INTERVAL', value)
+    with pytest.raises(
+        ValueError,
+        match='SHOTGUN_API_RETRY_INTERVAL must be a nonnegative integer of milliseconds',
+    ):
+        Config()
+
+
+@pytest.mark.parametrize(
+    ('value', 'effective'), [(30, 30.0), (0.5, 0.5), (10**300, 1e300), (0, None), (None, None)]
+)
+def test_idle_limit_accepts_numbers_and_turns_off_with_none_or_zero(
+    value: float | None, effective: float | None
+) -> None:
+    config = Config()
+    config.max_connection_idle_secs = value
+    assert config.max_connection_idle_secs == value
+    assert config_module.snapshot(config).max_connection_idle_secs == effective
+
+
+@pytest.mark.parametrize(
+    ('value', 'error'),
+    [
+        (True, TypeError),
+        ('60', TypeError),
+        (-1, ValueError),
+        (-0.5, ValueError),
+        (float('nan'), ValueError),
+        (float('inf'), ValueError),
+        (10**400, ValueError),
+    ],
+)
+@pytest.mark.parametrize('mixed_update', [False, True])
+def test_idle_limit_rejection_changes_nothing(
+    value: object, error: type[Exception], *, mixed_update: bool
+) -> None:
+    config = Config()
+    before = config_module.snapshot(config)
+    generation = config.transport_generation
+    if mixed_update:
+        with pytest.raises(error, match='max_connection_idle_secs'):
+            config.update_fields(pool_maxsize=99, max_connection_idle_secs=value)
+    else:
+        name = 'max_connection_idle_secs'
+        with pytest.raises(error, match=name):
+            setattr(config, name, value)
+    assert config_module.snapshot(config) == before
+    assert config.transport_generation == generation
+
+
+@pytest.mark.parametrize(
+    ('value', 'effective'), [(6, 6), (60, 60), (3600, 3600), (0, None), (None, None)]
+)
+def test_keepalive_target_accepts_whole_seconds_and_turns_off_with_none_or_zero(
+    value: int | None, effective: int | None
+) -> None:
+    config = Config()
+    config.tcp_keepalive_timeout_secs = value
+    assert config.tcp_keepalive_timeout_secs == value
+    assert config_module.snapshot(config).tcp_keepalive_timeout_secs == effective
+
+
+@pytest.mark.parametrize(
+    ('value', 'error'),
+    [
+        (True, TypeError),
+        (60.0, TypeError),
+        ('60', TypeError),
+        (-1, ValueError),
+        (1, ValueError),
+        (5, ValueError),
+        (3601, ValueError),
+    ],
+)
+@pytest.mark.parametrize('mixed_update', [False, True])
+def test_keepalive_target_rejection_changes_nothing(
+    value: object, error: type[Exception], *, mixed_update: bool
+) -> None:
+    config = Config()
+    before = config_module.snapshot(config)
+    generation = config.transport_generation
+    if mixed_update:
+        with pytest.raises(error, match='tcp_keepalive_timeout_secs'):
+            config.update_fields(pool_maxsize=99, tcp_keepalive_timeout_secs=value)
+    else:
+        name = 'tcp_keepalive_timeout_secs'
+        with pytest.raises(error, match=name):
+            setattr(config, name, value)
+    assert config_module.snapshot(config) == before
+    assert config.transport_generation == generation
+
+
+@pytest.mark.parametrize('name', ['max_connection_idle_secs', 'tcp_keepalive_timeout_secs'])
+def test_connection_settings_start_a_new_transport_generation(name: str) -> None:
+    config = Config()
+    before = config_module.snapshot(config)
+    setattr(config, name, 30)
+    after = config_module.snapshot(config)
+    assert after.transport_generation == before.transport_generation + 1
+    assert after.origin_generation == before.origin_generation
+    assert after.auth_generation == before.auth_generation
+
+
+def test_timeout_error_names_only_public_values() -> None:
+    config = Config()
+    with pytest.raises(TypeError, match='timeout_secs must be a number or None') as caught:
+        config.update_fields(timeout_secs='invalid')
+    assert 'UNSET' not in str(caught.value)
+
+
 def test_timeout_semantics_and_retry_interval_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1448,7 +1587,10 @@ def test_timeout_semantics_and_retry_interval_environment(
     monkeypatch.setenv('SHOTGUN_API_RETRY_INTERVAL', '1500')
     assert Config().rpc_attempt_interval == 1500
     monkeypatch.setenv('SHOTGUN_API_RETRY_INTERVAL', '-1')
-    with pytest.raises(ValueError, match='rpc_attempt_interval'):
+    with pytest.raises(
+        ValueError,
+        match='SHOTGUN_API_RETRY_INTERVAL must be a nonnegative integer of milliseconds',
+    ):
         Config()
 
 

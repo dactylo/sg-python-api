@@ -1,3 +1,8 @@
-"""Package version shared by public exports and compatibility metadata."""
+"""Compatibility target reported by `__version__` and the package release version."""
 
-PACKAGE_VERSION = '0.1.2'
+from importlib.metadata import distributions
+
+COMPATIBILITY_VERSION = '3.10.5'
+PACKAGE_VERSION = next(
+    (distribution.version for distribution in distributions(name='sg-python-api')), '0+unknown'
+)

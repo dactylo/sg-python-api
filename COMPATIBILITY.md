@@ -11,20 +11,15 @@ start with the [migration guide](docs/migration-guide.md); for a first request, 
 | Review the differences that affect applications    | [What changes for your application](#what-changes-for-your-application)                             |
 | Tune pooling or page prefetch, or observe requests | [Configuration and observer extensions](#configuration-and-observer-extensions)                     |
 | Use the async client or async `mockgun`            | [Async extension surfaces](#async-extension-surfaces)                                               |
+| Test application code without a site               | [mockgun test double](#mockgun-test-double)                                                         |
 | Check which configuration names are supported      | [Supported configuration and capability surfaces](#supported-configuration-and-capability-surfaces) |
 | Check when plain HTTP is allowed                   | [Authenticated transport security](#authenticated-transport-security)                               |
 | Point an existing client at a different site       | [Server floor and readiness](#server-floor-and-readiness)                                           |
 
-Two terms recur on this page. A site's *origin* is its scheme, normalized hostname, and effective
-port, where the effective port is the URL's explicit port or else 443 for HTTPS and 80 for HTTP.
-The URL path is not part of the origin. Before the first operation against an origin, the client
-reads that server's information and checks its version and page limit; this page calls that step
-the *readiness check*.
-
 ## Supported scope
 
 The package provides the `shotgun_api3` import name and targets the documented synchronous API of
-Autodesk's Python client `3.10.3`, including its method signatures, return shapes, errors, filters,
+Autodesk's Python client `3.10.5`, including its method signatures, return shapes, errors, filters,
 paging, schema, file, activity, navigation, and scheduling operations. It also provides the
 `shotgun_api3.lib.mockgun` and `shotgun_api3.lib.sgtimezone` modules and native async extensions.
 
@@ -43,22 +38,37 @@ differences are grouped below so you can check only the areas your application u
 
 ### Timeouts and retries
 
-Requests have a 15-second connect timeout and a 300-second read timeout by default. Finite waits
-let an application recover when a dependency stops responding. To change both limits, assign
-`sg.config.timeout_secs` a finite positive number of seconds no larger than the platform's
-`threading.TIMEOUT_MAX`. Assigning a Boolean, zero, a negative or non-finite number, or a value
-above that limit raises an error immediately. Set it to `None` only when the application
-deliberately accepts an unlimited wait.
+Requests have a 15-second connect timeout and a 300-second read timeout by default. Use these
+`sg.config` settings to adjust waits and retries:
+
+| Setting                    | Default                                    | Meaning                                                                                                                                                                                           |
+| -------------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout_secs`             | 15 seconds to connect; 300 seconds to read | Assign one finite positive number to set both limits, or `None` for unlimited waits.                                                                                                              |
+| `max_connection_idle_secs` | `60`                                       | Both clients replace a pooled connection idle past this many seconds. Accepts a non-negative `int` or `float` (excluding `bool`) convertible to a finite `float`; `None` or `0` turns expiry off. |
+| `max_rpc_attempts`         | `3`                                        | Maximum number of attempts.                                                                                                                                                                       |
+| `rpc_attempt_interval`     | `3000`                                     | Base retry delay in milliseconds. `SHOTGUN_API_RETRY_INTERVAL` overrides the default when the client is created.                                                                                  |
+
+An explicit `timeout_secs` must not exceed the platform's `threading.TIMEOUT_MAX`. A Boolean, zero,
+negative or non-finite number, or a value above that limit raises an error immediately. Use `None`
+only when your application deliberately accepts an unlimited wait.
+
+Idle expiry helps after a connection has been idle past `max_connection_idle_secs`. It cannot
+prevent a wait when the connection is dropped sooner or during a request. The synchronous client
+records its idle timestamp when the response becomes available: after the body is preloaded for a
+buffered response, or after headers arrive for a streamed response. Time spent reading a streamed
+body may cause the connection to be replaced early on later reuse. Autodesk's client starts
+counting after the request completes.
+
+The limits apply to each connection attempt and to each wait for data, not to a whole call, so a
+server that keeps sending slowly can hold a sync call longer than either limit. To cancel an async
+call after a chosen time, use `asyncio.timeout()`; cleanup, such as finishing a local file write,
+can delay the return.
 
 Retries use one policy for every operation, with backoff and jitter. Reads can retry. A write that
 is unsafe to replay retries only when a failure occurs before the request is sent. Once sent, its
 result may be ambiguous, so the client does not repeat it automatically. HTTP status retries,
 including those directed by `Retry-After`, require an operation that is safe to replay. There is no
 exact legacy retry mode.
-
-Tune the number of attempts with `sg.config.max_rpc_attempts` (default `3`). Tune the base delay
-with `sg.config.rpc_attempt_interval`, in milliseconds; its default is `3000`, or the value of the
-`SHOTGUN_API_RETRY_INTERVAL` environment variable when the client is created.
 
 When a retryable response carries a valid `Retry-After` header of 0 to 30 seconds, the client waits
 that long before the next attempt. A larger valid value stops retrying and raises the current
@@ -114,9 +124,9 @@ operation repeats the check; the client never pages with an invalid size.
 | Multi-target thumbnail sharing | The client waits for source readiness before sharing and does not upload the source again.                                                                                                                                                                        |
 | Legacy form uploads            | Servers requiring legacy form uploads are unsupported. The client raises `ShotgunError` before any upload request; capability reads may occur. Hosted direct and multipart routes are supported.                                                                  |
 | Datetime-shaped strings        | Invalid values remain unchanged strings. On platforms without pre-1970 time conversion, valid pre-epoch values use the process standard offset without historical daylight-saving accuracy.                                                                       |
-| Request diagnostics            | Structured observers omit credentials and bodies. Application `httpx2` INFO logging can include signed URLs; set that logger to WARNING.                                                                                                                          |
+| Request diagnostics            | Use [observers](#observers) for metadata without credentials or bodies. Set application `httpx2` logging to WARNING to avoid logging signed URLs.                                                                                                                 |
 | User agent                     | The default includes an `sg-python-api` marker. `add_user_agent()` preserves it, `reset_user_agent()` restores the default, and assigning `sg.config.user_agents` replaces every entry.                                                                           |
-| `shotgun_api3.__version__`     | Reports the installed sg-python-api version, rather than Autodesk's compatibility-target version.                                                                                                                                                                 |
+| `shotgun_api3.__version__`     | Reports `3.10.5`, the Autodesk client version whose API this release matches. `importlib.metadata.version('sg-python-api')` returns the installed sg-python-api version.                                                                                          |
 
 ### Unsupported legacy surfaces
 
@@ -133,13 +143,40 @@ servers older than 3.3.0 is not provided.
 These settings have no counterpart in Autodesk's client. Set them on `sg.config` like any other
 configuration attribute.
 
+### `page_prefetch`
+
 `page_prefetch` controls bounded lookahead for paged `find()` requests. Its default, `0`, keeps
 page fetching serial. A positive value N permits N concurrent page requests, with at most N-1 later
 pages fetched ahead while results remain ordered; a value of 1 therefore fetches nothing ahead.
 
+### `pool_maxsize`
+
 `pool_maxsize` defaults to `10`. For the synchronous client, it sets how many connections the pool
 keeps open per origin; concurrent demand can still open additional connections. For the
 asynchronous client, it caps both simultaneous and retained keep-alive connections.
+
+### `tcp_keepalive_timeout_secs`
+
+`tcp_keepalive_timeout_secs` controls TCP keepalive on connections opened by either client. Its
+default is `60` seconds, matching Autodesk's keepalive tuning. Set it to an `int` from 6 to 3600
+seconds (excluding `bool`); `None` or `0` turns keepalive off. It is independent of
+`max_connection_idle_secs` and `timeout_secs`: turning idle expiry off does not turn keepalive off.
+
+The value is a nominal target, not a deadline. When the platform accepts the tuning, the operating
+system starts probing a connection with nothing outstanding after about half the configured time
+without hearing from its peer. If the probes remain unanswered, it declares the connection dead
+about the configured time after it last heard from the peer. A waiting call can then fail before a
+longer read timeout, and a pooled connection already declared dead is discarded before reuse. A
+shorter read timeout can end the call first. There is no deadline measured from the start of an
+outage: one that ends between probes may pass unnoticed, and a connection reused before failure is
+observable can still wait for its read timeout.
+
+This can end a call during an outage that lasts through the unanswered probes, even if the path
+would recover before the read timeout; a sent write then fails as possibly applied. If an
+application stops responding while its TCP stack still answers probes, keepalive cannot detect the
+stall; a call waiting for data can still wait for its read timeout. Through a proxy, keepalive
+covers the connection to the proxy, not the server beyond it. If a platform refuses some keepalive
+options, its own defaults apply to those options, so the configured target is not guaranteed.
 
 ### Observers
 
@@ -203,9 +240,9 @@ otherwise, call `await sg.close()`. Closing drains in-flight work and releases t
 transport, including page requests already reserved by an in-flight `find()`. Once closing begins,
 the closing transport rejects unrelated new work, and a later operation reconnects lazily.
 
-The async client has no `abort()` method; cancel an operation by cancelling its task. Cancellation
-is not retried. A cancelled write may already have reached the server, so check its outcome before
-repeating it.
+Neither client has an `abort()` method. Cancel an async operation by cancelling its task; a sync
+call ends when it completes, fails, or times out. Cancellation is not retried. A cancelled write
+may already have reached the server, so check its outcome before repeating it.
 
 `AsyncShotgun` validates constructor arguments synchronously but defers network work. The readiness
 check and any one-use `auth_token` exchange run at the first of these points: entering an
@@ -215,15 +252,15 @@ starting an operation that needs readiness. Until then, `server_caps` and `serve
 
 ### `shotgun_api3.lib.mockgun.AsyncShotgun`
 
-`mockgun.AsyncShotgun` delegates awaitable methods to the in-memory `mockgun.Shotgun`
-implementation and works without the `async` extra. Use it to exercise async application code
-without making network requests. Configure schema files before construction with
+`mockgun.AsyncShotgun` runs the real `AsyncShotgun` against the same kind of in-memory site as
+`mockgun.Shotgun`. It works without the `async` extra, and its requests never leave the process.
+Configure schema files before construction with
 `await mockgun.AsyncShotgun.set_schema_paths(field_path, entity_path)`; retrieving them with
-`get_schema_paths()` also requires `await`.
+`get_schema_paths()` also requires `await`. Its `new_client()` method is synchronous and returns
+another async client on the same site.
 
 Both async extension surfaces inherit the semantics of their synchronous counterparts.
-Transport-specific differences apply to `AsyncShotgun`; `mockgun.AsyncShotgun` works in memory and
-has no HTTP transport behavior.
+Transport-specific differences apply to `AsyncShotgun`.
 
 ## Supported configuration and capability surfaces
 
@@ -237,10 +274,11 @@ Applications may use these configuration and capability surfaces from Autodesk's
   `ssl_version`.
 - Module-level `LOG`, `SG_TIMEZONE`, `SgTimezone`, and `SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION`.
 
-The following opt-in extensions have no official counterpart:
+The following extensions have no official counterpart:
 
 - `sg.config.page_prefetch`.
 - `sg.config.pool_maxsize`.
+- [`sg.config.tcp_keepalive_timeout_secs`](#tcp_keepalive_timeout_secs).
 - `sg.config.on_compatibility_warning`.
 - `sg.config.on_progress`.
 - `sg.config.on_request`.
@@ -249,6 +287,36 @@ The following opt-in extensions have no official counterpart:
 - `sg.config.update_fields()`.
 - `shotgun_api3.AsyncShotgun`.
 - `shotgun_api3.lib.mockgun.AsyncShotgun`.
+- `new_client()` and `site` on `shotgun_api3.lib.mockgun.Shotgun` and `AsyncShotgun`.
+- `shotgun_api3.lib.mockgun.Site`.
+
+## mockgun test double
+
+`shotgun_api3.lib.mockgun.Shotgun` runs the real client against an in-memory site, so
+`isinstance(client, shotgun_api3.Shotgun)` holds. The async test client uses the same model. Each
+directly constructed client gets its own site; `new_client()` shares that site. Use `site` to
+control test data and server settings. See
+[testing application code](docs/testing.md#test-application-code-with-mockgun) for setup and
+examples, and the [migration guide](docs/migration-guide.md) when replacing an existing client.
+
+Mockgun returns results for the operations and inputs it supports. Inputs known to be invalid raise
+`Fault`; when the site cannot settle an answer, it raises `MockgunError`, which is outside the
+`ShotgunError` family. A passing mockgun test does not guarantee the same result from a real site.
+Match `Fault` by class unless its code or message is part of the contract you need to test. See
+[handling unsupported answers](docs/testing.md#handle-unsupported-answers) for recovery.
+
+The site emulates records and writes, server-maintained fields where declared in the schema, the
+event log, queries, summaries and text search, schema reads and writes, files and thumbnails, Note
+threads, activity streams, follows, preferences, work schedules, subscriptions, Project last
+access, sessions, and canned navigation and export responses.
+
+It does not model permissions or per-user visibility, Project-level entity visibility, server
+events beyond the event log such as webhooks, thumbnail states other than ready, or `summarize()`
+presets. It accepts any script key, and a client constructed without credentials acts as the script
+`mockgun`; a `sudo_as_login` naming no existing `HumanUser` creates one. The
+`shotgun_api3.lib.mockgun.mockgun` module exports the same names as `shotgun_api3.lib.mockgun`. Its
+IDs, URLs and times differ from a real site, and URLs fetched outside the client are not served.
+Assert relationships among values instead of literal IDs, URLs or times.
 
 ## Authenticated transport security
 
@@ -269,6 +337,10 @@ Credential-free downloads from external attachment URLs may still use HTTP. A UR
 port from the configured origin counts as external and receives no site session cookie.
 
 ## Server floor and readiness
+
+A site's *origin* is its scheme, normalized hostname, and effective port: the explicit port, or 443
+for HTTPS and 80 for HTTP. The URL path is not part of the origin. The *readiness check* reads the
+server's information and checks its version and page limit.
 
 The supported server floor is version 7.10.0. The readiness check belongs to one exact origin, not
 to the client as a whole: the client rejects a server below the floor before the first operation

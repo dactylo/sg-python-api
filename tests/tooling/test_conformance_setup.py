@@ -37,37 +37,121 @@ _API_SOURCE = (
     '        self.assertEqual(created, label)\n'
     '        self.assertEqual(label, self.expected_label)\n'
 )
+_MOCKGUN_EXCLUSIONS = {
+    key: reason
+    for reason, keys in (
+        (
+            'mockgun login actor adds a visible HumanUser to this fixture',
+            (
+                'TestTextFieldOperators.test_operator_contains',
+                'TestTextFieldOperators.test_operator_contains_case_sensitivity',
+                'TestTextFieldOperators.test_operator_ends_with',
+                'TestTextFieldOperators.test_operator_ends_with_case_sensitivity',
+                'TestTextFieldOperators.test_operator_in',
+                'TestTextFieldOperators.test_operator_in_case_sensitivity',
+                'TestTextFieldOperators.test_operator_is',
+                'TestTextFieldOperators.test_operator_is_case_sensitivity',
+                'TestTextFieldOperators.test_operator_is_not_none',
+                'TestTextFieldOperators.test_operator_not_in',
+                'TestTextFieldOperators.test_operator_starts_with',
+                'TestTextFieldOperators.test_operator_starts_with_case_sensitivity',
+            ),
+        ),
+        (
+            'mockgun null membership is rejected; use is None',
+            (
+                'TestTextFieldOperators.test_operator_in_none',
+                'TestTextFieldOperators.test_operator_not_in_none',
+            ),
+        ),
+        (
+            'mockgun link results include display names',
+            (
+                'TestMultiEntityFieldUpdate.test_batch_update',
+                'TestMultiEntityFieldUpdate.test_update_add',
+                'TestMultiEntityFieldUpdate.test_update_remove',
+                'TestMultiEntityFieldUpdate.test_update_set',
+            ),
+        ),
+        (
+            'mockgun preserves Fault class, not exact legacy message text',
+            (
+                'TestValidateFilterSyntax.test_filter_array_or_dict',
+                'TestFilterOperator.test_invalid_operator',
+            ),
+        ),
+        (
+            'mockgun null values sort last in both directions',
+            ('TestFilterOperator.test_ordered_filter_operator',),
+        ),
+        (
+            'mockgun requires a modeled HumanUser display name in linked results',
+            (
+                'TestMultiEntityFieldComparison.test_find_by_sub_entity_field',
+                'TestMultiEntityFieldComparison.test_find_with_none',
+            ),
+        ),
+    )
+    for key in keys
+}
 
 
 class _ContractClient:
     def __init__(self, defect: str) -> None:
-        self.defect = defect
+        self._defect = defect
         self.calls: list[str] = []
 
     def export_page(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
         self.calls.append('export_page')
-        if self.defect == 'missing_error':
+        if self._defect == 'missing_error':
             return
-        if self.defect == 'wrong_error':
+        if self._defect == 'wrong_error':
             raise ValueError('invalid export')
         raise ShotgunError('candidate-specific validation text')
 
 
-class _ContractCase(unittest.TestCase):
-    sg: _ContractClient
-
-
 class _UserClient:
     def __init__(self, users: list[dict[str, object]]) -> None:
-        self.users = users
+        self._users = users
         self.calls: list[tuple[str, list[list[object]], list[str]]] = []
 
     def find(
         self, entity_type: str, filters: list[list[object]], fields: list[str]
     ) -> list[dict[str, object]]:
         self.calls.append((entity_type, filters, fields))
-        return self.users
+        return self._users
+
+
+def _mockgun_source(missing: str | None = None) -> str:
+    methods: dict[str, list[str]] = {}
+    for key in _MOCKGUN_EXCLUSIONS:
+        if key != missing:
+            class_name, method_name = key.split('.')
+            methods.setdefault(class_name, []).append(method_name)
+    methods['TestTextFieldOperators'].append('test_retained')
+    lines = ['import unittest']
+    for class_name, names in methods.items():
+        lines.extend(
+            (
+                f'class {class_name}(unittest.TestCase):',
+                '    def setUp(self):',
+                "        if self._testMethodName != 'test_retained':",
+                "            raise AssertionError('excluded setup ran')",
+            )
+        )
+        for name in names:
+            body = (
+                "self.assertEqual(self._testMethodName, 'test_retained')"
+                if name == 'test_retained'
+                else "raise AssertionError('excluded body ran')"
+            )
+            lines.extend((f'    def {name}(self):', f'        {body}'))
+    return '\n'.join(lines) + '\n'
+
+
+class _ContractCase(unittest.TestCase):
+    sg: _ContractClient
 
 
 def test_configuration_uses_existing_user_and_preserves_literal_secrets(tmp_path: Path) -> None:
@@ -157,6 +241,59 @@ def test_missing_or_ambiguous_user_fails_without_creating_config(
         setup._configure_user(client, path, {'SG_TEST_HUMAN_LOGIN': 'private@example.invalid'})
 
     assert not path.exists()
+
+
+def test_mockgun_exclusions_match_exact_documented_differences() -> None:
+    assert setup._EXCLUSIONS.get('test_mockgun.py') == _MOCKGUN_EXCLUSIONS
+    assert 'test_mockgun.py' in setup._ADAPTED_MODULES
+
+
+def test_mockgun_preparation_rejects_stale_exclusion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mockgun = tmp_path / 'test_mockgun.py'
+    mockgun.write_text(_mockgun_source('TestTextFieldOperators.test_operator_contains'))
+    monkeypatch.setattr(
+        setup,
+        '_UPSTREAM_HASHES',
+        {'test_mockgun.py': hashlib.sha256(mockgun.read_bytes()).hexdigest()},
+    )
+
+    with pytest.raises(RuntimeError, match='exclusion'):
+        setup._prepare_sources(tmp_path)
+
+
+def test_mockgun_preparation_skips_only_named_methods_before_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mockgun = tmp_path / 'test_mockgun.py'
+    mockgun.write_text(_mockgun_source())
+    monkeypatch.setattr(
+        setup,
+        '_UPSTREAM_HASHES',
+        {'test_mockgun.py': hashlib.sha256(mockgun.read_bytes()).hexdigest()},
+    )
+
+    setup._prepare_sources(tmp_path)
+
+    namespace = runpy.run_path(str(mockgun))
+    for key, reason in _MOCKGUN_EXCLUSIONS.items():
+        class_name, method_name = key.split('.')
+        case_type = cast('type[unittest.TestCase]', namespace[class_name])
+        result = unittest.TestResult()
+        case_type(method_name).run(result)
+        assert result.testsRun == 1
+        assert len(result.skipped) == 1
+        assert result.skipped[0][0]._testMethodName == method_name
+        assert result.skipped[0][1] == reason
+        assert not result.errors
+        assert not result.failures
+    retained = cast('type[unittest.TestCase]', namespace['TestTextFieldOperators'])
+    result = unittest.TestResult()
+    retained('test_retained').run(result)
+    assert result.testsRun == 1
+    assert result.wasSuccessful()
+    assert not result.skipped
 
 
 def test_preparation_installs_restoration_and_contract_adaptations(
@@ -346,3 +483,23 @@ def test_unknown_import_remains_a_collection_error(tmp_path: Path) -> None:
     path.write_text(ast.unparse(tree))
     with pytest.raises(ModuleNotFoundError):
         runpy.run_path(str(path))
+
+
+def test_unpinned_upstream_module_fails_before_rewriting_any_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pinned = tmp_path / 'test_pinned.py'
+    pinned.write_bytes(b'import os\n')
+    unpinned = tmp_path / 'test_unpinned.py'
+    unpinned.write_bytes(b'import sys\n')
+    monkeypatch.setattr(
+        setup,
+        '_UPSTREAM_HASHES',
+        {'test_pinned.py': hashlib.sha256(pinned.read_bytes()).hexdigest()},
+    )
+
+    with pytest.raises(RuntimeError, match='Unpinned upstream conformance module'):
+        setup._prepare_sources(tmp_path)
+
+    assert pinned.read_bytes() == b'import os\n'
+    assert unpinned.read_bytes() == b'import sys\n'

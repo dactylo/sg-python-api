@@ -1,4 +1,3 @@
-import ast
 import asyncio
 import dataclasses
 import gc
@@ -13,7 +12,7 @@ from typing import cast, get_type_hints
 import httpx2
 import pytest
 
-from shotgun_api3 import _files, _protocol
+from shotgun_api3 import _async_httpx2, _files, _protocol
 from shotgun_api3._async_httpx2 import Httpx2Transport, _ThreadedBody
 from shotgun_api3._async_transport import AsyncStreamingResponse
 from shotgun_api3._transport import (
@@ -31,11 +30,6 @@ from tests._loopback import receive_request
 
 pytestmark = pytest.mark.async_required
 
-_FILE_BATCH_SIZE = 1024 * 1024
-_FILE_FINAL_BATCH_SIZE = 77_057
-_FILE_TRANSFER_SIZE = 20_000_001
-_REQUEST_ID = 'request-1'
-
 
 class _BlockingBody(Iterator[bytes]):
     def __init__(self, close_error: Exception | None = None) -> None:
@@ -44,19 +38,19 @@ class _BlockingBody(Iterator[bytes]):
         self.close_raced = False
         self.closed = threading.Event()
         self.closed_on: int | None = None
-        self.finished = threading.Event()
+        self._finished = threading.Event()
         self.release = threading.Event()
         self.started = threading.Event()
 
     def __next__(self) -> bytes:
         self.started.set()
         self.release.wait(timeout=5.0)
-        self.finished.set()
+        self._finished.set()
         return b'BODY'
 
     def close(self) -> None:
         self.close_calls += 1
-        self.close_raced = not self.finished.is_set()
+        self.close_raced = not self._finished.is_set()
         self.closed_on = threading.get_ident()
         self.closed.set()
         if self._close_error is not None:
@@ -97,12 +91,13 @@ class _ControlledClient:
         self.close_calls = 0
         self.close_error: BaseException | None = None
         self.headers: Mapping[str, str] | None = None
+        self.extensions: Mapping[str, object] | None = None
         self.method: str | None = None
         self.request_body: bytes | None = None
         self.request_error: BaseException | None = None
         self.request_gate: asyncio.Event | None = None
         self.request_started = asyncio.Event()
-        self.response = response or httpx2.Response(
+        self._response = response or httpx2.Response(
             200,
             headers={'X-Response': 'value'},
             content=b'RESPONSE',
@@ -130,10 +125,12 @@ class _ControlledClient:
         content: bytes | AsyncIterator[bytes] | None,
         headers: Mapping[str, str],
         timeout: httpx2.Timeout,
+        **options: object,
     ) -> httpx2.Request:
         self.headers = headers
         self.method = method
         self.stream_timeout = timeout
+        self.extensions = cast('Mapping[str, object] | None', options.get('extensions'))
         self.url = url
         return httpx2.Request(method, url, headers=headers, content=content)
 
@@ -150,6 +147,7 @@ class _ControlledClient:
         self.method = method
         self.request_started.set()
         self.timeout = cast('httpx2.Timeout', options['timeout'])
+        self.extensions = cast('Mapping[str, object] | None', options.get('extensions'))
         self.url = url
         if self.request_gate is not None:
             await self.request_gate.wait()
@@ -162,7 +160,7 @@ class _ControlledClient:
         else:
             chunks = cast('AsyncIterator[bytes]', content)
             self.request_body = b''.join([chunk async for chunk in chunks])
-        return self.response
+        return self._response
 
     async def send(self, request: httpx2.Request, *, stream: bool) -> httpx2.Response:
         assert stream
@@ -185,25 +183,25 @@ class _ControlledStream(httpx2.AsyncByteStream):
         gate: asyncio.Event | None = None,
     ) -> None:
         self.close_calls = 0
-        self.close_error = close_error
-        self.close_gate = close_gate
+        self._close_error = close_error
+        self._close_gate = close_gate
         self.close_finished = asyncio.Event()
         self.close_started = asyncio.Event()
         self.events: list[str] | None = None
-        self.gate = gate
+        self._gate = gate
         self.pull_cancel_gate: asyncio.Event | None = None
         self.pull_cancelled = asyncio.Event()
         self.pull_finished = asyncio.Event()
         self.read_started = asyncio.Event()
-        self.script = script
+        self._script = script
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         try:
-            for item in self.script:
+            for item in self._script:
                 self.read_started.set()
-                if self.gate is not None:
+                if self._gate is not None:
                     try:
-                        await self.gate.wait()
+                        await self._gate.wait()
                     except asyncio.CancelledError:
                         if self.events is not None:
                             self.events.append('pull-cancelled')
@@ -225,13 +223,13 @@ class _ControlledStream(httpx2.AsyncByteStream):
         if self.events is not None:
             self.events.append('response-close-started')
         self.close_started.set()
-        if self.close_gate is not None:
-            await self.close_gate.wait()
+        if self._close_gate is not None:
+            await self._close_gate.wait()
         if self.events is not None:
             self.events.append('response-close-finished')
         self.close_finished.set()
-        if self.close_error is not None:
-            raise self.close_error
+        if self._close_error is not None:
+            raise self._close_error
 
 
 class _GatedCloseBody(_Body):
@@ -337,15 +335,13 @@ async def _loopback_response(
 def _request(
     *,
     body: bytes | Iterator[bytes] | None = b'{}',
-    total: float | None = None,
 ) -> TransportRequest:
     return TransportRequest(
         method='POST',
         url='https://example.test/api3/json',
         headers={'Content-Type': 'application/json', 'X-Request': 'value'},
         body=body,
-        timeout=TimeoutConfig(connect=1.0, read=2.0, total=total),
-        token=_REQUEST_ID,
+        timeout=TimeoutConfig(connect=1.0, read=2.0),
     )
 
 
@@ -357,7 +353,6 @@ def _request_for_url(url: str) -> TransportRequest:
         headers=request.headers,
         body=request.body,
         timeout=request.timeout,
-        token=request.token,
     )
 
 
@@ -387,21 +382,6 @@ async def test_buffered_send_converts_request_response_and_body_off_loop(
     assert response.status == 200
     assert response.content == b'RESPONSE'
     assert response.headers['x-response'] == 'value'
-
-
-@pytest.mark.anyio
-async def test_buffered_total_timeout_maps_to_read_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    client = _ControlledClient()
-    client.request_gate = asyncio.Event()
-    _install_client(monkeypatch, client)
-    transport = Httpx2Transport()
-    try:
-        with pytest.raises(ReadTimeoutError, match='total timeout'):
-            await transport.send(_request(total=0.02))
-    finally:
-        await transport.close()
 
 
 @pytest.mark.anyio
@@ -554,6 +534,7 @@ def test_constructor_disables_environment_and_wires_proxy_pool(
     assert options['verify'] is True
     assert 'transport' not in options
     assert (limits.max_connections, limits.max_keepalive_connections) == (7, 7)
+    assert limits.keepalive_expiry == 60.0
     assert str(proxy.url) == 'http://proxy.example:8080'
     assert proxy.headers['Proxy-Authorization'] == 'secret'
 
@@ -774,6 +755,21 @@ async def test_error_mapping_is_strictly_retry_safe(
 
 
 @pytest.mark.anyio
+async def test_pool_wait_connect_error_has_a_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _ControlledClient()
+    client.request_error = httpx2.PoolTimeout('')
+    _install_client(monkeypatch, client)
+    transport = Httpx2Transport()
+    try:
+        with pytest.raises(ConnectError) as caught:
+            await transport.send(_request())
+        assert str(caught.value).strip()
+        assert caught.value.__cause__ is client.request_error
+    finally:
+        await transport.close()
+
+
+@pytest.mark.anyio
 async def test_explicit_request_body_close_error_maps_to_send_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -790,21 +786,6 @@ async def test_explicit_request_body_close_error_maps_to_send_error(
 
     assert exc_info.value.__cause__ is close_error
     assert body.closed_on is not None
-
-
-def test_httpx2_is_imported_only_by_adapter() -> None:
-    source_root = Path(__file__).parents[2] / 'src' / 'shotgun_api3'
-    importers: list[str] = []
-    for path in source_root.rglob('*.py'):
-        tree = ast.parse(path.read_text())
-        if any(
-            (isinstance(node, ast.Import) and any(alias.name == 'httpx2' for alias in node.names))
-            or (isinstance(node, ast.ImportFrom) and node.module == 'httpx2')
-            for node in ast.walk(tree)
-        ):
-            importers.append(path.name)
-
-    assert importers == ['_async_httpx2.py']
 
 
 def test_public_transport_boundary_has_no_httpx2_types() -> None:
@@ -1258,21 +1239,22 @@ async def test_streaming_send_converts_request_and_returns_shared_response(
 
 
 @pytest.mark.anyio
-async def test_streaming_setup_timeout_returns_before_thread_pull_cleanup(
+async def test_streaming_setup_cancellation_returns_before_thread_pull_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     body = _BlockingBody()
     client = _ControlledClient()
     _install_client(monkeypatch, client)
     transport = Httpx2Transport()
-    task = asyncio.create_task(transport.send_streaming(_request(body=body, total=0.02)))
+    task = asyncio.create_task(transport.send_streaming(_request(body=body)))
     assert await asyncio.to_thread(body.started.wait, 1.0)
     close_task: asyncio.Task[None] | None = None
 
     try:
+        task.cancel()
         done, _pending = await asyncio.wait({task}, timeout=0.1)
         assert done == {task}
-        with pytest.raises(ReadTimeoutError, match='before response body'):
+        with pytest.raises(asyncio.CancelledError):
             await task
         close_task = asyncio.create_task(transport.close())
         done, _pending = await asyncio.wait({close_task}, timeout=0.05)
@@ -1280,7 +1262,7 @@ async def test_streaming_setup_timeout_returns_before_thread_pull_cleanup(
     finally:
         body.release.set()
         if not task.done():
-            with pytest.raises(ReadTimeoutError):
+            with pytest.raises(asyncio.CancelledError):
                 await task
         if close_task is None:
             await transport.close()
@@ -1290,66 +1272,6 @@ async def test_streaming_setup_timeout_returns_before_thread_pull_cleanup(
     assert await asyncio.to_thread(body.closed.wait, 1.0)
     assert body.close_calls == 1
     assert not body.close_raced
-
-
-@pytest.mark.anyio
-async def test_streaming_total_is_one_cumulative_monotonic_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = [100.0]
-    deadlines: list[float] = []
-    phase_durations = iter((0.02, 0.03, 0.03, 0.03))
-
-    @asynccontextmanager
-    async def controlled_timeout_at(deadline: float) -> AsyncGenerator[None, None]:
-        deadlines.append(deadline)
-        clock[0] += next(phase_durations)
-        yield
-        if clock[0] >= deadline:
-            raise TimeoutError
-
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, 'time', lambda: clock[0])
-    monkeypatch.setattr(asyncio, 'timeout_at', controlled_timeout_at)
-    stream = _ControlledStream([b'A', b'B', b'C'])
-    client = _ControlledClient()
-    client.stream_response = httpx2.Response(200, stream=stream)
-    _install_client(monkeypatch, client)
-    transport = Httpx2Transport()
-    response: AsyncStreamingResponse | None = None
-    try:
-        response = await transport.send_streaming(_request(total=0.1))
-        iterator = response.aiter_chunks(1)
-        assert await anext(iterator) == b'A'
-        assert await anext(iterator) == b'B'
-        with pytest.raises(ReadTimeoutError, match='total timeout'):
-            await anext(iterator)
-        assert stream.close_calls == 1
-    finally:
-        if response is not None:
-            await response.close()
-        await transport.close()
-
-    assert deadlines == pytest.approx([100.1] * 4)
-    assert clock[0] == pytest.approx(100.11)
-
-
-@pytest.mark.anyio
-async def test_streaming_total_timeout_covers_response_headers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    body = _Body([b'UNSENT'])
-    client = _ControlledClient()
-    client.send_gate = asyncio.Event()
-    _install_client(monkeypatch, client)
-    transport = Httpx2Transport()
-    try:
-        with pytest.raises(ReadTimeoutError, match='before response body'):
-            await transport.send_streaming(_request(body=body, total=0.02))
-    finally:
-        await transport.close()
-
-    assert body.closed_on is not None
 
 
 @pytest.mark.anyio
@@ -1374,7 +1296,7 @@ async def test_threaded_body_pulls_off_loop_and_observes_on_loop() -> None:
 
 @pytest.mark.anyio
 async def test_threaded_body_batches_exact_file_exchange_pulls(tmp_path: Path) -> None:
-    content = b'a' * (_FILE_TRANSFER_SIZE - 1) + b'b'
+    content = b'aaaabbbbxy'
     source_file = tmp_path / 'source.bin'
     source_file.write_bytes(content)
     exchange = _files.build_storage_upload_exchange(
@@ -1382,18 +1304,18 @@ async def test_threaded_body_batches_exact_file_exchange_pulls(tmp_path: Path) -
         _protocol.classify_endpoint('object_put'),
         'https://storage.example/object',
         _files.StorageRange(
-            length=_FILE_TRANSFER_SIZE,
+            length=len(content),
             offset=0,
             path=str(source_file),
         ),
-        chunk_size=_FILE_BATCH_SIZE,
+        chunk_size=4,
     )
-    source = cast('Iterator[bytes]', exchange.body_factory())
+    source = exchange.body_factory()
+    assert isinstance(source, Iterator)
 
     chunks = [chunk async for chunk in _ThreadedBody(source)]
 
-    assert len(chunks) <= 21
-    assert [len(chunk) for chunk in chunks] == [_FILE_BATCH_SIZE] * 19 + [_FILE_FINAL_BATCH_SIZE]
+    assert chunks == [b'aaaa', b'bbbb', b'xy']
     assert b''.join(chunks) == content
 
 
@@ -1481,3 +1403,76 @@ async def test_tls_connect_failure_maps_to_tls_error(
         await transport.close()
 
     assert exc_info.value.__cause__ is error
+
+
+@pytest.mark.parametrize('idle_limit', [None, 0.5])
+def test_constructor_passes_the_idle_limit_as_keepalive_expiry(
+    monkeypatch: pytest.MonkeyPatch, idle_limit: float | None
+) -> None:
+    options = _install_client(monkeypatch, _ControlledClient())
+    Httpx2Transport(max_connection_idle_secs=idle_limit)
+    limits = cast('httpx2.Limits', options['limits'])
+    assert limits.keepalive_expiry == idle_limit
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('mode', ['buffered', 'streaming'])
+async def test_requests_carry_the_keepalive_trace(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    client = _ControlledClient()
+    _install_client(monkeypatch, client)
+    transport = Httpx2Transport()
+    try:
+        if mode == 'buffered':
+            await transport.send(_request())
+        else:
+            response = await transport.send_streaming(_request())
+            await response.close()
+        assert client.extensions is not None
+        assert callable(client.extensions['trace'])
+    finally:
+        await transport.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('mode', ['buffered', 'streaming'])
+async def test_disabled_keepalive_attaches_no_trace(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    client = _ControlledClient()
+    _install_client(monkeypatch, client)
+    transport = Httpx2Transport(tcp_keepalive_timeout_secs=None)
+    try:
+        if mode == 'buffered':
+            await transport.send(_request())
+        else:
+            response = await transport.send_streaming(_request())
+            await response.close()
+        assert client.extensions is None or 'trace' not in client.extensions
+    finally:
+        await transport.close()
+
+
+@pytest.mark.anyio
+async def test_keepalive_trace_ignores_other_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[object] = []
+
+    def record(sock: object, _options: object) -> None:
+        recorded.append(sock)
+
+    class StreamWithoutSocket:
+        def get_extra_info(self, name: str) -> None:
+            assert name == 'socket'
+
+    monkeypatch.setattr(_async_httpx2, 'tune_socket', record, raising=False)
+    trace = _async_httpx2._keepalive_trace(())
+    for event in (
+        'connection.connect_tcp.started',
+        'connection.connect_tcp.failed',
+        'http11.send_request_headers.complete',
+    ):
+        await trace(event, {})
+    await trace('connection.connect_tcp.complete', {'return_value': StreamWithoutSocket()})
+    await trace('connection.connect_tcp.complete', {'return_value': object()})
+    assert recorded == []

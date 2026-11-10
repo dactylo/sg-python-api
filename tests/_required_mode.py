@@ -30,6 +30,26 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action='store_true',
         help='fail when any selected test skips',
     )
+    group.addoption(
+        '--live-extended', action='store_true', help='select only live tests with lasting effects'
+    )
+    group.addoption(
+        '--live-evidence-dir', default=None, help='save sanitized live counts and outcome evidence'
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    extended = bool(config.getoption('live_extended'))
+    selected: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        is_extended = item.name.startswith('test_extended_')
+        if item.get_closest_marker('live') is not None and is_extended != extended:
+            deselected.append(item)
+        else:
+            selected.append(item)
+    items[:] = selected
+    config.hook.pytest_deselected(items=deselected)
 
 
 def pytest_configure(config: pytest.Config) -> None:

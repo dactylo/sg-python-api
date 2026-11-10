@@ -18,21 +18,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _ARGUMENT_COUNT = 2
-# Keep the public input scope aligned with validate_artifacts.sh.
-_ARTIFACT_INPUTS = (
-    ':(top,glob)*',
-    ':(top,glob).github/**',
-    ':(top,glob)docs/*.md',
-    ':(top,glob)examples/**',
-    ':(top,glob)scripts/**',
-    ':(top,glob)src/**',
-    ':(top,glob)tests/**',
-)
+_ARTIFACT_INPUTS_PATH = 'scripts/artifact_inputs.txt'
 _EVIDENCE_PATH = 'dist/artifact-results.md'
 
 
 class _EvidenceError(Exception):
     """Reject evidence with a sanitized diagnostic."""
+
+
+def _artifact_inputs(repo_root: Path) -> tuple[str, ...]:
+    """Read the shared public artifact-input pathspecs."""
+    return tuple((repo_root / _ARTIFACT_INPUTS_PATH).read_text(encoding='ascii').splitlines())
 
 
 def _artifact_path(
@@ -134,6 +130,35 @@ def _git_status(
         raise _EvidenceError('Could not run artifact validation Git check') from None
 
 
+def _require_unchanged(repo_root: Path, candidate_commit: str, pathspecs: tuple[str, ...]) -> None:
+    """Require selected tracked inputs to match the validated commit."""
+    source_statuses = (
+        _git_status(
+            repo_root,
+            'diff',
+            '--quiet',
+            '--exit-code',
+            candidate_commit,
+            '--',
+            *pathspecs,
+        ),
+        _git_status(
+            repo_root,
+            'diff',
+            '--cached',
+            '--quiet',
+            '--exit-code',
+            candidate_commit,
+            '--',
+            *pathspecs,
+        ),
+    )
+    if any(status not in (0, 1) for status in source_statuses):
+        raise _EvidenceError('Could not verify artifact validation freshness')
+    if any(source_statuses):
+        raise _EvidenceError('Artifact validation evidence is stale')
+
+
 def _verify_freshness(repo_root: Path, candidate_commit: str) -> None:
     """Require an available ancestor candidate with unchanged tracked public inputs."""
     checks = (
@@ -149,31 +174,10 @@ def _verify_freshness(repo_root: Path, candidate_commit: str) -> None:
     for arguments, message in checks:
         if _git_status(repo_root, *arguments) != 0:
             raise _EvidenceError(message)
-    source_statuses = (
-        _git_status(
-            repo_root,
-            'diff',
-            '--quiet',
-            '--exit-code',
-            candidate_commit,
-            '--',
-            *_ARTIFACT_INPUTS,
-        ),
-        _git_status(
-            repo_root,
-            'diff',
-            '--cached',
-            '--quiet',
-            '--exit-code',
-            candidate_commit,
-            '--',
-            *_ARTIFACT_INPUTS,
-        ),
-    )
-    if any(status not in (0, 1) for status in source_statuses):
-        raise _EvidenceError('Could not verify artifact validation freshness')
-    if any(source_statuses):
+    if _git_status(repo_root, 'cat-file', '-e', f'{candidate_commit}:{_ARTIFACT_INPUTS_PATH}'):
         raise _EvidenceError('Artifact validation evidence is stale')
+    _require_unchanged(repo_root, candidate_commit, (_ARTIFACT_INPUTS_PATH,))
+    _require_unchanged(repo_root, candidate_commit, _artifact_inputs(repo_root))
 
 
 def _load_evidence(repo_root: Path) -> tuple[str, str, str, str]:

@@ -8,17 +8,20 @@ endif
 DEV_PYTHON := $(VENV_BIN)/python
 export PATH := $(abspath $(VENV_BIN)):$(PATH)
 export UV_SYSTEM_PYTHON := 0
-UV_VERSION := 0.12.23
+UV_VERSION := 0.13.6
 CI_PYTHON := 3.11
 CI_EXTRAS := --extra async
 CI_BUILD_REQUIREMENTS = $(DEV_PYTHON) -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))'
 CI_COMPILE = uv pip compile pyproject.toml - $(CI_EXTRAS) --universal --python-version $(CI_PYTHON) --no-python-downloads --no-sources --no-build --generate-hashes --no-annotate --custom-compile-command 'make lock-update'
 
-MARKDOWN_FILES := CHANGELOG.md COMPATIBILITY.md README.md docs/development.md docs/benchmarks.md docs/migration-guide.md docs/testing.md
-PUBLIC_MARKDOWN_FILES := $(wildcard *.md docs/*.md)
-SHELL_FILES := scripts/run_conformance.sh scripts/validate_artifacts.sh
+# Every file git tracks or would add, except paths git marks `private`.
+git_files = $(wildcard $(shell git -c core.quotePath=false ls-files --cached --others --exclude-standard -- $(1) ':(exclude,attr:private)'))
+MARKDOWN_FILES = $(call git_files,'*.md')
+PYTHON_FILES = $(call git_files,'*.py' '*.pyi')
+WORKFLOW_FILES := $(wildcard .github/workflows/*.yml)
+SHELL_FILES = $(call git_files,'*.sh')
 
-.PHONY: all check env-check format format-check lock-check lock-update quality setup shell-check test type-check uv-check venv-check whitespace-check
+.PHONY: all check env-check file-check format format-check lock-check lock-update quality setup shell-check test type-check uv-check venv-check whitespace-check workflow-check
 
 uv-check:
 	@test "$$(uv --version | cut -d ' ' -f 2)" = "$(UV_VERSION)" || \
@@ -40,26 +43,33 @@ env-check: venv-check
 		cmp -s pyproject.toml .venv/.pyproject.toml || \
 		{ echo 'Project setup is incomplete or outdated; run make setup.' >&2; exit 1; }
 
-format: env-check
-	$(DEV_PYTHON) -m ruff format .
-	$(DEV_PYTHON) -m ruff check --fix .
+# A tool given no files, or a folder, searches folders itself; stop before that can happen.
+file-check:
+	@test -n "$(PYTHON_FILES)" && test -n "$(MARKDOWN_FILES)" && test -n "$(SHELL_FILES)" || \
+		{ echo 'git listed no files to check; run make from a git checkout.' >&2; exit 1; }
+	@! git ls-files --cached --others --exclude-standard -- '*.py' '*.pyi' '*.md' ':(exclude,attr:private)' | grep -q '[[:space:]]' || \
+		{ echo 'Rename Python and Markdown files whose names contain whitespace.' >&2; exit 1; }
+
+format: env-check file-check
+	$(DEV_PYTHON) -m ruff format $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check --fix $(PYTHON_FILES) pyproject.toml
 	biome format --write .
-	$(DEV_PYTHON) -m mdformat $(sort $(MARKDOWN_FILES) $(PUBLIC_MARKDOWN_FILES))
+	$(DEV_PYTHON) -m mdformat $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt pyproject.toml
 	shfmt -w $(SHELL_FILES)
 
-format-check: env-check
-	$(DEV_PYTHON) -m ruff format --check .
-	$(DEV_PYTHON) -m ruff check .
+format-check: env-check file-check
+	$(DEV_PYTHON) -m ruff format --check $(PYTHON_FILES)
+	$(DEV_PYTHON) -m ruff check $(PYTHON_FILES) pyproject.toml
 	biome format .
-	$(DEV_PYTHON) -m mdformat --check $(sort $(MARKDOWN_FILES) $(PUBLIC_MARKDOWN_FILES))
+	$(DEV_PYTHON) -m mdformat --check $(MARKDOWN_FILES)
 	$(VENV_BIN)/pyproject-fmt --check pyproject.toml
 	shfmt -d $(SHELL_FILES)
 
-type-check: env-check
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin
-	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows
+type-check: env-check file-check
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Linux $(PYTHON_FILES)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Darwin $(PYTHON_FILES)
+	$(DEV_PYTHON) -m pyright --project pyproject.toml --pythonpath "$(DEV_PYTHON)" --pythonplatform Windows $(PYTHON_FILES)
 
 lock-check: env-check uv-check
 	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
@@ -76,13 +86,16 @@ lock-update: venv-check uv-check
 test: env-check
 	$(DEV_PYTHON) -m pytest -q $(TEST_FLAGS)
 
-shell-check:
+shell-check: file-check
 	bash -n $(SHELL_FILES)
 
 whitespace-check:
-	git diff --check HEAD
+	git diff --check "$$(git hash-object -t tree /dev/null)" -- . ':(exclude,attr:private)'
 
-quality: format-check lock-check type-check shell-check whitespace-check
+workflow-check: env-check
+	$(VENV_BIN)/zizmor --offline --no-progress --quiet $(WORKFLOW_FILES)
+
+quality: format-check lock-check type-check shell-check whitespace-check workflow-check
 
 check: quality test
 

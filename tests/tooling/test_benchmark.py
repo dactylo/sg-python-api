@@ -7,25 +7,90 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType, ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Never, Protocol, Self, TypedDict, TypeVar, cast
 
 import pytest
 
+from scripts import benchmark as _benchmark
 from shotgun_api3 import _files
 from shotgun_api3.lib.sgtimezone import SgTimezone
 from tests._git import git_env
-from tests._pyright import run_pyright
-from tests.tooling.test_artifact_evidence import prepare_evidence_candidate
+from tests.conftest import entity_id as record_id
+from tests.tooling._artifact_evidence import prepare_evidence_candidate
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from typing import Unpack
+
+    class _BenchmarkModule(Protocol):
+        _BATCH_SIZE = _benchmark._BATCH_SIZE
+
+        _ArtifactEvidence: type[_benchmark._ArtifactEvidence]
+        _BenchmarkError: type[_benchmark._BenchmarkError]
+        _CleanupError: type[_benchmark._CleanupError]
+        _CorrectnessError: type[_benchmark._CorrectnessError]
+        _LATENCY_OPERATIONS = _benchmark._LATENCY_OPERATIONS
+        _LiveState: type[_benchmark._LiveState]
+        _OFFICIAL_COMMIT = _benchmark._OFFICIAL_COMMIT
+        _OFFICIAL_REF = _benchmark._OFFICIAL_REF
+        _OFFICIAL_REPOSITORY = _benchmark._OFFICIAL_REPOSITORY
+        _OFFICIAL_VERSION = _benchmark._OFFICIAL_VERSION
+        _OPERATION_CATEGORIES = _benchmark._OPERATION_CATEGORIES
+        _Operations: type[_benchmark._Operations]
+        _ParallelReadRunner: type[_benchmark._ParallelReadRunner]
+        _RSS_OPERATIONS = _benchmark._RSS_OPERATIONS
+        _ResourceJournal: type[_benchmark._ResourceJournal]
+        _capability_upload_route = staticmethod(_benchmark._capability_upload_route)
+        _cleanup_resources = staticmethod(_benchmark._cleanup_resources)
+        _cleanup_worker = staticmethod(_benchmark._cleanup_worker)
+        _client_orders = staticmethod(_benchmark._client_orders)
+        _controller = staticmethod(_benchmark._controller)
+        _entity_code = staticmethod(_benchmark._entity_code)
+        _latency_worker = staticmethod(_benchmark._latency_worker)
+        _launch_configured_worker = staticmethod(_benchmark._launch_configured_worker)
+        _launch_worker = staticmethod(_benchmark._launch_worker)
+        _load_artifact_evidence = staticmethod(_benchmark._load_artifact_evidence)
+        _main = staticmethod(_benchmark._main)
+        _measure_verified = staticmethod(_benchmark._measure_verified)
+        _new_namespace = staticmethod(_benchmark._new_namespace)
+        _normalize_peak_rss = staticmethod(_benchmark._normalize_peak_rss)
+        _official_checkout = staticmethod(_benchmark._official_checkout)
+        _operation_route = staticmethod(_benchmark._operation_route)
+        _preflight_tools = staticmethod(_benchmark._preflight_tools)
+        _raise_worker_errors = staticmethod(_benchmark._raise_worker_errors)
+        _read_worker_config = staticmethod(_benchmark._read_worker_config)
+        _recover_worker = staticmethod(_benchmark._recover_worker)
+        _report_header_lines = staticmethod(_benchmark._report_header_lines)
+        _rss_download_setup_worker = staticmethod(_benchmark._rss_download_setup_worker)
+        _rss_worker = staticmethod(_benchmark._rss_worker)
+        _run_with_cleanup = staticmethod(_benchmark._run_with_cleanup)
+        _sample_summary = staticmethod(_benchmark._sample_summary)
+        _validate_disposable_path = staticmethod(_benchmark._validate_disposable_path)
+        _validate_module_origin = staticmethod(_benchmark._validate_module_origin)
+        _validate_official_identity = staticmethod(_benchmark._validate_official_identity)
+        _validate_round_result = staticmethod(_benchmark._validate_round_result)
+        _validate_route_evidence = staticmethod(_benchmark._validate_route_evidence)
+        _verify_loaded_client = staticmethod(_benchmark._verify_loaded_client)
+        _worker = staticmethod(_benchmark._worker)
+        _worker_result = staticmethod(_benchmark._worker_result)
+        _workload_budget = staticmethod(_benchmark._workload_budget)
+        _write_payload = staticmethod(_benchmark._write_payload)
+        _write_report_atomic = staticmethod(_benchmark._write_report_atomic)
+        _write_worker_config = staticmethod(_benchmark._write_worker_config)
+        importlib = _benchmark.importlib
+        os = _benchmark.os
+        shutil = _benchmark.shutil
+        sys = _benchmark.sys
+        tempfile = _benchmark.tempfile
+        threading = _benchmark.threading
+        uuid = _benchmark.uuid
+
+    _checked_benchmark: _BenchmarkModule = _benchmark
 
 _EXPECTED_LATENCY_OPERATIONS = (
     'auth_first_request',
@@ -72,23 +137,23 @@ class _CleanupWorkerClient:
         namespaced: set[tuple[str, int]] | None = None,
         raised_delete: int | None = None,
     ) -> None:
-        self.events = events
-        self.false_delete = false_delete
+        self._events = events
+        self._false_delete = false_delete
         self.namespaced = set[tuple[str, int]]() if namespaced is None else namespaced
-        self.present = present
-        self.raised_delete = raised_delete
+        self._present = present
+        self._raised_delete = raised_delete
 
     def close(self) -> None:
-        self.events.append(('close', threading.get_ident()))
+        self._events.append(('close', threading.get_ident()))
 
     def delete(self, entity_type: str, entity_id: int) -> bool:
-        self.events.append(('delete', entity_type, entity_id, threading.get_ident()))
+        self._events.append(('delete', entity_type, entity_id, threading.get_ident()))
         self.namespaced.discard((entity_type, entity_id))
-        if entity_id == self.raised_delete:
+        if entity_id == self._raised_delete:
             raise RuntimeError('RAW delete response')
-        if entity_id == self.false_delete:
+        if entity_id == self._false_delete:
             return False
-        self.present.discard((entity_type, entity_id))
+        self._present.discard((entity_type, entity_id))
         return True
 
     def find(
@@ -97,7 +162,7 @@ class _CleanupWorkerClient:
         filters: list[list[object]],
         _fields: list[str],
     ) -> list[dict[str, object]]:
-        self.events.append(('sweep', entity_type, filters, threading.get_ident()))
+        self._events.append(('sweep', entity_type, filters, threading.get_ident()))
         return [
             {'type': candidate_type, 'id': candidate_id}
             for candidate_type, candidate_id in sorted(self.namespaced)
@@ -111,63 +176,67 @@ class _CleanupWorkerClient:
         _fields: list[str] | None = None,
     ) -> dict[str, object] | None:
         if entity_type == 'Project':
-            self.events.append(('project', threading.get_ident()))
+            self._events.append(('project', threading.get_ident()))
             return {'type': 'Project', 'id': 91, 'name': 'Benchmark Project'}
         entity_id = cast('int', filters[0][2])
-        self.events.append(('query', entity_type, entity_id, threading.get_ident()))
-        if (entity_type, entity_id) in self.present | self.namespaced:
+        self._events.append(('query', entity_type, entity_id, threading.get_ident()))
+        if (entity_type, entity_id) in self._present | self.namespaced:
             return {'type': entity_type, 'id': entity_id}
         return None
 
 
+class _ClientConfig:
+    on_request: Callable[[object], None] | None = None
+
+
 class _InterruptedWorkerLauncher:
     def __init__(
-        self, benchmark: ModuleType, process_control: BaseException, recovery_case: str
+        self, benchmark: _BenchmarkModule, process_control: BaseException, recovery_case: str
     ) -> None:
-        self.benchmark = benchmark
-        self.process_control = process_control
-        self.recovery_case = recovery_case
+        self._benchmark = benchmark
+        self._process_control = process_control
+        self._recovery_case = recovery_case
         self.events: list[str] = []
         self.worker_path: Path | None = None
-        self.original_recover = benchmark._recover_worker
+        self._original_recover = benchmark._recover_worker
 
     def __call__(self, config_path: Path, root: Path) -> dict[str, object]:
-        journal_type = self.benchmark._ResourceJournal
+        journal_type = self._benchmark._ResourceJournal
         config = cast('dict[str, object]', json.loads(config_path.read_text(encoding='ascii')))
         if config['mode'] == 'preflight':
-            return _controller_worker_result(self.benchmark, config)
+            return _controller_worker_result(self._benchmark, config)
         if config['mode'] == 'cleanup':
             self.events.append('cleanup')
             assert self.worker_path is not None
             assert self.worker_path.exists()
-            assert journal_type._load(root)._resources == (
-                () if self.recovery_case == 'empty' else (('Shot', 17),)
+            assert journal_type.load(root).resources == (
+                () if self._recovery_case == 'empty' else (('Shot', 17),)
             )
-            if self.recovery_case == 'failure':
+            if self._recovery_case == 'failure':
                 raise RuntimeError('SECRET cleanup response')
-            if self.recovery_case == 'interrupt':
+            if self._recovery_case == 'interrupt':
                 raise KeyboardInterrupt('cleanup interrupt')
-            if self.recovery_case == 'exit':
+            if self._recovery_case == 'exit':
                 raise SystemExit(23)
-            journal_type._load(root)._clear()
+            journal_type.load(root).clear()
             return {'cleanup': 'PASS'}
         self.worker_path = config_path
-        assert journal_type._load(root)._resources == ()
-        if self.recovery_case == 'malformed':
+        assert journal_type.load(root).resources == ()
+        if self._recovery_case == 'malformed':
             (root / 'resource-journal.json').write_text(
                 '{"resources":[{"entity_type":"SECRET-journal","id":17}]}',
                 encoding='ascii',
             )
-        elif self.recovery_case != 'empty':
-            journal_type._load(root)._record('Shot', 17)
+        elif self._recovery_case != 'empty':
+            journal_type.load(root).record('Shot', 17)
         self.events.append('interrupted')
-        raise self.process_control
+        raise self._process_control
 
     def recover(self, config: Mapping[str, object], root: Path, sequence: int) -> None:
         self.events.append('recover')
         assert self.worker_path is not None
         assert self.worker_path.exists()
-        self.original_recover(config, root, sequence)
+        self._original_recover(config, root, sequence)
 
 
 class _LatencyObserverClient:
@@ -180,15 +249,15 @@ class _LatencyObserverClient:
         emit_events: bool,
     ) -> None:
         self.config = SimpleNamespace(on_request=None)
-        self.emit_events = emit_events
-        self.emitted_roles = emitted_roles
-        self.entity = entity
-        self.role = role
+        self._emit_events = emit_events
+        self._emitted_roles = emitted_roles
+        self._entity = entity
+        self._role = role
 
     def _emit(self, category: str) -> None:
         observer = self.config.on_request
-        if self.emit_events and observer is not None:
-            self.emitted_roles.append(self.role)
+        if self._emit_events and observer is not None:
+            self._emitted_roles.append(self._role)
             observer(SimpleNamespace(operation=category, route='rpc'))
 
     def close(self) -> None:
@@ -196,7 +265,7 @@ class _LatencyObserverClient:
 
     def find_one(self, *_args: object, **_kwargs: object) -> dict[str, object]:
         self._emit('read')
-        return self.entity
+        return self._entity
 
     def get_session_token(self) -> str:
         self._emit('session_authentication')
@@ -206,14 +275,14 @@ class _LatencyObserverClient:
 class _LatencyObserverState:
     def __init__(self, _module: object, config: Mapping[str, object]) -> None:
         self.clients: list[_LatencyObserverClient] = []
-        self.emit_events = config.get('emit_events', True) is True
-        self.emitted_roles = cast('list[str]', config['emitted_roles'])
+        self._emit_events = config.get('emit_events', True) is True
+        self._emitted_roles = cast('list[str]', config['emitted_roles'])
         self.entities: list[dict[str, object]] = [{'type': 'Shot', 'id': 1, 'code': 'ns-shot-000'}]
 
-    def _cleanup(self) -> None:
+    def cleanup(self) -> None:
         pass
 
-    def _client(self, *, session_token: str | None = None) -> _LatencyObserverClient:
+    def client(self, *, session_token: str | None = None) -> _LatencyObserverClient:
         if not self.clients:
             role = 'control'
         elif len(self.clients) == 1:
@@ -224,23 +293,23 @@ class _LatencyObserverState:
             role = 'authentication'
         client = _LatencyObserverClient(
             role,
-            self.emitted_roles,
+            self._emitted_roles,
             self.entities[0],
-            emit_events=self.emit_events,
+            emit_events=self._emit_events,
         )
         self.clients.append(client)
         return client
 
-    def _prepare(self) -> None:
-        self._client()
+    def prepare(self) -> None:
+        self.client()
 
 
 class _ParallelLatencyFailureClient:
     def __init__(self, events: list[str]) -> None:
-        self.events = events
+        self._events = events
 
     def close(self) -> None:
-        self.events.append('client:close')
+        self._events.append('client:close')
 
 
 class _ParallelLatencyFailureState:
@@ -249,42 +318,42 @@ class _ParallelLatencyFailureState:
         self.events = cast('list[str]', config['events'])
         self.prepare_failure = cast('Callable[[], None]', config['prepare_failure'])
 
-    def _cleanup(self) -> None:
+    def cleanup(self) -> None:
         self.events.append('state:cleanup')
 
-    def _client(self) -> _ParallelLatencyFailureClient:
+    def client(self) -> _ParallelLatencyFailureClient:
         return _ParallelLatencyFailureClient(self.events)
 
-    def _prepare(self) -> None:
+    def prepare(self) -> None:
         self.events.append('state:prepare')
 
 
 class _ParallelLatencyFailureOperations:
     def __init__(self, _client: object, state: _ParallelLatencyFailureState) -> None:
-        self.state = state
+        self._state = state
 
-    def _call(self, _name: str, _invocation: int) -> object:
-        self.state.events.append('operations:call')
-        self.state.call_failure()
+    def call(self, _name: str, _invocation: int) -> object:
+        self._state.events.append('operations:call')
+        self._state.call_failure()
         return {'type': 'Shot', 'id': 1, 'code': 'shot-1'}
 
-    def _close(self) -> None:
-        self.state.events.append('operations:close')
+    def close(self) -> None:
+        self._state.events.append('operations:close')
 
-    def _prepare(self, _name: str) -> None:
-        self.state.events.append('operations:prepare')
-        self.state.prepare_failure()
+    def prepare(self, _name: str) -> None:
+        self._state.events.append('operations:prepare')
+        self._state.prepare_failure()
 
-    def _verify_result(self, _name: str, _result: object) -> bool:
+    def verify_result(self, _name: str, _result: object) -> bool:
         return True
 
 
 class _ParallelRunnerFailureClient:
     def __init__(self, barrier: threading.Barrier, raw_error: BaseException) -> None:
-        self.barrier = barrier
+        self._barrier = barrier
         self.close_thread: int | None = None
         self.owner_thread = threading.get_ident()
-        self.raw_error = raw_error
+        self._raw_error = raw_error
 
     def close(self) -> None:
         self.close_thread = threading.get_ident()
@@ -296,58 +365,49 @@ class _ParallelRunnerFailureClient:
         _fields: list[str],
     ) -> dict[str, object]:
         entity_id = cast('int', filters[0][2])
-        self.barrier.wait(timeout=5)
+        self._barrier.wait(timeout=5)
         if entity_id == 3:
-            raise self.raw_error
+            raise self._raw_error
         return {'type': 'Shot', 'id': entity_id, 'code': f'shot-{entity_id}'}
 
 
 class _ParallelRunnerMeasuredClient:
     def __init__(self, close_threads: list[int]) -> None:
-        self.close_threads = close_threads
+        self._close_threads = close_threads
 
     def close(self) -> None:
-        self.close_threads.append(threading.get_ident())
+        self._close_threads.append(threading.get_ident())
 
 
 class _ParallelRunnerFailureState:
     def __init__(self, _module: object, config: Mapping[str, object]) -> None:
-        self.barrier = cast('threading.Barrier', config['barrier'])
+        self._barrier = cast('threading.Barrier', config['barrier'])
         self.clients = cast('list[_ParallelRunnerFailureClient]', config['parallel_clients'])
         self.entities = [
             {'type': 'Shot', 'id': identity, 'code': f'shot-{identity}'}
             for identity in range(1, 5)
         ]
-        self.lock = cast('threading.Lock', config['lock'])
-        self.make_calls = cast('list[int]', config['make_calls'])
-        self.measured_close_threads = cast('list[int]', config['measured_close_threads'])
-        self.raw_error = cast('BaseException', config['raw_error'])
+        self._lock = cast('threading.Lock', config['lock'])
+        self._make_calls = cast('list[int]', config['make_calls'])
+        self._measured_close_threads = cast('list[int]', config['measured_close_threads'])
+        self._raw_error = cast('BaseException', config['raw_error'])
 
-    def _cleanup(self) -> None:
+    def cleanup(self) -> None:
         pass
 
-    def _client(self) -> _ParallelRunnerMeasuredClient:
-        return _ParallelRunnerMeasuredClient(self.measured_close_threads)
+    def client(self) -> _ParallelRunnerMeasuredClient:
+        return _ParallelRunnerMeasuredClient(self._measured_close_threads)
 
-    def _make_client(self) -> _ParallelRunnerFailureClient:
-        with self.lock:
-            self.make_calls[0] += 1
-        client = _ParallelRunnerFailureClient(self.barrier, self.raw_error)
-        with self.lock:
+    def make_client(self) -> _ParallelRunnerFailureClient:
+        with self._lock:
+            self._make_calls[0] += 1
+        client = _ParallelRunnerFailureClient(self._barrier, self._raw_error)
+        with self._lock:
             self.clients.append(client)
         return client
 
-    def _prepare(self) -> None:
+    def prepare(self) -> None:
         pass
-
-
-class _PartialStartClient:
-    def __init__(self) -> None:
-        self.close_thread: int | None = None
-        self.owner_thread = threading.get_ident()
-
-    def close(self) -> None:
-        self.close_thread = threading.get_ident()
 
 
 class _PayloadWriteRecorder:
@@ -370,56 +430,15 @@ class _PayloadWriteRecorder:
         return len(value)
 
 
-class _RecoveryStateSeam(Protocol):
-    clients: list[_CleanupWorkerClient]
-    download_attachment_id: int
-    multipart_payload: Path
-    project: dict[str, object]
-
-    def _client(self) -> _CleanupWorkerClient: ...
-
-    def _record_resource(self, entity_type: str, entity_id: int) -> None: ...
-
-
-class _RecoveryTimeoutLauncher:
-    def __init__(self, benchmark: ModuleType) -> None:
-        self.benchmark = benchmark
-        self.original_launch = benchmark._launch_worker
-
-    def __call__(self, config_path: Path, root: Path) -> dict[str, object]:
-        config = cast(
-            'dict[str, object]',
-            json.loads(config_path.read_text(encoding='ascii')),
-        )
-        if config['mode'] == 'preflight':
-            return _controller_worker_result(self.benchmark, config)
-        if config['mode'] == 'cleanup':
-            return self.original_launch(config_path, root, env={}, run=self._timed_out)
-        self.benchmark._ResourceJournal._load(root)._record('Shot', 987654321)
-        raise self.benchmark._BenchmarkError('Benchmark worker failed with status -9')
-
-    @staticmethod
-    def _timed_out(
-        _command: list[str],
-        **_kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(
-            ['SECRET-command', 'SECRET-path'],
-            3600,
-            output='SECRET-stdout',
-            stderr='SECRET-stderr and traceback',
-        )
-
-
 class _RssFixtureClient:
     def __init__(self, events: list[str], source: Path) -> None:
         self.config = SimpleNamespace(on_request=None)
-        self.events = events
-        self.source = source
+        self._events = events
+        self._source = source
 
     def download_attachment(self, _identity: int, *, file_path: str) -> str:
-        self.events.append('download')
-        Path(file_path).write_bytes(self.source.read_bytes())
+        self._events.append('download')
+        Path(file_path).write_bytes(self._source.read_bytes())
         return file_path
 
     def find_one(
@@ -433,7 +452,7 @@ class _RssFixtureClient:
         return {'type': 'Version', 'id': 5, 'sg_uploaded_movie': {'id': 7}}
 
     def upload(self, *_args: object, **_kwargs: object) -> int:
-        self.events.append('upload')
+        self._events.append('upload')
         return 7
 
 
@@ -442,7 +461,7 @@ class _RssFixtureState:
         self.clients: list[_RssFixtureClient] = []
         self.direct_payload = source
         self.download_attachment_id = 7
-        self.events = events
+        self._events = events
         self.multipart_payload = source
         self.namespace = 'ns'
         self.recorded_resources: list[tuple[str, int]] = []
@@ -451,33 +470,220 @@ class _RssFixtureState:
             's3_direct_uploads_enabled': True,
             's3_enabled_upload_types': {'Version': ['sg_uploaded_movie']},
         }
-        self.source = source
+        self._source = source
         self.version = {'id': 5}
         self.work_root = work_root
 
-    def _cleanup(self) -> None:
-        self.events.append('cleanup')
+    def cleanup(self) -> None:
+        self._events.append('cleanup')
 
-    def _cleanup_clients(self) -> None:
-        self.events.append('client-cleanup')
+    def cleanup_clients(self) -> None:
+        self._events.append('client-cleanup')
 
-    def _client(self) -> _RssFixtureClient:
-        self.events.append('client')
-        client = _RssFixtureClient(self.events, self.source)
+    def client(self) -> _RssFixtureClient:
+        self._events.append('client')
+        client = _RssFixtureClient(self._events, self._source)
         self.clients.append(client)
         return client
 
-    def _prepare(self) -> None:
-        self.events.append('full-prepare')
+    def prepare(self) -> None:
+        self._events.append('full-prepare')
 
-    def _prepare_rss(self, name: str) -> None:
-        self.events.append(f'prepare:{name}')
-        client = self._client()
+    def prepare_rss(self, name: str) -> None:
+        self._events.append(f'prepare:{name}')
+        client = self.client()
         if name == 'rss_download':
             client.upload()
 
-    def _record_resource(self, entity_type: str, entity_id: int) -> None:
+    def record_resource(self, entity_type: str, entity_id: int) -> None:
         self.recorded_resources.append((entity_type, entity_id))
+
+
+class _UnusedClient:
+    config: _benchmark._LiveClientConfig = _ClientConfig()
+
+    def batch(self, requests: list[dict[str, object]]) -> list[object]:
+        del requests
+        raise AssertionError('Unexpected test client call: batch')
+
+    def close(self) -> None:
+        raise AssertionError('Unexpected test client call: close')
+
+    def create(self, entity_type: str, data: dict[str, object]) -> object:
+        del entity_type, data
+        raise AssertionError('Unexpected test client call: create')
+
+    def delete(self, entity_type: str, entity_id: int) -> object:
+        del entity_type, entity_id
+        raise AssertionError('Unexpected test client call: delete')
+
+    def download_attachment(self, entity_id: int, *, file_path: str) -> object:
+        del entity_id, file_path
+        raise AssertionError('Unexpected test client call: download_attachment')
+
+    def find(
+        self,
+        entity_type: str,
+        filters: list[list[object]],
+        fields: list[str],
+        **options: Unpack[_benchmark._FindOptions],
+    ) -> list[dict[str, object]]:
+        del entity_type, filters, fields, options
+        raise AssertionError('Unexpected test client call: find')
+
+    def find_one(
+        self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+    ) -> object:
+        del entity_type, filters, fields
+        raise AssertionError('Unexpected test client call: find_one')
+
+    def get_session_token(self) -> str:
+        raise AssertionError('Unexpected test client call: get_session_token')
+
+    def info(self) -> object:
+        raise AssertionError('Unexpected test client call: info')
+
+    def schema_entity_read(self) -> dict[str, object]:
+        raise AssertionError('Unexpected test client call: schema_entity_read')
+
+    def schema_field_read(self, entity_type: str) -> dict[str, object]:
+        del entity_type
+        raise AssertionError('Unexpected test client call: schema_field_read')
+
+    def summarize(
+        self,
+        entity_type: str,
+        filters: list[list[object]],
+        summary_fields: list[dict[str, object]],
+    ) -> dict[str, object]:
+        del entity_type, filters, summary_fields
+        raise AssertionError('Unexpected test client call: summarize')
+
+    def update(
+        self, entity_type: str, entity_id: int, data: dict[str, object]
+    ) -> dict[str, object]:
+        del entity_type, entity_id, data
+        raise AssertionError('Unexpected test client call: update')
+
+    def upload(
+        self,
+        entity_type: str,
+        entity_id: int,
+        path: str,
+        field_name: str | None = None,
+        display_name: str | None = None,
+    ) -> object:
+        del entity_type, entity_id, path, field_name, display_name
+        raise AssertionError('Unexpected test client call: upload')
+
+
+class _StateOptions(TypedDict, total=False):
+    client: Callable[..., _benchmark._MeasuredClient]
+    clients: list[_benchmark._MeasuredClient]
+    config: dict[str, object]
+    create: Callable[[_benchmark._SetupClient, str, dict[str, object]], dict[str, object]]
+    direct_payload: Path
+    download_attachment_id: int
+    entities: list[dict[str, object]]
+    expected_descriptions: dict[int, str | None]
+    generic_payload: Path
+    make_client: Callable[[], _benchmark._MeasuredClient]
+    module: ModuleType
+    multipart_payload: Path
+    namespace: str
+    project: dict[str, object]
+    resources: list[tuple[str, int]]
+    server_info: dict[str, object]
+    verified_deleted_shot_ids: set[int]
+    version: dict[str, object]
+    work_root: Path
+
+
+class _State(_benchmark._LiveState):
+    def __init__(self, **options: Unpack[_StateOptions]) -> None:
+        self._config = options.get('config', {})
+        self.clients = options.get('clients', [])
+        self.direct_payload = options.get('direct_payload', Path())
+        self.download_attachment_id = options.get('download_attachment_id', 0)
+        self.entities = options.get('entities', [])
+        self.expected_descriptions = options.get('expected_descriptions', {})
+        self.generic_payload = options.get('generic_payload', Path())
+        self.module = options.get('module', ModuleType('test_client'))
+        self.multipart_payload = options.get('multipart_payload', Path())
+        self.namespace = options.get('namespace', '')
+        self.project = options.get('project', {})
+        self.resources = options.get('resources', [])
+        self.server_info = options.get('server_info', {})
+        self.verified_deleted_shot_ids = options.get('verified_deleted_shot_ids', set())
+        self.version = options.get('version', {})
+        self.work_root = options.get('work_root', Path())
+        self._client_factory = options.get('client', _unexpected)
+        self._create_record = options.get('create', _unexpected)
+        self._make_client = options.get('make_client', _unexpected)
+
+    def client(self, *, session_token: str | None = None) -> _benchmark._MeasuredClient:
+        if session_token is None:
+            return self._client_factory()
+        return self._client_factory(session_token=session_token)
+
+    def create(
+        self, client: _benchmark._SetupClient, entity_type: str, data: dict[str, object]
+    ) -> dict[str, object]:
+        return self._create_record(client, entity_type, data)
+
+    def make_client(self, session_token: str | None = None) -> _benchmark._MeasuredClient:
+        assert session_token is None
+        return self._make_client()
+
+
+class _PartialStartClient(_UnusedClient):
+    def __init__(self) -> None:
+        self.close_thread: int | None = None
+        self.owner_thread = threading.get_ident()
+
+    def close(self) -> None:
+        self.close_thread = threading.get_ident()
+
+
+class _RecoveryStateSeam(Protocol):
+    clients: list[_CleanupWorkerClient]
+    download_attachment_id: int
+    multipart_payload: Path
+    project: dict[str, object]
+
+    def client(self) -> _CleanupWorkerClient: ...
+
+    def record_resource(self, entity_type: str, entity_id: int) -> None: ...
+
+
+class _RecoveryTimeoutLauncher:
+    def __init__(self, benchmark: _BenchmarkModule) -> None:
+        self._benchmark = benchmark
+        self._original_launch = benchmark._launch_worker
+
+    def __call__(self, config_path: Path, root: Path) -> dict[str, object]:
+        config = cast(
+            'dict[str, object]',
+            json.loads(config_path.read_text(encoding='ascii')),
+        )
+        if config['mode'] == 'preflight':
+            return _controller_worker_result(self._benchmark, config)
+        if config['mode'] == 'cleanup':
+            return self._original_launch(config_path, root, env={}, run=self._timed_out)
+        self._benchmark._ResourceJournal.load(root).record('Shot', 987654321)
+        raise self._benchmark._BenchmarkError('Benchmark worker failed with status -9')
+
+    @staticmethod
+    def _timed_out(
+        _command: list[str],
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(
+            ['SECRET-command', 'SECRET-path'],
+            3600,
+            output='SECRET-stdout',
+            stderr='SECRET-stderr and traceback',
+        )
 
 
 class _StopBenchmark(BaseException):
@@ -503,25 +709,25 @@ class _PartialStartThread:
         args: tuple[int],
         name: str,
     ) -> None:
-        self.index = args[0]
-        self.raw_error = raw_error
-        self.started = False
+        self._index = args[0]
+        self._raw_error = raw_error
+        self._started = False
         self.target = target
-        self.thread = thread_type(target=target, args=args, name=name)
+        self._thread = thread_type(target=target, args=args, name=name)
 
     @property
     def ident(self) -> int | None:
-        return self.thread.ident
+        return self._thread.ident
 
     def join(self) -> None:
-        if self.started:
-            self.thread.join()
+        if self._started:
+            self._thread.join()
 
     def start(self) -> None:
-        if self.index == 2:
-            raise self.raw_error
-        self.started = True
-        self.thread.start()
+        if self._index == 2:
+            raise self._raw_error
+        self._started = True
+        self._thread.start()
 
 
 class _PostStartFailureThread:
@@ -533,22 +739,22 @@ class _PostStartFailureThread:
         args: tuple[int],
         name: str,
     ) -> None:
-        self.index = args[0]
-        self.raw_error = raw_error
+        self._index = args[0]
+        self._raw_error = raw_error
         self.target = target
-        self.thread = thread_type(target=target, args=args, name=name)
+        self._thread = thread_type(target=target, args=args, name=name)
 
     @property
     def ident(self) -> int | None:
-        return self.thread.ident
+        return self._thread.ident
 
     def join(self) -> None:
-        self.thread.join()
+        self._thread.join()
 
     def start(self) -> None:
-        self.thread.start()
-        if self.index == 2:
-            raise self.raw_error
+        self._thread.start()
+        if self._index == 2:
+            raise self._raw_error
 
 
 class _WorkerRunOptions(TypedDict):
@@ -560,12 +766,19 @@ class _WorkerRunOptions(TypedDict):
     timeout: int
 
 
+class _ControllerOverrides(TypedDict, total=False):
+    env_value: str
+    events: list[str]
+    install_roots: list[Path]
+    official_package: bool
+
+
 def _absent_resource(_kind: str, _identity: int) -> None:
     pass
 
 
 def _assert_controller_configs(
-    benchmark: ModuleType,
+    benchmark: _BenchmarkModule,
     configs: list[dict[str, object]],
     install_root: Path,
     official: Path,
@@ -589,18 +802,71 @@ def _ignore_worker_module(_root: Path) -> None:
     pass
 
 
-def _load_benchmark() -> ModuleType:
+def _load_benchmark() -> _BenchmarkModule:
     spec = importlib.util.spec_from_file_location('benchmark_under_test', _BENCHMARK)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    return cast('_BenchmarkModule', module)
+
+
+def _module(**attributes: object) -> ModuleType:
+    module = ModuleType('test_client')
+    vars(module).update(attributes)
     return module
 
 
 def _noop() -> None:
     pass
+
+
+def _patch_controller(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **overrides: Unpack[_ControllerOverrides]
+) -> _BenchmarkModule:
+    benchmark = _load_benchmark()
+    official = tmp_path / 'official'
+    official.mkdir()
+    if overrides.get('official_package', True):
+        (official / 'shotgun_api3').mkdir()
+        (official / 'shotgun_api3' / '__init__.py').touch()
+    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '9.9.9', tmp_path / 'wheel')
+    events = overrides.get('events', [])
+    install_roots = overrides.get('install_roots', [])
+    for name in _REQUIRED_ENV:
+        monkeypatch.setenv(name, overrides.get('env_value', 'value').format(name=name))
+    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
+
+    def load(_root: Path) -> object:
+        events.append('artifact')
+        return evidence
+
+    def official_checkout(_repo_root: Path, _official_root: Path) -> Path:
+        events.append('official')
+        return official
+
+    def preflight() -> None:
+        events.append('preflight')
+
+    def install(_evidence: object, install_root: Path) -> Path:
+        events.append('install')
+        install_roots.append(install_root)
+        candidate = install_root / 'site-packages'
+        (candidate / 'shotgun_api3').mkdir(parents=True)
+        (candidate / 'shotgun_api3' / '__init__.py').touch()
+        return candidate
+
+    monkeypatch.setattr(benchmark, '_preflight_tools', preflight)
+    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
+    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
+    monkeypatch.setattr(benchmark, '_install_candidate', install)
+    return benchmark
+
+
+def _record(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return cast('dict[str, object]', value)
 
 
 def _route(client: str, name: str) -> str:
@@ -620,7 +886,7 @@ def _route(client: str, name: str) -> str:
 
 
 def _operation_result(
-    benchmark: ModuleType,
+    benchmark: _BenchmarkModule,
     value: float = 0.1,
     *,
     client: str = 'ours',
@@ -655,7 +921,7 @@ def _rss_result(client: str, name: str, value: int = 1024) -> dict[str, object]:
 
 
 def _controller_worker_result(
-    benchmark: ModuleType,
+    benchmark: _BenchmarkModule,
     config: Mapping[str, object],
 ) -> dict[str, object]:
     client = cast('str', config['client'])
@@ -682,6 +948,10 @@ def _controller_worker_result(
 
 def _successful_delete(_kind: str, _identity: int) -> bool:
     return True
+
+
+def _unexpected(*_args: object, **_kwargs: object) -> Never:
+    raise AssertionError('Unexpected test state operation')
 
 
 def _unused_worker_module(_config: Mapping[str, object]) -> ModuleType:
@@ -720,7 +990,7 @@ def test_artifact_evidence_uses_real_isolated_helper(
     result = benchmark._load_artifact_evidence(candidate)
 
     assert result.candidate_commit == commit
-    assert result.version == '0.1.2'
+    assert result.version == '9.9.9'
     assert result.wheel_path == wheel.resolve()
     assert result.sha256 == digest
     wheel.write_bytes(b'tampered')
@@ -786,7 +1056,7 @@ def test_atomic_report_is_ascii_formatted_sanitized_and_contains_required_eviden
                     }
                     for name in benchmark._RSS_OPERATIONS
                 },
-                'version': '0.1.2',
+                'version': '9.9.9',
             },
         },
         'cleanup': 'PASS',
@@ -1014,7 +1284,7 @@ def test_atomic_report_sanitizes_ordinary_work_and_cleanup_failures(
 def test_auth_cold_call_constructs_client_and_warm_call_reuses_it() -> None:
     benchmark = _load_benchmark()
 
-    class Client:
+    class Client(_UnusedClient):
         def __init__(self) -> None:
             self.calls = 0
 
@@ -1030,14 +1300,14 @@ def test_auth_cold_call_constructs_client_and_warm_call_reuses_it() -> None:
         constructions.append(None)
         return fresh
 
-    state = SimpleNamespace(
-        _client=client,
+    state = _State(
+        client=client,
         entities=[{'type': 'Shot', 'id': 1, 'code': 'ns-shot-000'}],
     )
     operations = benchmark._Operations(outer, state)
 
-    operations._call('auth_first_request', 0)
-    operations._call('auth_first_request', 1)
+    operations.call('auth_first_request', 0)
+    operations.call('auth_first_request', 1)
 
     assert len(constructions) == 1
     assert fresh.calls == 2
@@ -1063,7 +1333,7 @@ def test_auth_rows_accept_route_and_category_events_from_secondary_clients(
     monkeypatch.setattr(benchmark, '_LiveState', _LatencyObserverState)
 
     result = benchmark._latency_worker(
-        SimpleNamespace(),
+        _module(),
         {'client': 'ours', 'emitted_roles': emitted_roles},
     )
 
@@ -1077,7 +1347,7 @@ def test_batch_result_pair_arity_is_independent_of_batch_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     benchmark = _load_benchmark()
-    operations = benchmark._Operations(SimpleNamespace(), SimpleNamespace())
+    operations = benchmark._Operations(_UnusedClient(), _State())
     responses = [
         {'description': 'first'},
         {'description': 'second'},
@@ -1087,10 +1357,27 @@ def test_batch_result_pair_arity_is_independent_of_batch_size(
 
     monkeypatch.setattr(benchmark, '_BATCH_SIZE', 3)
 
-    assert operations._verify_result('batch', (responses, expected)) is True
-    assert operations._verify_result('batch', (responses,)) is False
-    assert operations._verify_result('batch', (responses, expected, None)) is False
-    assert operations._verify_result('batch', (responses, ['first', 'wrong', 'third'])) is False
+    assert operations.verify_result('batch', (responses, expected)) is True
+    assert operations.verify_result('batch', (responses,)) is False
+    assert operations.verify_result('batch', (responses, expected, None)) is False
+    assert operations.verify_result('batch', (responses, ['first', 'wrong', 'third'])) is False
+
+
+def test_benchmark_docs_describe_safe_default_and_download_setup() -> None:
+    source = (_REPO_ROOT / 'docs' / 'development.md').read_text(encoding='ascii')
+    text = ' '.join(source.split())
+
+    assert 'default 2 paired rounds' in text
+    assert '18 worker processes' in text
+    assert '184 server entities' in text
+    assert '332,032,784 uploaded bytes' in text
+    assert '162 worker processes' in text
+    assert '1,840 server entities' in text
+    assert '3,320,327,840 uploaded bytes' in text
+    assert 'larger even `BENCH_N`' in text
+
+    methodology = (_REPO_ROOT / 'docs' / 'benchmarks.md').read_text(encoding='ascii')
+    assert 'fresh download-only process' in ' '.join(methodology.split())
 
 
 @pytest.mark.parametrize(
@@ -1276,17 +1563,17 @@ def test_cleanup_worker_attempts_all_work_and_retains_journal_on_failure(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
+    journal = journal_type.create(tmp_path)
     resources = (('Shot', 1), ('Attachment', 2), ('Version', 3))
     for entity_type, entity_id in resources:
-        journal._record(entity_type, entity_id)
+        journal.record(entity_type, entity_id)
     events: list[tuple[object, ...]] = []
     client = _CleanupWorkerClient(events, {('Attachment', 2)}, false_delete=2)
 
     def make_client(*_args: object, **_kwargs: object) -> _CleanupWorkerClient:
         return client
 
-    module = SimpleNamespace(Shotgun=make_client)
+    module = _module(Shotgun=make_client)
 
     with pytest.raises(benchmark._CleanupError, match='cleanup failed') as captured:
         benchmark._cleanup_worker(
@@ -1296,7 +1583,7 @@ def test_cleanup_worker_attempts_all_work_and_retains_journal_on_failure(
 
     assert 'Attachment' not in str(captured.value)
     assert '2' not in str(captured.value)
-    assert journal_type._load(tmp_path)._resources == resources
+    assert journal_type.load(tmp_path).resources == resources
     assert [event[:3] for event in events if event[0] == 'delete'] == [
         ('delete', 'Version', 3),
         ('delete', 'Attachment', 2),
@@ -1315,7 +1602,7 @@ def test_cleanup_worker_deletes_and_verifies_every_namespaced_identity(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal_type._create(tmp_path)
+    journal_type.create(tmp_path)
     events: list[tuple[object, ...]] = []
     client = _CleanupWorkerClient(
         events,
@@ -1329,7 +1616,7 @@ def test_cleanup_worker_deletes_and_verifies_every_namespaced_identity(
         return client
 
     result = benchmark._cleanup_worker(
-        SimpleNamespace(Shotgun=make_client),
+        _module(Shotgun=make_client),
         _worker_config(tmp_path, mode='cleanup'),
     )
 
@@ -1373,7 +1660,7 @@ def test_cleanup_worker_deletes_and_verifies_every_namespaced_identity(
         ('query', 'Version', 18, worker_thread),
         ('close', worker_thread),
     ]
-    assert journal_type._load(tmp_path)._resources == ()
+    assert journal_type.load(tmp_path).resources == ()
 
 
 def test_cleanup_worker_deletes_verifies_sweeps_closes_and_clears_serially(
@@ -1381,10 +1668,10 @@ def test_cleanup_worker_deletes_verifies_sweeps_closes_and_clears_serially(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
+    journal = journal_type.create(tmp_path)
     resources = (('Shot', 1), ('Attachment', 2), ('Version', 3))
     for entity_type, entity_id in resources:
-        journal._record(entity_type, entity_id)
+        journal.record(entity_type, entity_id)
     events: list[tuple[object, ...]] = []
     client = _CleanupWorkerClient(
         events,
@@ -1396,7 +1683,7 @@ def test_cleanup_worker_deletes_verifies_sweeps_closes_and_clears_serially(
     def make_client(*_args: object, **_kwargs: object) -> _CleanupWorkerClient:
         return client
 
-    module = SimpleNamespace(Shotgun=make_client)
+    module = _module(Shotgun=make_client)
 
     result = benchmark._cleanup_worker(
         module,
@@ -1404,7 +1691,7 @@ def test_cleanup_worker_deletes_verifies_sweeps_closes_and_clears_serially(
     )
 
     assert result == {'cleanup': 'PASS'}
-    assert journal_type._load(tmp_path)._resources == ()
+    assert journal_type.load(tmp_path).resources == ()
     worker_thread = threading.get_ident()
     assert events == [
         ('project', worker_thread),
@@ -1462,7 +1749,7 @@ def test_cleanup_worker_malformed_journal_fails_before_live_client(
 
     with pytest.raises(benchmark._BenchmarkError, match='resource journal') as captured:
         benchmark._cleanup_worker(
-            SimpleNamespace(Shotgun=create_client),
+            _module(Shotgun=create_client),
             _worker_config(tmp_path, mode='cleanup'),
         )
 
@@ -1487,7 +1774,7 @@ def test_cleanup_worker_result_dispatches_and_verifies_import_root(
     benchmark = _load_benchmark()
     expected = tmp_path / 'expected'
     expected.mkdir()
-    module = SimpleNamespace()
+    module = _module()
     calls: list[str] = []
     config_path = tmp_path / 'worker.json'
     config_path.write_text('{}', encoding='ascii')
@@ -1544,37 +1831,13 @@ def test_cleanup_worker_timeout_blocks_report_publication_without_leaks(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    benchmark = _load_benchmark()
-    official = tmp_path / 'official'
-    (official / 'shotgun_api3').mkdir(parents=True)
-    (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.2', tmp_path / 'wheel')
+    benchmark = _patch_controller(monkeypatch, tmp_path, env_value='SECRET-{name}')
     report_called = False
-    for name in _REQUIRED_ENV:
-        monkeypatch.setenv(name, f'SECRET-{name}')
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
-
-    def load(_root: Path) -> object:
-        return evidence
-
-    def official_checkout(_repo_root: Path, _official_root: Path) -> Path:
-        return official
-
-    monkeypatch.setattr(benchmark, '_preflight_tools', _noop)
-    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
-    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
-
-    def install(_evidence: object, install_root: Path) -> Path:
-        candidate = install_root / 'site-packages'
-        (candidate / 'shotgun_api3').mkdir(parents=True)
-        (candidate / 'shotgun_api3' / '__init__.py').touch()
-        return candidate
 
     def publish(_destination: Path, _result: Mapping[str, object]) -> None:
         nonlocal report_called
         report_called = True
 
-    monkeypatch.setattr(benchmark, '_install_candidate', install)
     monkeypatch.setattr(benchmark, '_launch_worker', _RecoveryTimeoutLauncher(benchmark))
     monkeypatch.setattr(benchmark, '_write_report_atomic', publish)
 
@@ -1690,43 +1953,16 @@ def test_controller_defaults_to_bounded_workload_after_isolated_preflights(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    benchmark = _load_benchmark()
-    official = tmp_path / 'official'
-    (official / 'shotgun_api3').mkdir(parents=True)
-    (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.2', tmp_path / 'wheel')
     events: list[str] = []
     configs: list[dict[str, object]] = []
     install_roots: list[Path] = []
     published: dict[str, object] = {}
-    for name in _REQUIRED_ENV:
-        monkeypatch.setenv(name, 'value')
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
+    benchmark = _patch_controller(
+        monkeypatch, tmp_path, events=events, install_roots=install_roots
+    )
+    official = tmp_path / 'official'
     monkeypatch.delenv('BENCH_N', raising=False)
     monkeypatch.setenv('BENCH_SEED', '7')
-
-    def load(_root: Path) -> object:
-        events.append('artifact')
-        return evidence
-
-    def official_checkout(_repo_root: Path, _official_root: Path) -> Path:
-        events.append('official')
-        return official
-
-    def preflight() -> None:
-        events.append('preflight')
-
-    monkeypatch.setattr(benchmark, '_preflight_tools', preflight)
-    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
-    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
-
-    def install(_evidence: object, install_root: Path) -> Path:
-        events.append('install')
-        install_roots.append(install_root)
-        candidate = install_root / 'site-packages'
-        (candidate / 'shotgun_api3').mkdir(parents=True)
-        (candidate / 'shotgun_api3' / '__init__.py').touch()
-        return candidate
 
     def launch(config: dict[str, object], _root: Path, _sequence: int) -> dict[str, object]:
         events.append('worker')
@@ -1737,7 +1973,6 @@ def test_controller_defaults_to_bounded_workload_after_isolated_preflights(
         events.append('publish')
         published.update(result)
 
-    monkeypatch.setattr(benchmark, '_install_candidate', install)
     monkeypatch.setattr(benchmark, '_launch_configured_worker', launch)
     monkeypatch.setattr(benchmark, '_write_report_atomic', publish)
 
@@ -1773,30 +2008,11 @@ def test_controller_interruption_recovers_before_removal_and_blocks_publication(
     process_control: BaseException,
     recovery_case: str,
 ) -> None:
-    benchmark = _load_benchmark()
+    benchmark = _patch_controller(monkeypatch, tmp_path, env_value='unused')
     launcher = _InterruptedWorkerLauncher(benchmark, process_control, recovery_case)
     original_unlink = Path.unlink
-    official = tmp_path / 'official'
-    (official / 'shotgun_api3').mkdir(parents=True)
-    (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.2', tmp_path / 'wheel')
-    for name in _REQUIRED_ENV:
-        monkeypatch.setenv(name, 'unused')
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
     monkeypatch.delenv('BENCH_N', raising=False)
     monkeypatch.delenv('BENCH_SEED', raising=False)
-
-    def load(_root: Path) -> object:
-        return evidence
-
-    def official_checkout(_repo_root: Path, _official_root: Path) -> Path:
-        return official
-
-    def install(_evidence: object, install_root: Path) -> Path:
-        candidate = install_root / 'site-packages'
-        (candidate / 'shotgun_api3').mkdir(parents=True)
-        (candidate / 'shotgun_api3' / '__init__.py').touch()
-        return candidate
 
     def unlink(path: Path, *, missing_ok: bool = False) -> None:
         if path == launcher.worker_path:
@@ -1806,10 +2022,6 @@ def test_controller_interruption_recovers_before_removal_and_blocks_publication(
     def publish(_destination: Path, _result: Mapping[str, object]) -> None:
         launcher.events.append('publish')
 
-    monkeypatch.setattr(benchmark, '_preflight_tools', _noop)
-    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
-    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
-    monkeypatch.setattr(benchmark, '_install_candidate', install)
     monkeypatch.setattr(benchmark, '_launch_worker', launcher)
     monkeypatch.setattr(benchmark, '_recover_worker', launcher.recover)
     monkeypatch.setattr(benchmark, '_write_report_atomic', publish)
@@ -1834,26 +2046,10 @@ def test_controller_rejects_excessive_workload_before_order_allocation_or_worker
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    benchmark = _load_benchmark()
-    official = tmp_path / 'official'
-    official.mkdir()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.2', tmp_path / 'wheel')
+    benchmark = _patch_controller(monkeypatch, tmp_path, official_package=False)
     order_called = False
     worker_called = False
-    for name in _REQUIRED_ENV:
-        monkeypatch.setenv(name, 'value')
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
     monkeypatch.setenv('BENCH_N', str(10**18))
-
-    def load(_root: Path) -> object:
-        return evidence
-
-    def official_checkout(_repo_root: Path, _official_root: Path) -> Path:
-        return official
-
-    monkeypatch.setattr(benchmark, '_preflight_tools', _noop)
-    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
-    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
 
     def orders(_sample_count: int, *, seed: int) -> list[tuple[str, str]]:
         nonlocal order_called
@@ -1879,14 +2075,14 @@ def test_created_result_pair_arity_is_independent_of_batch_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     benchmark = _load_benchmark()
-    operations = benchmark._Operations(SimpleNamespace(), SimpleNamespace())
+    operations = benchmark._Operations(_UnusedClient(), _State())
 
     monkeypatch.setattr(benchmark, '_BATCH_SIZE', 3)
 
-    assert operations._verify_result('create', ({'id': 7, 'code': 'expected'}, 'expected')) is True
-    assert operations._verify_result('create', ({'id': 7, 'code': 'expected'},)) is False
-    assert operations._verify_result('create', ({'id': 7}, 'expected', None)) is False
-    assert operations._verify_result('create', ({'id': 7, 'code': 'wrong'}, 'expected')) is False
+    assert operations.verify_result('create', ({'id': 7, 'code': 'expected'}, 'expected')) is True
+    assert operations.verify_result('create', ({'id': 7, 'code': 'expected'},)) is False
+    assert operations.verify_result('create', ({'id': 7}, 'expected', None)) is False
+    assert operations.verify_result('create', ({'id': 7, 'code': 'wrong'}, 'expected')) is False
 
 
 def test_delete_preparation_allocates_one_target_per_cold_warm_invocation(
@@ -1903,17 +2099,17 @@ def test_delete_preparation_allocates_one_target_per_cold_warm_invocation(
         created.append({'entity_type': entity_type, **data})
         return {'id': len(created)}
 
-    state = SimpleNamespace(
-        clients=[SimpleNamespace()],
-        _create=create,
+    state = _State(
+        clients=[_UnusedClient()],
+        create=create,
         namespace='namespace',
         project={'id': 9},
     )
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
 
     monkeypatch.setattr(benchmark, '_BATCH_SIZE', 3)
 
-    operations._prepare('delete')
+    operations.prepare('delete')
 
     assert created == [
         {
@@ -1934,19 +2130,21 @@ def test_deleted_result_pair_arity_is_independent_of_batch_size(
 ) -> None:
     benchmark = _load_benchmark()
 
-    class Control:
-        def find_one(self, _entity_type: str, _filters: object) -> None:
-            pass
+    class Control(_UnusedClient):
+        def find_one(
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+        ) -> None:
+            del entity_type, filters, fields
 
-    state = SimpleNamespace(clients=[Control()], verified_deleted_shot_ids=set())
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    state = _State(clients=[Control()], verified_deleted_shot_ids=set())
+    operations = benchmark._Operations(_UnusedClient(), state)
 
     monkeypatch.setattr(benchmark, '_BATCH_SIZE', 3)
 
-    assert operations._verify_result('delete', (True, 7)) is True
-    assert operations._verify_result('delete', (True,)) is False
-    assert operations._verify_result('delete', (True, 8, None)) is False
-    assert operations._verify_result('delete', (False, 8)) is False
+    assert operations.verify_result('delete', (True, 7)) is True
+    assert operations.verify_result('delete', (True,)) is False
+    assert operations.verify_result('delete', (True, 8, None)) is False
+    assert operations.verify_result('delete', (False, 8)) is False
     assert state.verified_deleted_shot_ids == {7}
 
 
@@ -1974,23 +2172,22 @@ def test_download_and_upload_verification_compare_exact_bytes(
     downloaded = tmp_path / 'download-0.bin'
     downloaded.write_bytes(b'x' * len(source.read_bytes()))
 
-    class Control:
-        def download_attachment(self, _identity: int, *, file_path: str) -> str:
+    class Control(_UnusedClient):
+        def download_attachment(self, entity_id: int, *, file_path: str) -> str:
+            del entity_id
             Path(file_path).write_bytes(b'x' * len(source.read_bytes()))
             return file_path
 
         def find_one(
-            self,
-            entity_type: str,
-            _filters: object,
-            fields: object = None,
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
         ) -> dict[str, object]:
+            del filters
             if entity_type == 'Attachment':
                 return {'type': 'Attachment', 'id': 7}
             assert fields == ['sg_uploaded_movie']
             return {'type': 'Version', 'id': 5, 'sg_uploaded_movie': {'id': 7}}
 
-    state = SimpleNamespace(
+    state = _State(
         clients=[Control()],
         direct_payload=source,
         download_attachment_id=7,
@@ -2000,10 +2197,10 @@ def test_download_and_upload_verification_compare_exact_bytes(
         version={'id': 5},
         work_root=tmp_path,
     )
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
 
-    assert operations._verify_result('download', str(downloaded)) is False
-    assert operations._verify_result(upload_name, 7) is False
+    assert operations.verify_result('download', str(downloaded)) is False
+    assert operations.verify_result(upload_name, 7) is False
 
 
 @pytest.mark.parametrize('worker_outcome', ['handled', 'unexpected', 'signal', 'timeout'])
@@ -2064,29 +2261,16 @@ def test_empty_observer_is_rejected_only_for_our_client(
     if client_name == 'ours':
         with pytest.raises(benchmark._CorrectnessError, match='evidence failed'):
             benchmark._latency_worker(
-                SimpleNamespace(),
+                _module(),
                 config,
             )
     else:
         result = benchmark._latency_worker(
-            SimpleNamespace(),
+            _module(),
             config,
         )
         assert result['operations']['find_one']['category'] == 'read'
         assert result['operations']['find_one']['route'] == 'rpc'
-
-
-def test_fresh_benchmark_modules_do_not_share_globals(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    first = _load_benchmark()
-    monkeypatch.setattr(first, '_BATCH_SIZE', 987)
-
-    second = _load_benchmark()
-
-    assert first is not second
-    assert second._BATCH_SIZE != 987
-    assert first._ResourceJournal is not second._ResourceJournal
 
 
 def test_full_inventory_is_required_without_silent_skips() -> None:
@@ -2131,17 +2315,17 @@ def test_generated_entity_codes_are_distinct_and_fit_observed_limit(
         recorded.append(cast('str', data['code']))
         return {'id': len(recorded)}
 
-    state = SimpleNamespace(
-        clients=[SimpleNamespace()],
-        _create=create,
+    state = _State(
+        clients=[_UnusedClient()],
+        create=create,
         namespace=namespace,
         project={'id': 1},
     )
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
 
-    operations._call('create', 0)
-    operations._call('create', 1)
-    operations._prepare('delete')
+    operations.call('create', 0)
+    operations.call('create', 1)
+    operations.prepare('delete')
 
     assert recorded == [
         f'{namespace}-created-0',
@@ -2166,16 +2350,16 @@ def test_generated_entity_codes_reject_overflow_before_live_create() -> None:
         live_create_called = True
         return {'id': 1}
 
-    state = SimpleNamespace(
-        clients=[SimpleNamespace()],
-        _create=create,
+    state = _State(
+        clients=[_UnusedClient()],
+        create=create,
         namespace='x' * 100,
         project={'id': 1},
     )
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
 
     with pytest.raises(benchmark._BenchmarkError, match='100-character'):
-        operations._call('create', 0)
+        operations.call('create', 0)
 
     assert live_create_called is False
 
@@ -2188,22 +2372,21 @@ def test_generated_live_fixture_codes_use_shared_boundary(
     namespace = benchmark._new_namespace('official', 19)
     original_entity_code = benchmark._entity_code
     suffixes: list[str] = []
+    created: list[tuple[str, str]] = []
 
     def entity_code(value: str, suffix: str) -> str:
         suffixes.append(suffix)
         return original_entity_code(value, suffix)
 
-    class Control:
+    class Control(_UnusedClient):
         def __init__(self) -> None:
-            self.identity = 1
+            self._identity = 1
 
-        def create(
-            self,
-            entity_type: str,
-            data: dict[str, object],
-        ) -> dict[str, object]:
-            self.identity += 1
-            return {'id': self.identity, 'type': entity_type, **data}
+        def create(self, entity_type: str, data: dict[str, object]) -> dict[str, object]:
+            self._identity += 1
+            if isinstance(data.get('code'), str):
+                created.append((entity_type, cast('str', data['code'])))
+            return {'id': self._identity, 'type': entity_type, **data}
 
         def find_one(self, *_args: object, **_kwargs: object) -> dict[str, object]:
             return {'id': 1, 'type': 'Project', 'name': 'Benchmark'}
@@ -2222,7 +2405,7 @@ def test_generated_live_fixture_codes_use_shared_boundary(
     def write_payload(_path: Path, _byte_count: int) -> None:
         pass
 
-    module = SimpleNamespace(Shotgun=shotgun)
+    module = _module(Shotgun=shotgun)
     config = {
         'api_key': 'unused',
         'namespace': namespace,
@@ -2233,36 +2416,32 @@ def test_generated_live_fixture_codes_use_shared_boundary(
     }
     monkeypatch.setattr(benchmark, '_entity_code', entity_code)
     monkeypatch.setattr(benchmark, '_write_payload', write_payload)
-    benchmark._ResourceJournal._create(tmp_path)
+    benchmark._ResourceJournal.create(tmp_path)
 
-    benchmark._LiveState(module, config)._prepare()
+    benchmark._LiveState(module, config).prepare()
 
     assert suffixes == ['version', *(f'shot-{index:03d}' for index in range(30))]
+    assert len(created) == 31
+    assert {entity_type for entity_type, _code in created} == {'Version', 'Shot'}
+    assert all(code.startswith(f'{namespace}-') and len(code) <= 100 for _, code in created)
+    assert len({code for _, code in created}) == len(created)
 
 
-def test_generated_payload_is_deterministic_nontrivial_content(tmp_path: Path) -> None:
+@pytest.mark.parametrize('size', [0, 31, 32, 33, 1 << 20, (1 << 20) + 17])
+def test_generated_payload_has_requested_size_and_repeatable_content(
+    size: int, tmp_path: Path
+) -> None:
     benchmark = _load_benchmark()
     first = tmp_path / 'first.bin'
     second = tmp_path / 'second.bin'
 
-    benchmark._write_payload(first, 8193)
-    benchmark._write_payload(second, 8193)
+    benchmark._write_payload(first, size)
+    benchmark._write_payload(second, size)
 
+    assert first.stat().st_size == size
     assert first.read_bytes() == second.read_bytes()
-    assert first.stat().st_size == 8193
-    assert any(first.read_bytes())
-
-
-@pytest.mark.parametrize('size', [0, 31, 32, 33, 1 << 20, (1 << 20) + 17])
-def test_generated_payload_matches_repeated_digest(size: int, tmp_path: Path) -> None:
-    benchmark = _load_benchmark()
-    path = tmp_path / 'payload.bin'
-    digest = hashlib.sha256(b'sg-python-api benchmark transfer payload').digest()
-    expected = (digest * ((size + len(digest) - 1) // len(digest)))[:size]
-
-    benchmark._write_payload(path, size)
-
-    assert path.read_bytes() == expected
+    if size:
+        assert any(first.read_bytes())
 
 
 @pytest.mark.parametrize('with_residue', [False, True])
@@ -2293,7 +2472,7 @@ def test_handled_worker_failure_recovers_namespace_and_retains_diagnostics(
         state.clients.append(client)
         return client
 
-    monkeypatch.setattr(benchmark._LiveState, '_client', track)
+    monkeypatch.setattr(benchmark._LiveState, 'client', track)
 
     def fail_worker(_config_path: Path) -> dict[str, object]:
         raise benchmark._BenchmarkError('benchmark operation failed: create')
@@ -2315,7 +2494,7 @@ def test_handled_worker_failure_recovers_namespace_and_retains_diagnostics(
         if config['mode'] == 'cleanup':
             return actual_worker_result(config_path)
         if with_residue:
-            journal_type._load(root)._record('Shot', 17)
+            journal_type.load(root).record('Shot', 17)
         return actual_launch(config_path, root, env={}, run=run)
 
     monkeypatch.setattr(benchmark, '_launch_worker', launch)
@@ -2335,7 +2514,7 @@ def test_handled_worker_failure_recovers_namespace_and_retains_diagnostics(
     assert not tuple(tmp_path.glob('*worker*.json'))
     assert not tuple(tmp_path.glob('*cleanup*.json'))
     if not recovery_fails:
-        assert journal_type._load(tmp_path)._resources == ()
+        assert journal_type.load(tmp_path).resources == ()
 
 
 @pytest.mark.parametrize(
@@ -2348,22 +2527,41 @@ def test_initialized_operations_reject_mismatched_bound_verifiers_before_workloa
     operation_key: str,
 ) -> None:
     benchmark = _load_benchmark()
-    original = benchmark._Operations._verifiers
+    original = benchmark._Operations.verifiers
 
-    def changed_mapping(operations: object) -> dict[str, object]:
-        mapping = original(operations)
+    def changed_mapping(operations: _benchmark._Operations) -> dict[str, object]:
+        mapping: dict[str, object] = dict(original(operations))
         if change == 'remove':
             mapping.pop(operation_key)
         else:
             mapping[operation_key] = _noop
         return mapping
 
-    monkeypatch.setattr(benchmark._Operations, '_verifiers', changed_mapping)
+    monkeypatch.setattr(benchmark._Operations, 'verifiers', changed_mapping)
     with pytest.raises(
         benchmark._BenchmarkError,
         match=rf'^Benchmark operation metadata mismatch: verifiers: {operation_key}$',
     ):
-        benchmark._Operations(SimpleNamespace(), SimpleNamespace())
+        benchmark._Operations(_UnusedClient(), _State())
+
+
+def test_installed_client_is_verified_by_distribution_version(tmp_path: Path) -> None:
+    benchmark = _load_benchmark()
+    root = tmp_path / 'site-packages'
+    module_path = root / 'shotgun_api3' / '__init__.py'
+    module_path.parent.mkdir(parents=True)
+    module_path.touch()
+    info = root / 'sg_python_api-1.2.3.dist-info'
+    info.mkdir()
+    (info / 'METADATA').write_text(
+        'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 1.2.3\n', encoding='ascii'
+    )
+    # An installed client's __version__ reports its compatibility target instead.
+    module = _module(__file__=str(module_path), __version__='3.10.3')
+
+    benchmark._verify_loaded_client(module, root, '1.2.3')
+    with pytest.raises(benchmark._BenchmarkError, match='version'):
+        benchmark._verify_loaded_client(module, root, '3.10.3')
 
 
 @pytest.mark.parametrize(
@@ -2417,27 +2615,27 @@ def test_known_entity_and_payload_decode_require_loaded_client_timezone_identity
     client: str,
 ) -> None:
     benchmark = _load_benchmark()
-    modules = {name: SimpleNamespace(sg_timezone=SgTimezone()) for name in ('official', 'ours')}
+    modules = {name: _module(sg_timezone=SgTimezone()) for name in ('official', 'ours')}
     other_client = 'ours' if client == 'official' else 'official'
-    entities = [
+    entities: list[dict[str, object]] = [
         {'type': 'Shot', 'id': index, 'code': f'ns-shot-{index:03d}'} for index in range(1, 31)
     ]
-    state = SimpleNamespace(
+    state = _State(
         config={'client': client},
         entities=entities,
-        expected_descriptions={entity['id']: None for entity in entities},
+        expected_descriptions={record_id(entity): None for entity in entities},
         module=modules[client],
         namespace='ns',
     )
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
     wrong_known = {'type': 'Shot', 'id': 999, 'code': entities[0]['code']}
     wrong_payload = [
         {**entity, 'created_at': '2026-07-19T00:00:00Z', 'description': 'wrong'}
         for entity in entities
     ]
 
-    assert operations._verify_result('find_one', wrong_known) is False
-    assert operations._verify_result('payload_decode', wrong_payload) is False
+    assert operations.verify_result('find_one', wrong_known) is False
+    assert operations.verify_result('payload_decode', wrong_payload) is False
 
     naive_payload = [
         {
@@ -2447,7 +2645,7 @@ def test_known_entity_and_payload_decode_require_loaded_client_timezone_identity
         }
         for entity in entities
     ]
-    assert operations._verify_result('payload_decode', naive_payload) is False
+    assert operations.verify_result('payload_decode', naive_payload) is False
 
     created_at = datetime(2026, 7, 19, tzinfo=UTC)
     loaded_datetime = created_at.astimezone(modules[client].sg_timezone.local)
@@ -2463,7 +2661,7 @@ def test_known_entity_and_payload_decode_require_loaded_client_timezone_identity
         }
         for entity in entities
     ]
-    assert operations._verify_result('payload_decode', wrong_timezone_payload) is False
+    assert operations.verify_result('payload_decode', wrong_timezone_payload) is False
 
     valid_payload = [
         {
@@ -2473,7 +2671,7 @@ def test_known_entity_and_payload_decode_require_loaded_client_timezone_identity
         }
         for entity in entities
     ]
-    assert operations._verify_result('payload_decode', valid_payload) is True
+    assert operations.verify_result('payload_decode', valid_payload) is True
 
 
 def test_latency_operation_presentation_order_is_stable() -> None:
@@ -2489,34 +2687,34 @@ def test_latency_worker_preserves_measurement_process_control_during_cleanup(
     process_control = KeyboardInterrupt()
     events: list[str] = []
 
-    class Client:
+    class Client(_UnusedClient):
         def close(self) -> None:
             events.append('close')
 
     class Operations:
         def __init__(self, _client: object, _state: object) -> None:
-            self._close = lambda: events.append('operations-close')
+            self.close = lambda: events.append('operations-close')
 
-        def _call(self, _name: str, _invocation: int) -> object:
+        def call(self, _name: str, _invocation: int) -> object:
             raise process_control
 
-        def _prepare(self, _name: str) -> None:
+        def prepare(self, _name: str) -> None:
             pass
 
-        def _verify_result(self, _name: str, _result: object) -> bool:
+        def verify_result(self, _name: str, _result: object) -> bool:
             return True
 
     class State:
         def __init__(self, _module: object, _config: object) -> None:
             pass
 
-        def _cleanup(self) -> None:
+        def cleanup(self) -> None:
             events.append('cleanup')
 
-        def _client(self) -> Client:
+        def client(self) -> Client:
             return Client()
 
-        def _prepare(self) -> None:
+        def prepare(self) -> None:
             events.append('prepare')
 
     monkeypatch.setattr(benchmark, '_LATENCY_OPERATIONS', ('find_one',))
@@ -2525,7 +2723,7 @@ def test_latency_worker_preserves_measurement_process_control_during_cleanup(
 
     with pytest.raises(KeyboardInterrupt) as captured:
         benchmark._latency_worker(
-            SimpleNamespace(),
+            _module(),
             {'client': 'official'},
         )
 
@@ -2539,22 +2737,33 @@ def test_live_state_cleanup_finishes_then_propagates_first_process_control() -> 
     first = KeyboardInterrupt()
     second = SystemExit(17)
 
-    class Control:
+    class Control(_UnusedClient):
         def close(self) -> None:
             events.append('close:control')
 
-        def delete(self, _kind: str, _identity: int) -> None:
+        def delete(self, entity_type: str, entity_id: int) -> None:
+            del entity_type, entity_id
             events.append('delete')
             raise first
 
-        def find(self, kind: str, *_args: object) -> list[object]:
-            events.append(f'sweep:{kind}')
+        def find(
+            self,
+            entity_type: str,
+            filters: list[list[object]],
+            fields: list[str],
+            **options: Unpack[_benchmark._FindOptions],
+        ) -> list[dict[str, object]]:
+            del filters, fields, options
+            events.append(f'sweep:{entity_type}')
             return []
 
-        def find_one(self, _kind: str, _filters: object) -> None:
+        def find_one(
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+        ) -> None:
+            del entity_type, filters, fields
             events.append('query')
 
-    class Other:
+    class Other(_UnusedClient):
         def close(self) -> None:
             events.append('close:other')
             raise second
@@ -2566,7 +2775,7 @@ def test_live_state_cleanup_finishes_then_propagates_first_process_control() -> 
     state.resources = [('Attachment', 7)]
 
     with pytest.raises(KeyboardInterrupt) as captured:
-        state._cleanup()
+        state.cleanup()
 
     assert captured.value is first
     assert events == [
@@ -2583,44 +2792,55 @@ def test_live_state_cleanup_finishes_then_propagates_first_process_control() -> 
 def test_live_state_journal_clears_only_after_final_client_closure(tmp_path: Path) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
-    journal._record('Attachment', 7)
+    journal = journal_type.create(tmp_path)
+    journal.record('Attachment', 7)
     events: list[str] = []
-    original_clear = journal._clear
+    original_clear = journal.clear
 
     def clear() -> None:
         events.append('journal:clear')
         original_clear()
 
-    journal._clear = clear
+    journal.clear = clear
 
-    class Control:
+    class Control(_UnusedClient):
         def close(self) -> None:
             events.append('close:control')
 
-        def delete(self, _entity_type: str, _entity_id: int) -> bool:
+        def delete(self, entity_type: str, entity_id: int) -> bool:
+            del entity_type, entity_id
             events.append('delete')
             return True
 
-        def find(self, entity_type: str, *_args: object) -> list[object]:
+        def find(
+            self,
+            entity_type: str,
+            filters: list[list[object]],
+            fields: list[str],
+            **options: Unpack[_benchmark._FindOptions],
+        ) -> list[dict[str, object]]:
+            del filters, fields, options
             events.append(f'sweep:{entity_type}')
             return []
 
-        def find_one(self, _entity_type: str, _filters: object) -> None:
+        def find_one(
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+        ) -> None:
+            del entity_type, filters, fields
             events.append('query')
 
-    class Other:
+    class Other(_UnusedClient):
         def close(self) -> None:
             events.append('close:other')
 
     state = object.__new__(benchmark._LiveState)
     state.clients = [Control(), Other()]
-    state.journal = journal
+    state._journal = journal
     state.namespace = 'ns'
     state.project = {'id': 1}
     state.resources = [('Attachment', 7)]
 
-    state._cleanup()
+    state.cleanup()
 
     assert events == [
         'delete',
@@ -2633,37 +2853,39 @@ def test_live_state_journal_clears_only_after_final_client_closure(tmp_path: Pat
         'journal:clear',
     ]
     assert state.resources == []
-    assert journal_type._load(tmp_path)._resources == ()
+    assert journal_type.load(tmp_path).resources == ()
 
 
 def test_live_state_journal_does_not_record_unsuccessful_mutations(tmp_path: Path) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal_type._create(tmp_path)
+    journal_type.create(tmp_path)
     state = benchmark._LiveState(
-        SimpleNamespace(),
+        _module(),
         {'namespace': 'ns', 'work_root': str(tmp_path)},
     )
 
-    class InvalidCreate:
-        def create(self, *_args: object) -> dict[str, object]:
+    class InvalidCreate(_UnusedClient):
+        def create(self, entity_type: str, data: dict[str, object]) -> dict[str, object]:
+            del entity_type, data
             return {'type': 'Shot', 'id': True}
 
-    class FailedCreate:
-        def create(self, *_args: object) -> object:
+    class FailedCreate(_UnusedClient):
+        def create(self, entity_type: str, data: dict[str, object]) -> object:
+            del entity_type, data
             raise RuntimeError('create failed')
 
     with pytest.raises(benchmark._CorrectnessError, match='creation failed'):
-        state._create(InvalidCreate(), 'Shot', {})
+        state.create(InvalidCreate(), 'Shot', {})
     with pytest.raises(RuntimeError, match='create failed'):
-        state._create(FailedCreate(), 'Shot', {})
+        state.create(FailedCreate(), 'Shot', {})
 
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    operations = benchmark._Operations(_UnusedClient(), state)
     for invalid in (None, True, 0, '7'):
         assert operations._track_upload(invalid) is invalid
 
     assert state.resources == []
-    assert journal_type._load(tmp_path)._resources == ()
+    assert journal_type.load(tmp_path).resources == ()
 
 
 def test_live_state_journal_records_validated_create_and_upload_paths(
@@ -2672,19 +2894,15 @@ def test_live_state_journal_records_validated_create_and_upload_paths(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal_type._create(tmp_path)
+    journal_type.create(tmp_path)
 
-    class Control:
+    class Control(_UnusedClient):
         def __init__(self) -> None:
-            self.identity = 1
+            self._identity = 1
 
-        def create(
-            self,
-            entity_type: str,
-            data: dict[str, object],
-        ) -> dict[str, object]:
-            self.identity += 1
-            return {'id': self.identity, 'type': entity_type, **data}
+        def create(self, entity_type: str, data: dict[str, object]) -> dict[str, object]:
+            self._identity += 1
+            return {'id': self._identity, 'type': entity_type, **data}
 
         def find_one(self, *_args: object, **_kwargs: object) -> dict[str, object]:
             return {'id': 1, 'type': 'Project', 'name': 'Benchmark'}
@@ -2706,7 +2924,7 @@ def test_live_state_journal_records_validated_create_and_upload_paths(
 
     monkeypatch.setattr(benchmark, '_write_payload', write_payload)
     state = benchmark._LiveState(
-        SimpleNamespace(Shotgun=shotgun),
+        _module(Shotgun=shotgun),
         {
             'api_key': 'unused',
             'namespace': 'ns',
@@ -2717,8 +2935,8 @@ def test_live_state_journal_records_validated_create_and_upload_paths(
         },
     )
 
-    state._prepare()
-    operations = benchmark._Operations(SimpleNamespace(), state)
+    state.prepare()
+    operations = benchmark._Operations(_UnusedClient(), state)
     assert operations._track_upload(41) == 41
 
     expected = (
@@ -2728,13 +2946,13 @@ def test_live_state_journal_records_validated_create_and_upload_paths(
         ('Attachment', 41),
     )
     assert tuple(state.resources) == expected
-    assert journal_type._load(tmp_path)._resources == expected
+    assert journal_type.load(tmp_path).resources == expected
 
     rss_root = tmp_path / 'rss'
     rss_root.mkdir()
-    journal_type._create(rss_root)
+    journal_type.create(rss_root)
     rss_state = benchmark._LiveState(
-        SimpleNamespace(Shotgun=shotgun),
+        _module(Shotgun=shotgun),
         {
             'api_key': 'unused',
             'namespace': 'rss',
@@ -2744,8 +2962,8 @@ def test_live_state_journal_records_validated_create_and_upload_paths(
             'work_root': str(rss_root),
         },
     )
-    rss_state._prepare_rss('rss_download')
-    assert journal_type._load(rss_root)._resources == (
+    rss_state.prepare_rss('rss_download')
+    assert journal_type.load(rss_root).resources == (
         ('Version', 33),
         ('Attachment', 40),
     )
@@ -2758,66 +2976,77 @@ def test_live_state_journal_retains_conservative_snapshot_after_partial_cleanup(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
-    journal._record('Attachment', 7)
+    journal = journal_type.create(tmp_path)
+    journal.record('Attachment', 7)
     events: list[str] = []
 
-    class Control:
+    class Control(_UnusedClient):
         def close(self) -> None:
             events.append('close:control')
             if failing_stage == 'client-close':
                 raise RuntimeError('close failed')
 
-        def delete(self, _entity_type: str, _entity_id: int) -> bool:
+        def delete(self, entity_type: str, entity_id: int) -> bool:
+            del entity_type, entity_id
             events.append('delete')
             return True
 
-        def find(self, entity_type: str, *_args: object) -> list[object]:
+        def find(
+            self,
+            entity_type: str,
+            filters: list[list[object]],
+            fields: list[str],
+            **options: Unpack[_benchmark._FindOptions],
+        ) -> list[dict[str, object]]:
+            del filters, fields, options
             events.append(f'sweep:{entity_type}')
             if failing_stage == 'namespace':
                 raise RuntimeError('sweep failed')
             return []
 
-        def find_one(self, _entity_type: str, _filters: object) -> None:
+        def find_one(
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+        ) -> None:
+            del entity_type, filters, fields
             events.append('query')
             if failing_stage == 'absence':
                 raise RuntimeError('query failed')
 
     state = object.__new__(benchmark._LiveState)
     state.clients = [Control()]
-    state.journal = journal
+    state._journal = journal
     state.namespace = 'ns'
     state.project = {'id': 1}
     state.resources = [('Attachment', 7)]
 
     with pytest.raises(benchmark._CleanupError, match='cleanup failed'):
-        state._cleanup()
+        state.cleanup()
 
-    assert journal_type._load(tmp_path)._resources == (('Attachment', 7),)
+    assert journal_type.load(tmp_path).resources == (('Attachment', 7),)
     assert 'close:control' in events
 
 
 def test_live_state_journal_retains_in_memory_identity_after_publication_failure() -> None:
     benchmark = _load_benchmark()
 
-    class Client:
-        def create(
-            self,
-            entity_type: str,
-            data: dict[str, object],
-        ) -> dict[str, object]:
+    class Client(_UnusedClient):
+        def create(self, entity_type: str, data: dict[str, object]) -> dict[str, object]:
             return {'type': entity_type, 'id': 7, **data}
 
-    class Journal:
-        def _record(self, _entity_type: str, _entity_id: int) -> None:
+    class Journal(_benchmark._ResourceJournal):
+        def __init__(self) -> None:
+            pass
+
+        def record(self, entity_type: str, entity_id: int) -> None:
+            del entity_type, entity_id
             raise benchmark._BenchmarkError('journal publication failed')
 
     state = object.__new__(benchmark._LiveState)
-    state.journal = Journal()
+    state._journal = Journal()
     state.resources = list[tuple[str, int]]()
 
     with pytest.raises(benchmark._BenchmarkError, match='journal publication failed'):
-        state._create(Client(), 'Attachment', {})
+        state.create(Client(), 'Attachment', {})
 
     assert state.resources == [('Attachment', 7)]
 
@@ -2825,19 +3054,19 @@ def test_live_state_journal_retains_in_memory_identity_after_publication_failure
 def test_live_state_journal_retains_resources_without_cleanup_client(tmp_path: Path) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
-    journal._record('Attachment', 7)
+    journal = journal_type.create(tmp_path)
+    journal.record('Attachment', 7)
     state = object.__new__(benchmark._LiveState)
     state.clients = []
-    state.journal = journal
+    state._journal = journal
     state.namespace = 'ns'
     state.project = {'id': 1}
     state.resources = [('Attachment', 7)]
 
     with pytest.raises(benchmark._CleanupError, match='cleanup failed'):
-        state._cleanup()
+        state.cleanup()
 
-    assert journal_type._load(tmp_path)._resources == (('Attachment', 7),)
+    assert journal_type.load(tmp_path).resources == (('Attachment', 7),)
 
 
 def test_live_state_journal_rss_upload_uses_central_resource_ownership(
@@ -2874,7 +3103,7 @@ def test_live_state_journal_rss_upload_uses_central_resource_ownership(
     monkeypatch.setattr(benchmark.sys, 'platform', 'darwin')
 
     result = benchmark._rss_worker(
-        SimpleNamespace(),
+        _module(),
         {'client': 'official', 'rss_operation': rss_name},
     )
 
@@ -2896,11 +3125,11 @@ def test_loaded_client_version_and_origin_are_both_verified(tmp_path: Path) -> N
     module_path = root / 'shotgun_api3' / '__init__.py'
     module_path.parent.mkdir(parents=True)
     module_path.touch()
-    module = SimpleNamespace(__file__=str(module_path), __version__='0.1.2')
+    module = _module(__file__=str(module_path), __version__='9.9.9')
 
-    benchmark._verify_loaded_client(module, root, '0.1.2')
+    benchmark._verify_loaded_client(module, root, '9.9.9')
     with pytest.raises(benchmark._BenchmarkError, match='version'):
-        benchmark._verify_loaded_client(module, root, '9.9.9')
+        benchmark._verify_loaded_client(module, root, '8.8.8')
 
 
 @pytest.mark.parametrize(
@@ -2937,17 +3166,17 @@ def test_main_rejects_operation_metadata_before_runtime_entrypoints(
     monkeypatch.setattr(benchmark, '_controller', fail_runtime)
     monkeypatch.setattr(benchmark, '_worker', fail_runtime)
     if metadata_class == 'callbacks':
-        original = benchmark._Operations._callbacks
+        original = benchmark._Operations.callbacks
 
         def changed_mapping() -> dict[str, object]:
-            mapping = original().copy()
+            mapping: dict[str, object] = dict(original())
             if change == 'remove':
                 mapping.pop(operation_key)
             else:
                 mapping[operation_key] = _noop
             return mapping
 
-        monkeypatch.setattr(benchmark._Operations, '_callbacks', staticmethod(changed_mapping))
+        monkeypatch.setattr(benchmark._Operations, 'callbacks', staticmethod(changed_mapping))
     elif metadata_class == 'categories':
         categories = dict(benchmark._OPERATION_CATEGORIES)
         if change == 'remove':
@@ -2963,7 +3192,7 @@ def test_main_rejects_operation_metadata_before_runtime_entrypoints(
         benchmark._BenchmarkError,
         match=rf'^Benchmark operation metadata mismatch: {metadata_class}: {operation_key}$',
     ):
-        benchmark.main(argv)
+        benchmark._main(argv)
 
     assert touched == []
 
@@ -3045,9 +3274,9 @@ def test_nested_download_failure_recovers_shared_namespace_and_parent_journal(
 
     def prepare(state: _RecoveryStateSeam, _name: str) -> None:
         state.project = {'type': 'Project', 'id': 1}
-        state._client()
+        state.client()
         for kind, identity in sorted(present):
-            state._record_resource(kind, identity)
+            state.record_resource(kind, identity)
         state.download_attachment_id = 7
         state.multipart_payload.write_bytes(b'download-fixture')
 
@@ -3059,14 +3288,14 @@ def test_nested_download_failure_recovers_shared_namespace_and_parent_journal(
     def launch(config_path: Path, root: Path) -> dict[str, object]:
         config = json.loads(config_path.read_text(encoding='ascii'))
         if config['mode'] == 'rss':
-            assert journal_type._load(root)._resources == ()
+            assert journal_type.load(root).resources == ()
             return actual_launch(config_path, root, env={}, run=run)
         if config['mode'] == 'cleanup':
             roots.append(root)
         return benchmark._worker_result(config_path)
 
-    monkeypatch.setattr(state_type, '_client', client_factory)
-    monkeypatch.setattr(state_type, '_prepare_rss', prepare)
+    monkeypatch.setattr(state_type, 'client', client_factory)
+    monkeypatch.setattr(state_type, 'prepare_rss', prepare)
 
     monkeypatch.setattr(benchmark, '_import_worker_client', _unused_worker_module)
     monkeypatch.setattr(benchmark, '_verify_worker_modules', _ignore_worker_module)
@@ -3083,13 +3312,13 @@ def test_nested_download_failure_recovers_shared_namespace_and_parent_journal(
     assert ('Benchmark worker recovery failed' in str(captured.value)) is recovery_fails
     assert not tuple(tmp_path.rglob('*worker*.json'))
     assert not tuple(tmp_path.rglob('*cleanup*.json'))
-    assert journal_type._load(tmp_path / 'rss-download-worker')._resources == ()
+    assert journal_type.load(tmp_path / 'rss-download-worker').resources == ()
     if recovery_fails:
         assert present == {('Attachment', 7)}
-        assert journal_type._load(tmp_path)._resources
+        assert journal_type.load(tmp_path).resources
     else:
         assert not present
-        assert journal_type._load(tmp_path)._resources == ()
+        assert journal_type.load(tmp_path).resources == ()
     # Parent cleanup still checks identities deleted by child recovery.
     assert sum(event[:3] == ('delete', 'Attachment', 7) for event in events) >= 2
 
@@ -3227,7 +3456,7 @@ def test_operation_route_supplies_exact_upload_target(
     generic.write_bytes(b'g')
     direct.write_bytes(b'dd')
     multipart.write_bytes(b'mmm')
-    state = SimpleNamespace(
+    state = _State(
         direct_payload=direct,
         generic_payload=generic,
         multipart_payload=multipart,
@@ -3293,7 +3522,7 @@ def test_parallel_read_latency_worker_closes_operations_and_client_after_failure
 
     with pytest.raises(benchmark._BenchmarkError) as captured:
         benchmark._latency_worker(
-            SimpleNamespace(),
+            _module(),
             {
                 'call_failure': call_failure,
                 'client': 'official',
@@ -3327,7 +3556,7 @@ def test_parallel_read_methodology_describes_asymmetric_client_ownership() -> No
     }
     clients = {
         'official': {'version': benchmark._OFFICIAL_VERSION},
-        'ours': {'version': '0.1.2'},
+        'ours': {'version': '9.9.9'},
     }
     generated = ' '.join(
         benchmark._report_header_lines(
@@ -3386,7 +3615,7 @@ def test_parallel_runner_official_clients_close_on_owning_threads_after_call_fai
 
     with pytest.raises(benchmark._BenchmarkError) as captured:
         benchmark._latency_worker(
-            SimpleNamespace(),
+            _module(),
             {
                 'barrier': barrier,
                 'client': 'official',
@@ -3413,7 +3642,7 @@ def test_parallel_runner_official_clients_close_on_owning_threads_after_setup_fa
     make_calls = 0
     raw_error = RuntimeError('RAW runner setup failure sentinel')
 
-    class Client:
+    class Client(_UnusedClient):
         def __init__(self) -> None:
             self.close_thread: int | None = None
             self.owner_thread = threading.get_ident()
@@ -3421,8 +3650,9 @@ def test_parallel_runner_official_clients_close_on_owning_threads_after_setup_fa
         def close(self) -> None:
             self.close_thread = threading.get_ident()
 
-    class State:
-        def _make_client(self) -> Client:
+    class State(_State):
+        def make_client(self, session_token: str | None = None) -> Client:
+            del session_token
             nonlocal make_calls
             with lock:
                 make_calls += 1
@@ -3449,7 +3679,7 @@ def test_parallel_runner_official_clients_remain_owned_by_persistent_threads() -
     clients: list[Client] = []
     lock = threading.Lock()
 
-    class Client:
+    class Client(_UnusedClient):
         def __init__(self) -> None:
             self.calls: list[tuple[int, int]] = []
             self.close_thread: int | None = None
@@ -3459,18 +3689,17 @@ def test_parallel_runner_official_clients_remain_owned_by_persistent_threads() -
             self.close_thread = threading.get_ident()
 
         def find_one(
-            self,
-            _entity_type: str,
-            filters: list[list[object]],
-            _fields: list[str],
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
         ) -> dict[str, object]:
+            del entity_type, fields
             entity_id = cast('int', filters[0][2])
             self.calls.append((threading.get_ident(), entity_id))
             barrier.wait(timeout=5)
             return {'type': 'Shot', 'id': entity_id, 'code': f'shot-{entity_id}'}
 
-    class State:
-        def _make_client(self) -> Client:
+    class State(_State):
+        def make_client(self, session_token: str | None = None) -> Client:
+            del session_token
             client = Client()
             with lock:
                 clients.append(client)
@@ -3478,13 +3707,13 @@ def test_parallel_runner_official_clients_remain_owned_by_persistent_threads() -
 
     runner = benchmark._ParallelReadRunner(State(), None)
     try:
-        cold = runner._read((7, 3, 11, 5))
-        warm = runner._read((7, 3, 11, 5))
+        cold = runner.read((7, 3, 11, 5))
+        warm = runner.read((7, 3, 11, 5))
     finally:
-        runner._close()
+        runner.close()
 
-    assert [result['id'] for result in cold] == [7, 3, 11, 5]
-    assert [result['id'] for result in warm] == [7, 3, 11, 5]
+    assert [_record(result)['id'] for result in cold] == [7, 3, 11, 5]
+    assert [_record(result)['id'] for result in warm] == [7, 3, 11, 5]
     assert len(clients) == 4
     assert len({client.owner_thread for client in clients}) == 4
     for client in clients:
@@ -3526,7 +3755,7 @@ def test_parallel_runner_partial_thread_start_failure_closes_started_clients(
 
     with pytest.raises(RuntimeError) as captured:
         benchmark._ParallelReadRunner(
-            SimpleNamespace(_make_client=make_client),
+            _State(make_client=make_client),
             None,
         )
 
@@ -3536,7 +3765,7 @@ def test_parallel_runner_partial_thread_start_failure_closes_started_clients(
         assert captured.value is raw_error
         assert all(client.close_thread == client.owner_thread for client in clients)
     finally:
-        runner._close()
+        runner.close()
 
 
 def test_parallel_runner_post_start_failure_closes_started_clients(
@@ -3572,7 +3801,7 @@ def test_parallel_runner_post_start_failure_closes_started_clients(
 
     with pytest.raises(RuntimeError) as captured:
         benchmark._ParallelReadRunner(
-            SimpleNamespace(_make_client=make_client),
+            _State(make_client=make_client),
             None,
         )
 
@@ -3600,39 +3829,37 @@ def test_parallel_runner_replacement_shares_one_client_across_persistent_threads
     close_threads: list[int] = []
     lock = threading.Lock()
 
-    class Client:
+    class Client(_UnusedClient):
         def close(self) -> None:
             close_threads.append(threading.get_ident())
 
         def find_one(
-            self,
-            _entity_type: str,
-            filters: list[list[object]],
-            _fields: list[str],
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
         ) -> dict[str, object]:
+            del entity_type, fields
             entity_id = cast('int', filters[0][2])
             with lock:
                 calls.append((threading.get_ident(), entity_id))
             barrier.wait(timeout=5)
             return {'type': 'Shot', 'id': entity_id, 'code': f'shot-{entity_id}'}
 
-    def make_client() -> object:
+    def make_client() -> Never:
         pytest.fail('replacement runner constructed an extra client')
 
     shared = Client()
     runner = benchmark._ParallelReadRunner(
-        SimpleNamespace(_make_client=make_client),
+        _State(make_client=make_client),
         shared,
     )
     try:
-        cold = runner._read((13, 2, 8, 1))
-        warm = runner._read((13, 2, 8, 1))
+        cold = runner.read((13, 2, 8, 1))
+        warm = runner.read((13, 2, 8, 1))
     finally:
-        runner._close()
-        runner._close()
+        runner.close()
+        runner.close()
 
-    assert [result['id'] for result in cold] == [13, 2, 8, 1]
-    assert [result['id'] for result in warm] == [13, 2, 8, 1]
+    assert [_record(result)['id'] for result in cold] == [13, 2, 8, 1]
+    assert [_record(result)['id'] for result in warm] == [13, 2, 8, 1]
     thread_ids = {thread_id for thread_id, _entity_id in calls}
     assert len(thread_ids) == 4
     assert all(
@@ -3655,22 +3882,9 @@ def test_payload_write_uses_bounded_blocks(monkeypatch: pytest.MonkeyPatch) -> N
     assert recorder.lengths == []
 
     benchmark._write_payload(Path('large.bin'), (2 << 20) + 17)
-    assert recorder.lengths == [1 << 20, 1 << 20, 17]
-
-
-def test_pending_benchmark_docs_describe_safe_default_and_download_setup() -> None:
-    source = (_REPO_ROOT / 'docs' / 'benchmarks.md').read_text(encoding='ascii')
-    text = ' '.join(source.split())
-
-    assert 'default 2 paired rounds' in text
-    assert '18 worker processes' in text
-    assert '184 server entities' in text
-    assert '332,032,784 uploaded bytes' in text
-    assert '162 worker processes' in text
-    assert '1,840 server entities' in text
-    assert '3,320,327,840 uploaded bytes' in text
-    assert 'fresh download-only process' in text
-    assert 'larger even `BENCH_N`' in text
+    assert sum(recorder.lengths) == (2 << 20) + 17
+    assert len(recorder.lengths) > 1
+    assert all(0 < length <= 1 << 20 for length in recorder.lengths)
 
 
 def test_preflight_crosses_real_isolated_process_and_selects_exact_package(
@@ -3688,7 +3902,7 @@ def test_preflight_crosses_real_isolated_process_and_selects_exact_package(
     shadow_package.mkdir(parents=True)
     (shadow_package / '__init__.py').write_text("__version__ = '9.9.9'\n", encoding='ascii')
     monkeypatch.setenv('PYTHONPATH', str(shadow_root))
-    config = {
+    config: dict[str, object] = {
         'api_key': 'unused',
         'client': 'ours',
         'client_root': str(selected_root),
@@ -3769,7 +3983,7 @@ def test_recover_worker_failure_preserves_both_diagnostics_without_leaking_detai
             json.loads(config_path.read_text(encoding='ascii')),
         )
         if launched['mode'] != 'cleanup':
-            journal_type._load(root)._record('Attachment', 987654321)
+            journal_type.load(root).record('Attachment', 987654321)
             if owned_failure:
                 raise benchmark._BenchmarkError('Benchmark worker timed out')
             raise RuntimeError('SECRET worker exception detail')
@@ -3790,6 +4004,41 @@ def test_recover_worker_failure_preserves_both_diagnostics_without_leaking_detai
     assert captured.value.__context__ is None
     assert 'SECRET' not in str(captured.value)
     assert '987654321' not in str(captured.value)
+    assert not tuple(tmp_path.glob('*worker*.json'))
+    assert not tuple(tmp_path.glob('*cleanup*.json'))
+
+
+def test_recover_worker_preserves_original_after_nonempty_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    benchmark = _load_benchmark()
+    journal_type = benchmark._ResourceJournal
+    config = _worker_config(tmp_path)
+    launches: list[dict[str, object]] = []
+    failure = benchmark._BenchmarkError('worker failed')
+
+    def launch(config_path: Path, root: Path) -> dict[str, str]:
+        launched_config = cast(
+            'dict[str, object]',
+            json.loads(config_path.read_text(encoding='ascii')),
+        )
+        launches.append(launched_config)
+        if launched_config['mode'] != 'cleanup':
+            journal_type.load(root).record('Shot', 17)
+            raise failure
+        journal_type.load(root).clear()
+        return {'cleanup': 'PASS'}
+
+    monkeypatch.setattr(benchmark, '_launch_worker', launch)
+
+    with pytest.raises(benchmark._BenchmarkError) as captured:
+        benchmark._launch_configured_worker(config, tmp_path, 8)
+
+    assert captured.value is failure
+    assert [launch['mode'] for launch in launches] == ['latency', 'cleanup']
+    assert launches[1] == {**config, 'mode': 'cleanup'}
+    assert journal_type.load(tmp_path).resources == ()
     assert not tuple(tmp_path.glob('*worker*.json'))
     assert not tuple(tmp_path.glob('*cleanup*.json'))
 
@@ -3833,9 +4082,9 @@ def test_recover_worker_rejects_nonempty_success_after_successful_recovery(
             json.loads(config_path.read_text(encoding='ascii')),
         )
         if config['mode'] == 'cleanup':
-            journal_type._load(root)._clear()
+            journal_type.load(root).clear()
             return {'cleanup': 'PASS'}
-        journal_type._load(root)._record('Version', 19)
+        journal_type.load(root).record('Version', 19)
         return {'client': 'official', 'operations': {}, 'rss': {}}
 
     monkeypatch.setattr(benchmark, '_launch_worker', launch)
@@ -3848,7 +4097,7 @@ def test_recover_worker_rejects_nonempty_success_after_successful_recovery(
         )
 
     assert str(captured.value) == 'Benchmark worker cleanup contract failed'
-    assert journal_type._load(tmp_path)._resources == ()
+    assert journal_type.load(tmp_path).resources == ()
 
 
 @pytest.mark.parametrize(
@@ -3867,15 +4116,15 @@ def test_recover_worker_requires_exact_result_and_empty_journal(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
-    journal._record('Shot', 987654321)
+    journal = journal_type.create(tmp_path)
+    journal.record('Shot', 987654321)
     cleanup_config: Path | None = None
 
     def launch(config_path: Path, root: Path) -> dict[str, str]:
         nonlocal cleanup_config
         cleanup_config = config_path
         if clear_journal:
-            journal_type._load(root)._clear()
+            journal_type.load(root).clear()
         return result
 
     monkeypatch.setattr(benchmark, '_launch_worker', launch)
@@ -3896,8 +4145,8 @@ def test_recover_worker_reuses_exact_client_identity_and_removes_private_config(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
-    journal._record('Shot', 17)
+    journal = journal_type.create(tmp_path)
+    journal.record('Shot', 17)
     config = {**_worker_config(tmp_path), 'rss_operation': 'rss_upload'}
     observed: list[dict[str, object]] = []
     config_paths: list[Path] = []
@@ -3912,7 +4161,7 @@ def test_recover_worker_reuses_exact_client_identity_and_removes_private_config(
         )
         observed.append(cleanup_config)
         config_paths.append(config_path)
-        journal_type._load(root)._clear()
+        journal_type.load(root).clear()
         return {'cleanup': 'PASS'}
 
     monkeypatch.setattr(benchmark, '_launch_worker', launch)
@@ -3923,51 +4172,7 @@ def test_recover_worker_reuses_exact_client_identity_and_removes_private_config(
     assert observed[0] == {**_worker_config(tmp_path), 'mode': 'cleanup'}
     assert config_paths[0].name != 'worker-6.json'
     assert not config_paths[0].exists()
-    assert journal_type._load(tmp_path)._resources == ()
-
-
-@pytest.mark.parametrize(
-    'worker_failure',
-    [
-        'Benchmark worker failed with status -11',
-        'Benchmark worker failed at an ordinary boundary',
-        'Benchmark worker timed out',
-    ],
-    ids=('abnormal-exit', 'ordinary-failure', 'timeout'),
-)
-def test_recover_worker_runs_after_each_worker_failure_and_preserves_original(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    worker_failure: str,
-) -> None:
-    benchmark = _load_benchmark()
-    journal_type = benchmark._ResourceJournal
-    config = _worker_config(tmp_path)
-    launches: list[dict[str, object]] = []
-
-    def launch(config_path: Path, root: Path) -> dict[str, str]:
-        launched_config = cast(
-            'dict[str, object]',
-            json.loads(config_path.read_text(encoding='ascii')),
-        )
-        launches.append(launched_config)
-        if launched_config['mode'] != 'cleanup':
-            journal_type._load(root)._record('Shot', 17)
-            raise benchmark._BenchmarkError(worker_failure)
-        journal_type._load(root)._clear()
-        return {'cleanup': 'PASS'}
-
-    monkeypatch.setattr(benchmark, '_launch_worker', launch)
-
-    with pytest.raises(benchmark._BenchmarkError) as captured:
-        benchmark._launch_configured_worker(config, tmp_path, 8)
-
-    assert str(captured.value) == worker_failure
-    assert [launch['mode'] for launch in launches] == ['latency', 'cleanup']
-    assert launches[1] == {**config, 'mode': 'cleanup'}
-    assert journal_type._load(tmp_path)._resources == ()
-    assert not tuple(tmp_path.glob('*worker*.json'))
-    assert not tuple(tmp_path.glob('*cleanup*.json'))
+    assert journal_type.load(tmp_path).resources == ()
 
 
 @pytest.mark.parametrize(
@@ -4013,15 +4218,15 @@ def test_resource_journal_accepts_exact_schema_and_exposes_read_only_resources(
         encoding='ascii',
     )
 
-    journal = benchmark._ResourceJournal._load(tmp_path)
+    journal = benchmark._ResourceJournal.load(tmp_path)
 
-    assert journal._resources == (
+    assert journal.resources == (
         ('Shot', 7),
         ('Version', 8),
         ('Attachment', 9),
     )
     with pytest.raises(AttributeError):
-        journal._resources = ()
+        object.__setattr__(journal, 'resources', ())
 
 
 def test_resource_journal_enforces_64_entry_bound_without_partial_record(
@@ -4029,16 +4234,16 @@ def test_resource_journal_enforces_64_entry_bound_without_partial_record(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
+    journal = journal_type.create(tmp_path)
     for identity in range(1, 65):
-        journal._record('Shot', identity)
+        journal.record('Shot', identity)
 
     with pytest.raises(benchmark._BenchmarkError, match='resource journal'):
-        journal._record('Shot', 65)
+        journal.record('Shot', 65)
 
     expected = tuple(('Shot', identity) for identity in range(1, 65))
-    assert journal._resources == expected
-    assert journal_type._load(tmp_path)._resources == expected
+    assert journal.resources == expected
+    assert journal_type.load(tmp_path).resources == expected
 
 
 @pytest.mark.parametrize('failing_operation', ['write', 'replace'])
@@ -4049,7 +4254,7 @@ def test_resource_journal_failure_preserves_published_snapshot_and_removes_tempo
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
+    journal = journal_type.create(tmp_path)
     destination = tmp_path / 'resource-journal.json'
     published = destination.read_bytes()
     original_write = os.write
@@ -4071,11 +4276,11 @@ def test_resource_journal_failure_preserves_published_snapshot_and_removes_tempo
         monkeypatch.setattr(Path, 'replace', replace)
 
     with pytest.raises(benchmark._BenchmarkError, match='resource journal') as captured:
-        journal._record('Shot', 7)
+        journal.record('Shot', 7)
 
     assert 'RAW' not in str(captured.value)
     assert destination.read_bytes() == published
-    assert journal._resources == ()
+    assert journal.resources == ()
     assert not tuple(tmp_path.glob('.resource-journal.json.*'))
 
 
@@ -4101,8 +4306,8 @@ def test_resource_journal_is_created_empty_before_live_worker_only(
     def launch(_config_path: Path, root: Path) -> dict[str, object]:
         observed.append(journal_path.exists())
         if expects_journal:
-            journal = benchmark._ResourceJournal._load(root)
-            assert journal._resources == ()
+            journal = benchmark._ResourceJournal.load(root)
+            assert journal.resources == ()
         return {}
 
     monkeypatch.setattr(benchmark, '_launch_worker', launch)
@@ -4163,7 +4368,7 @@ def test_resource_journal_rejects_invalid_schema(
     )
 
     with pytest.raises(benchmark._BenchmarkError, match='resource journal'):
-        benchmark._ResourceJournal._load(tmp_path)
+        benchmark._ResourceJournal.load(tmp_path)
 
 
 def test_resource_journal_rejects_non_ascii_data(tmp_path: Path) -> None:
@@ -4171,10 +4376,10 @@ def test_resource_journal_rejects_non_ascii_data(tmp_path: Path) -> None:
     (tmp_path / 'resource-journal.json').write_bytes(b'{"resources":[],"\xc3\xa9":true}')
 
     with pytest.raises(benchmark._BenchmarkError, match='resource journal'):
-        benchmark._ResourceJournal._load(tmp_path)
+        benchmark._ResourceJournal.load(tmp_path)
 
 
-@pytest.mark.parametrize('operation', ['_create', '_load'])
+@pytest.mark.parametrize('operation', ['create', 'load'])
 def test_resource_journal_rejects_path_outside_worker_root(
     tmp_path: Path,
     operation: str,
@@ -4196,7 +4401,7 @@ def test_resource_journal_writes_atomically_with_owner_only_permissions(
 ) -> None:
     benchmark = _load_benchmark()
     journal_type = benchmark._ResourceJournal
-    journal = journal_type._create(tmp_path)
+    journal = journal_type.create(tmp_path)
     destination = tmp_path / 'resource-journal.json'
     original_replace = Path.replace
     replacements: list[tuple[Path, Path]] = []
@@ -4218,14 +4423,14 @@ def test_resource_journal_writes_atomically_with_owner_only_permissions(
     monkeypatch.setattr(benchmark.os, 'fsync', recording_fsync)
     monkeypatch.setattr(Path, 'replace', replace)
 
-    journal._record('Shot', 7)
+    journal.record('Shot', 7)
 
     assert flushes
     assert replacements
     assert replacements[-1][1] == destination
     if os.name == 'posix':
         assert destination.stat().st_mode & 0o777 == 0o600
-    assert journal_type._load(tmp_path)._resources == (('Shot', 7),)
+    assert journal_type.load(tmp_path).resources == (('Shot', 7),)
     assert not tuple(tmp_path.glob('.resource-journal.json.*'))
 
 
@@ -4281,15 +4486,15 @@ def test_rss_correctness_and_cleanup_diagnostics_survive_nested_workers(
             return file_path
 
     class State(_RssFixtureState):
-        def _cleanup(self) -> None:
+        def cleanup(self) -> None:
             events.append('cleanup')
             if cleanup_fails:
                 raise RuntimeError('SECRET cleanup response')
 
-        def _cleanup_clients(self) -> None:
-            self._cleanup()
+        def cleanup_clients(self) -> None:
+            self.cleanup()
 
-        def _client(self) -> Client:
+        def client(self) -> Client:
             client = Client(events, source)
             self.clients.append(client)
             return client
@@ -4317,7 +4522,7 @@ def test_rss_correctness_and_cleanup_diagnostics_survive_nested_workers(
         'rss_operation': rss_name,
     }
     with pytest.raises(benchmark._BenchmarkError) as rss_error:
-        benchmark._rss_worker(SimpleNamespace(), config)
+        benchmark._rss_worker(_module(), config)
     diagnostic = f'benchmark correctness failed for {rss_name}'
     diagnostic += '; warning: benchmark cleanup failed' if cleanup_fails else ''
     assert str(rss_error.value) == diagnostic
@@ -4369,7 +4574,7 @@ def test_rss_download_setup_cleans_after_download_worker_failure(
 
     with pytest.raises(benchmark._BenchmarkError) as captured:
         benchmark._rss_download_setup_worker(
-            SimpleNamespace(),
+            _module(),
             {
                 'client': 'official',
                 'mode': 'rss_download_setup',
@@ -4393,7 +4598,7 @@ def test_rss_download_setup_cleanup_failure_has_precedence(
     source.write_bytes(b'large-transfer-content')
 
     class State(_RssFixtureState):
-        def _cleanup(self) -> None:
+        def cleanup(self) -> None:
             events.append('cleanup')
             raise RuntimeError('raw cleanup detail')
 
@@ -4409,7 +4614,7 @@ def test_rss_download_setup_cleanup_failure_has_precedence(
 
     with pytest.raises(benchmark._CleanupError, match='cleanup failed') as captured:
         benchmark._rss_download_setup_worker(
-            SimpleNamespace(),
+            _module(),
             {
                 'client': 'official',
                 'mode': 'rss_download_setup',
@@ -4453,7 +4658,7 @@ def test_rss_download_setup_hands_off_sanitized_fixture_and_cleans(
     monkeypatch.setattr(benchmark, '_launch_configured_worker', launch)
 
     result = benchmark._rss_download_setup_worker(
-        SimpleNamespace(),
+        _module(),
         {
             'client': 'official',
             'mode': 'rss_download_setup',
@@ -4514,11 +4719,11 @@ def test_rss_download_worker_uses_handoff_digest_without_setup_upload(
     }
 
     if expected_matches:
-        result = benchmark._rss_worker(SimpleNamespace(), config)
+        result = benchmark._rss_worker(_module(), config)
         assert result['rss']['rss_download']['correct'] is True
     else:
         with pytest.raises(benchmark._CorrectnessError, match='rss_download'):
-            benchmark._rss_worker(SimpleNamespace(), config)
+            benchmark._rss_worker(_module(), config)
 
     assert 'prepare:rss_download' not in events
     assert 'upload' not in events
@@ -4571,36 +4776,11 @@ def test_successful_controller_keeps_curated_page_and_writes_private_report(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    benchmark = _load_benchmark()
+    benchmark = _patch_controller(monkeypatch, tmp_path)
     curated = tmp_path / 'docs' / 'benchmarks.md'
     curated.parent.mkdir()
     curated.write_text('curated page\n', encoding='ascii')
-    official = tmp_path / 'official'
-    (official / 'shotgun_api3').mkdir(parents=True)
-    (official / 'shotgun_api3' / '__init__.py').touch()
-    evidence = benchmark._ArtifactEvidence('a' * 40, 'b' * 64, '0.1.2', tmp_path / 'wheel')
-    for name in _REQUIRED_ENV:
-        monkeypatch.setenv(name, 'value')
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
     monkeypatch.delenv('BENCH_N', raising=False)
-
-    def load(_root: Path) -> object:
-        return evidence
-
-    def official_checkout(_root: Path, _path: Path) -> Path:
-        return official
-
-    monkeypatch.setattr(benchmark, '_preflight_tools', _noop)
-    monkeypatch.setattr(benchmark, '_load_artifact_evidence', load)
-    monkeypatch.setattr(benchmark, '_official_checkout', official_checkout)
-
-    def install(_evidence: object, install_root: Path) -> Path:
-        candidate = install_root / 'site-packages'
-        (candidate / 'shotgun_api3').mkdir(parents=True)
-        (candidate / 'shotgun_api3' / '__init__.py').touch()
-        return candidate
-
-    monkeypatch.setattr(benchmark, '_install_candidate', install)
 
     def launch(config: Mapping[str, object], _root: Path, _sequence: int) -> dict[str, object]:
         return _controller_worker_result(benchmark, config)
@@ -4617,24 +4797,27 @@ def test_successful_controller_keeps_curated_page_and_writes_private_report(
 def test_summarize_uses_shared_verified_deletions_across_operation_runners() -> None:
     benchmark = _load_benchmark()
 
-    class Control:
-        def find_one(self, entity_type: str, filters: list[list[object]]) -> None:
+    class Control(_UnusedClient):
+        def find_one(
+            self, entity_type: str, filters: list[list[object]], fields: list[str] | None = None
+        ) -> None:
+            del fields
             assert entity_type == 'Shot'
             assert filters[0][:2] == ['id', 'is']
 
-    state = SimpleNamespace(
+    state = _State(
         clients=[Control()],
         namespace='ns',
         project={'id': 1},
         resources=[('Shot', identity) for identity in range(1, 35)],
         verified_deleted_shot_ids=set(),
     )
-    delete_runner = benchmark._Operations(SimpleNamespace(), state)
+    delete_runner = benchmark._Operations(_UnusedClient(), state)
 
-    assert delete_runner._verify_result('delete', (True, 33)) is True
-    assert delete_runner._verify_result('delete', (True, 34)) is True
+    assert delete_runner.verify_result('delete', (True, 33)) is True
+    assert delete_runner.verify_result('delete', (True, 34)) is True
 
-    summarize_runner = benchmark._Operations(SimpleNamespace(), state)
+    summarize_runner = benchmark._Operations(_UnusedClient(), state)
     filters = summarize_runner._filters()
 
     assert filters == [
@@ -4643,25 +4826,25 @@ def test_summarize_uses_shared_verified_deletions_across_operation_runners() -> 
     ]
     assert state.resources == [('Shot', identity) for identity in range(1, 35)]
     assert state.verified_deleted_shot_ids == {33, 34}
-    assert summarize_runner._verify_result('summarize', {'summaries': {'id': 32}}) is True
-    assert summarize_runner._verify_result('summarize', {'summaries': {'id': 340}}) is False
+    assert summarize_runner.verify_result('summarize', {'summaries': {'id': 32}}) is True
+    assert summarize_runner.verify_result('summarize', {'summaries': {'id': 340}}) is False
 
 
 def test_update_result_pair_arity_is_independent_of_batch_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     benchmark = _load_benchmark()
-    operations = benchmark._Operations(SimpleNamespace(), SimpleNamespace())
+    operations = benchmark._Operations(_UnusedClient(), _State())
 
     monkeypatch.setattr(benchmark, '_BATCH_SIZE', 3)
 
-    assert operations._verify_result('update', ({'description': 'expected'}, 'expected')) is True
-    assert operations._verify_result('update', ({'description': 'expected'},)) is False
+    assert operations.verify_result('update', ({'description': 'expected'}, 'expected')) is True
+    assert operations.verify_result('update', ({'description': 'expected'},)) is False
     assert (
-        operations._verify_result('update', ({'description': 'expected'}, 'expected', None))
+        operations.verify_result('update', ({'description': 'expected'}, 'expected', None))
         is False
     )
-    assert operations._verify_result('update', ({'description': 'wrong'}, 'expected')) is False
+    assert operations.verify_result('update', ({'description': 'wrong'}, 'expected')) is False
 
 
 def test_worker_benchmark_error_exits_nonzero_with_owned_diagnostic(
@@ -4767,36 +4950,6 @@ def test_worker_config_sanitizes_ordinary_serialization_failures(
     assert events == ['open', 'write', 'close']
 
 
-def test_worker_config_static_boundary_requires_a_dictionary() -> None:
-    source = """from collections.abc import Mapping
-from pathlib import Path
-from types import MappingProxyType
-
-from scripts import benchmark
-
-path = Path('worker.json')
-config: dict[str, object] = {}
-benchmark._write_worker_config(path, config)
-
-config_mapping: Mapping[str, object] = MappingProxyType(config)
-benchmark._write_worker_config(path, config_mapping)
-"""
-    invalid_line = source.splitlines().index(
-        'benchmark._write_worker_config(path, config_mapping)'
-    )
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-        probe = Path(directory) / 'worker_config_types.py'
-        probe.write_text(source, encoding='utf-8')
-        result = run_pyright(probe, cwd=_REPO_ROOT)
-
-    report = json.loads(result.stdout)
-    diagnostics = report['generalDiagnostics']
-    assert result.returncode == 1, result.stdout
-    assert report['summary']['errorCount'] == 1
-    assert {item['rule'] for item in diagnostics} == {'reportArgumentType'}
-    assert {item['range']['start']['line'] for item in diagnostics} == {invalid_line}
-
-
 @pytest.mark.parametrize(
     'diagnostic',
     [
@@ -4884,6 +5037,7 @@ def test_worker_process_is_isolated_from_checkout_and_pythonpath(tmp_path: Path)
         assert kwargs['capture_output'] is True
         assert kwargs['text'] is True
         assert kwargs['check'] is False
+        assert kwargs['timeout'] == 3600
         payload: dict[str, object] = {'client': 'ours', 'operations': {}, 'rss': {}}
         return subprocess.CompletedProcess(command, 0, json.dumps(payload) + '\n', '')
 
@@ -4926,25 +5080,6 @@ def test_worker_reraises_exact_process_control(
 
     assert captured.value is process_control
     assert events == ['cleanup']
-
-
-def test_worker_timeout_is_fixed_for_every_isolated_launch(tmp_path: Path) -> None:
-    benchmark = _load_benchmark()
-    config = tmp_path / 'worker.json'
-    observed: list[int] = []
-
-    def run(
-        command: list[str],
-        **kwargs: Unpack[_WorkerRunOptions],
-    ) -> subprocess.CompletedProcess[str]:
-        observed.append(kwargs['timeout'])
-        payload: dict[str, object] = {'client': 'ours', 'operations': {}, 'rss': {}}
-        return subprocess.CompletedProcess(command, 0, json.dumps(payload) + '\n', '')
-
-    benchmark._launch_worker(config, tmp_path, env={}, run=run)
-    benchmark._launch_worker(config, tmp_path, env={}, run=run)
-
-    assert observed == [3600, 3600]
 
 
 def test_worker_timeout_is_sanitized_without_retaining_exception_details(

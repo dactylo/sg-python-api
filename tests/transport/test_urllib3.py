@@ -1,15 +1,15 @@
+import io
 import socket
 import ssl
 import threading
-import time
 from collections.abc import Iterator
-from typing import Never, Protocol, cast
+from typing import TYPE_CHECKING, Never
 
 import pytest
 import urllib3
+from urllib3.connection import HTTPConnection
 
 from shotgun_api3._transport import (
-    _CURRENT_ABORT,
     ConnectError,
     ProxyError,
     ReadTimeoutError,
@@ -19,23 +19,13 @@ from shotgun_api3._transport import (
     TransportError,
     TransportRequest,
     Urllib3Transport,
-    _AbortHandle,
-    _StartedUrllib3Request,
 )
 from tests._loopback import receive_request
 
+if TYPE_CHECKING:
+    from urllib3._base_connection import BaseHTTPConnection
+
 _ERROR_POOL = urllib3.HTTPConnectionPool('example.test')
-_REQUEST_ID = 'request-1'
-
-
-class _StartRequest(Protocol):
-    def __call__(
-        self,
-        transport: Urllib3Transport,
-        request: TransportRequest,
-        *,
-        preload_content: bool,
-    ) -> _StartedUrllib3Request: ...
 
 
 class _StubResponse:
@@ -66,7 +56,6 @@ def _req(url: str) -> TransportRequest:
         headers={'content-type': 'application/json'},
         body=b'{"method_name": "info", "params": []}',
         timeout=TimeoutConfig(connect=5.0, read=5.0),
-        token=_REQUEST_ID,
     )
 
 
@@ -90,9 +79,8 @@ def _start_request(
     request: TransportRequest,
     *,
     preload_content: bool,
-) -> _StartedUrllib3Request:
-    implementation = cast('_StartRequest', Urllib3Transport._start_request)
-    return implementation(transport, request, preload_content=preload_content)
+) -> urllib3.response.HTTPResponse:
+    return transport._start_request(request, preload_content=preload_content)
 
 
 @pytest.fixture
@@ -122,12 +110,15 @@ def test_certificate_verification_ssl_error_maps_to_tls_error(
 
 
 def test_connection_refused_maps_to_connect_error() -> None:
-    transport = Urllib3Transport()
-    try:
-        with pytest.raises(ConnectError):
-            transport.send(_req('http://127.0.0.1:1'))
-    finally:
-        transport.close()
+    with socket.socket() as closed_port:
+        closed_port.bind(('127.0.0.1', 0))
+        port = closed_port.getsockname()[1]
+        transport = Urllib3Transport()
+        try:
+            with pytest.raises(ConnectError):
+                transport.send(_req(f'http://127.0.0.1:{port}'))
+        finally:
+            transport.close()
 
 
 def test_generic_ssl_error_maps_to_send_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -166,41 +157,6 @@ def test_proxy_scheme_unsupported_maps_to_proxy_error(
         transport.close()
 
 
-@pytest.mark.parametrize('streaming', [False, True])
-def test_send_modes_own_started_handle_lifetime(
-    monkeypatch: pytest.MonkeyPatch,
-    streaming: bool,
-) -> None:
-    transport = Urllib3Transport()
-    registry = transport._abort_registry
-    releases: list[object] = []
-    original_release = registry._release
-    response = _StubResponse()
-
-    def release(handle: _AbortHandle) -> None:
-        releases.append(handle)
-        original_release(handle)
-
-    def return_response(*_args: object, **_kwargs: object) -> object:
-        return response
-
-    monkeypatch.setattr(registry, '_release', release)
-    monkeypatch.setattr(urllib3.PoolManager, 'request', return_response)
-    try:
-        request = _req('https://example.test')
-        if streaming:
-            result = transport.send_streaming(request)
-            assert releases == []
-            result.close()
-            result.close()
-        else:
-            result = transport.send(request)
-
-        assert len(releases) == 1
-    finally:
-        transport.close()
-
-
 def test_send_round_trip(local_server: str) -> None:
     transport = Urllib3Transport()
     try:
@@ -213,20 +169,11 @@ def test_send_round_trip(local_server: str) -> None:
 
 
 @pytest.mark.parametrize('preload_content', [True, False])
-def test_start_request_failure_releases_once_and_resets_context(
+def test_start_request_failure_maps_to_send_error(
     monkeypatch: pytest.MonkeyPatch,
     preload_content: bool,
 ) -> None:
     transport = Urllib3Transport()
-    registry = transport._abort_registry
-    releases: list[object] = []
-    original_release = registry._release
-
-    def release(handle: _AbortHandle) -> None:
-        releases.append(handle)
-        original_release(handle)
-
-    monkeypatch.setattr(registry, '_release', release)
     monkeypatch.setattr(
         urllib3.PoolManager,
         'request',
@@ -242,70 +189,35 @@ def test_start_request_failure_releases_once_and_resets_context(
     finally:
         transport.close()
 
-    assert len(releases) == 1
-    assert _CURRENT_ABORT.get() is None
-
 
 @pytest.mark.parametrize('preload_content', [True, False])
-def test_start_request_leaves_successful_handle_owned_by_caller(
+def test_start_request_preserves_response_and_transport_options(
     monkeypatch: pytest.MonkeyPatch,
     preload_content: bool,
 ) -> None:
     transport = Urllib3Transport()
-    registry = transport._abort_registry
-    releases: list[object] = []
-    request_contexts: list[object] = []
     request_kwargs: list[dict[str, object]] = []
-    original_release = registry._release
     response = _StubResponse()
 
-    def release(handle: _AbortHandle) -> None:
-        releases.append(handle)
-        original_release(handle)
-
     def return_response(*_args: object, **kwargs: object) -> object:
-        request_contexts.append(_CURRENT_ABORT.get())
         request_kwargs.append(kwargs)
         return response
 
-    monkeypatch.setattr(registry, '_release', release)
     monkeypatch.setattr(urllib3.PoolManager, 'request', return_response)
     try:
-        started = _start_request(
+        received = _start_request(
             transport,
             _req('https://example.test'),
             preload_content=preload_content,
         )
 
-        assert started.response is response
-        assert started.started <= time.monotonic()
-        assert request_contexts == [(registry, started.handle)]
-        assert _CURRENT_ABORT.get() is None
-        assert releases == []
+        assert received is response
         assert request_kwargs[0]['preload_content'] is preload_content
         assert request_kwargs[0]['retries'] is False
         timeout = request_kwargs[0]['timeout']
         assert isinstance(timeout, urllib3.Timeout)
         assert timeout.connect_timeout == 5.0
         assert timeout.read_timeout == 5.0
-        registry._release(started.handle)
-        assert releases == [started.handle]
-    finally:
-        transport.close()
-
-
-def test_transport_uses_abort_aware_pool_classes() -> None:
-    transport = Urllib3Transport()
-    try:
-        pool = transport._pool
-        pool_classes = pool.pool_classes_by_scheme
-        http_pool = pool_classes['http']
-        https_pool = pool_classes['https']
-
-        assert issubclass(http_pool, urllib3.connectionpool.HTTPConnectionPool)
-        assert http_pool is not urllib3.connectionpool.HTTPConnectionPool
-        assert issubclass(https_pool, urllib3.connectionpool.HTTPSConnectionPool)
-        assert https_pool is not urllib3.connectionpool.HTTPSConnectionPool
     finally:
         transport.close()
 
@@ -332,5 +244,57 @@ def test_urllib3_errors_map_to_transport_errors(
     try:
         with pytest.raises(transport_error):
             transport.send(_req('https://example.test'))
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize('iteration_error', [False, True])
+def test_stream_terminal_paths_return_connection_once(
+    monkeypatch: pytest.MonkeyPatch,
+    iteration_error: bool,
+) -> None:
+    class _FailingBody(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            if self.tell():
+                raise OSError('body read failed')
+            return super().read(size)
+
+    transport = Urllib3Transport()
+    pool = transport._pool.connection_from_url('http://127.0.0.1')
+    connection = pool._get_conn()
+    assert isinstance(connection, HTTPConnection)
+    returned: list[object] = []
+    original_put = pool._put_conn
+
+    def put_connection(conn: 'BaseHTTPConnection | None') -> None:
+        returned.append(conn)
+        original_put(conn)
+
+    body = _FailingBody(b'abcdef') if iteration_error else io.BytesIO(b'abcdef')
+    raw_response = urllib3.response.HTTPResponse(
+        body=body,
+        headers={'Content-Length': '6'},
+        pool=pool,
+        connection=connection,
+        preload_content=False,
+    )
+
+    def return_response(*_args: object, **_kwargs: object) -> object:
+        return raw_response
+
+    monkeypatch.setattr(pool, '_put_conn', put_connection)
+    monkeypatch.setattr(urllib3.PoolManager, 'request', return_response)
+    try:
+        response = transport.send_streaming(_req('http://127.0.0.1'))
+        chunks = response.iter_chunks(2)
+        assert next(chunks) == b'ab'
+        assert returned == []
+        if iteration_error:
+            with pytest.raises(SendError, match='body read failed'):
+                next(chunks)
+        else:
+            response.close()
+        response.close()
+        assert returned == [connection]
     finally:
         transport.close()

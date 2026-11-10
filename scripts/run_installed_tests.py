@@ -5,6 +5,10 @@ Run this script with positional arguments `TARGET_PREFIX TESTS_DIR MODE`, where
 `MODE` is `base` or `async`. The target prefix must already contain the
 installed package and dependencies.
 
+Importing this module reads the expected package version from the checkout's
+`pyproject.toml` and executes its `src/shotgun_api3/_version.py` to obtain the
+expected compatibility version.
+
 The entry point removes checkout source paths from import resolution, verifies
 installed metadata and public import origins, and runs the applicable tier-1
 tests. Live tests and declared checkout-only tests are excluded.
@@ -16,9 +20,11 @@ import argparse
 import importlib
 import importlib.abc
 import importlib.metadata
+import runpy
 import sys
 import sysconfig
 import tempfile
+import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, cast
 
@@ -31,20 +37,22 @@ _CHECKOUT_TEST_EXCLUSIONS = {
     'lib/test_mockgun_async.py::test_async_mockgun_finds_is_statically_integer': (
         'runs pyright with the checkout pyproject configuration'
     ),
-    'lib/test_mockgun_async.py::test_async_mockgun_import_needs_no_httpx2': (
+    'lib/test_mockgun_server.py::test_async_client_needs_no_httpx2': (
         'launches a subprocess against the checkout src directory'
     ),
     'client/test_async.py::test_constructor_static_contract_rejects_invalid_arguments': (
         'runs pyright with the checkout pyproject configuration'
     ),
-    'transport/test_async_httpx2.py::test_httpx2_is_imported_only_by_adapter': (
-        'scans Python sources in the checkout src directory'
-    ),
     'tooling/test_artifact_evidence.py': 'imports the checkout artifact-evidence helper',
     'tooling/test_conformance_runtime.py': 'imports the checkout conformance runtime helper',
     'tooling/test_conformance_setup.py': 'imports the checkout conformance setup helper',
     'tooling/test_benchmark.py': 'tests checkout benchmark script and evidence paths only',
-    'client/test_crud.py::test_result_annotations_preserve_only_validated_topology': (
+    'tooling/test_mockgun_benchmark.py': 'tests checkout mockgun benchmark script only',
+    'tooling/test_bootstrap_test_site.py': 'tests checkout bootstrap script only',
+    'tooling/test_live_standin.py': 'tests checkout live standin helper only',
+    'tooling/test_parity_calendar.py': 'tests checkout parity calendar helper only',
+    'tooling/test_sdist_contract.py': 'tests checkout source distribution contract helper',
+    'test_signature_parity.py::test_result_annotations_preserve_only_validated_topology': (
         'runs pyright with the checkout pyproject configuration'
     ),
     'files/test_uploads.py::test_thumbnail_forwarding_static_contract': (
@@ -60,7 +68,7 @@ _CHECKOUT_TEST_EXCLUSIONS = {
         'scans Python sources in the checkout src directory'
     ),
     'test_examples.py': 'tests checkout-only public example programs',
-    'client/test_filters.py::test_entity_optimization_flag_initializes_from_environment': (
+    'test_init.py::test_entity_optimization_flag_initializes_from_environment': (
         'launches a subprocess with the checkout src directory on PYTHONPATH'
     ),
     'test_init.py::test_async_shotgun_missing_extra_error_is_specific': (
@@ -85,6 +93,9 @@ _CHECKOUT_TEST_EXCLUSIONS = {
     'test_parity.py::test_supported_query_attachment_and_schedule_types': (
         'runs pyright with the checkout pyproject configuration'
     ),
+    'test_signature_parity.py::test_single_any_argument_call_is_rejected_by_type_checker': (
+        'runs pyright with the checkout pyproject configuration'
+    ),
     'test_project_metadata.py': 'reads checkout pyproject metadata only',
     'tooling/test_required_mode.py': 'tests checkout-local test plugins and live-site scripts',
     'tooling/test_run_conformance.py': (
@@ -95,9 +106,13 @@ _CHECKOUT_TEST_EXCLUSIONS = {
     'tooling/test_wire_fixtures.py': 'imports and tests the checkout wire-probe script',
 }
 _DIST_NAME = 'sg-python-api'
+_EXPECTED_COMPATIBILITY_VERSION = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / 'src' / 'shotgun_api3' / '_version.py')
+)['COMPATIBILITY_VERSION']
 _EXPECTED_DISTRIBUTION_FILES = {'shotgun_api3/py.typed'}
 _EXPECTED_EXTRAS = {'async'}
-_EXPECTED_MOCKGUN_EXPORTS = ['AsyncShotgun', 'MockgunError', 'Shotgun', 'generate_schema']
+_EXPECTED_LICENSE = 'MIT'
+_EXPECTED_MOCKGUN_EXPORTS = ['AsyncShotgun', 'MockgunError', 'Shotgun', 'Site', 'generate_schema']
 _EXPECTED_PACKAGE_EXPORTS = [
     'AuthenticationFault',
     'Error',
@@ -113,10 +128,16 @@ _EXPECTED_PACKAGE_EXPORTS = [
     '__version__',
     'sg_timezone',
 ]
+_EXPECTED_PYTEST_MARKERS = (
+    'async_required: tests requiring the installed async extra',
+    'live: tests requiring a live test site',
+    'slow: tests that are slow',
+)
 _EXPECTED_REQUIREMENTS = {
     "httpx2<3,>=2;extra=='async'",
     'urllib3<3,>=2',
 }
+_EXPECTED_REQUIRES_PYTHON = '>=3.11'
 _EXPECTED_SHOTGUN_EXPORTS = [
     'LOG',
     'SG_TIMEZONE',
@@ -144,7 +165,9 @@ _EXPECTED_URLS = {
     'Issues': 'https://github.com/dactylo/sg-python-api/issues',
     'Repository': 'https://github.com/dactylo/sg-python-api',
 }
-_EXPECTED_VERSION = '0.1.2'
+_EXPECTED_VERSION = tomllib.loads(
+    (Path(__file__).resolve().parents[1] / 'pyproject.toml').read_text(encoding='utf-8')
+)['project']['version']
 _PACKAGE_NAME = 'shotgun_api3'
 _Mode = Literal['async', 'base']
 
@@ -172,6 +195,11 @@ class _Httpx2Blocker(importlib.abc.MetaPathFinder):
     ) -> ModuleSpec | None:
         """Reject `httpx2` discovery and ignore all other modules.
 
+        Args:
+            fullname: Fully qualified module name to check.
+            path: Parent package search path; ignored by this blocker.
+            target: Module being reloaded; ignored by this blocker.
+
         Returns:
             `None` for every unblocked module.
 
@@ -193,6 +221,9 @@ class _PytestModule(Protocol):
 
     def main(self, args: Sequence[str]) -> int:
         """Run pytest with command-line arguments.
+
+        Args:
+            args: Pytest options and test paths, excluding the executable name.
 
         Returns:
             Pytest process exit status.
@@ -242,7 +273,16 @@ def _assert_exports(
     expected: list[str],
 ) -> None:
     """Require one module's exact export list and importable public names."""
-    if getattr(module, '__all__', None) != expected:
+    actual = getattr(module, '__all__', None)
+    is_export_list = isinstance(actual, list)
+    values = cast('list[object]', actual) if is_export_list else []
+    exports = cast('list[str]', values)
+    if (
+        not is_export_list
+        or not all(isinstance(name, str) for name in values)
+        or len(exports) != len(set(exports))
+        or set(exports) != set(expected)
+    ):
         raise AssertionError(f'{module.__name__} public exports differ')
     for name in expected:
         if not hasattr(module, name):
@@ -273,21 +313,17 @@ def _assert_async_import(package: ModuleType, purelib: Path) -> None:
     _assert_import_origins(purelib)
 
 
-def _assert_public_imports(
-    package: ModuleType,
-    distribution: importlib.metadata.Distribution,
-    purelib: Path,
-) -> None:
-    """Validate version, typing marker, and expected public imports."""
-    if getattr(package, '__version__', None) != _EXPECTED_VERSION:
+def _assert_public_imports(package: ModuleType, purelib: Path) -> None:
+    """Validate the compatibility version, typing marker, and expected public imports."""
+    if getattr(package, '__version__', None) != _EXPECTED_COMPATIBILITY_VERSION:
         raise AssertionError(f'import version differs: {getattr(package, "__version__", None)}')
-    if getattr(package, '__version__', None) != distribution.version:
-        raise AssertionError('import and distribution versions differ')
     _assert_exports(package, _EXPECTED_PACKAGE_EXPORTS)
     shotgun = importlib.import_module('shotgun_api3.shotgun')
     _assert_exports(shotgun, _EXPECTED_SHOTGUN_EXPORTS)
     mockgun = importlib.import_module('shotgun_api3.lib.mockgun')
     _assert_exports(mockgun, _EXPECTED_MOCKGUN_EXPORTS)
+    mockgun_client = importlib.import_module('shotgun_api3.lib.mockgun.mockgun')
+    _assert_exports(mockgun_client, _EXPECTED_MOCKGUN_EXPORTS)
     typing_marker = purelib / _PACKAGE_NAME / 'py.typed'
     if not typing_marker.is_file():
         raise AssertionError(f'installed typing marker is missing: {typing_marker}')
@@ -319,7 +355,7 @@ def _project_urls(metadata: importlib.metadata.PackageMetadata) -> dict[str, str
     return urls
 
 
-def _assert_metadata(purelib: Path) -> importlib.metadata.Distribution:
+def _assert_metadata(purelib: Path) -> None:
     """Validate installed distribution metadata and its target origin."""
     candidates = [
         distribution
@@ -334,16 +370,18 @@ def _assert_metadata(purelib: Path) -> importlib.metadata.Distribution:
         raise AssertionError(f'distribution version differs: {distribution.version}')
     if metadata['Name'] != _DIST_NAME:
         raise AssertionError(f'distribution name differs: {metadata["Name"]}')
-    if metadata['Requires-Python'] != '>=3.11':
+    if metadata['Requires-Python'] != _EXPECTED_REQUIRES_PYTHON:
         raise AssertionError(f'Python requirement differs: {metadata["Requires-Python"]}')
-    if metadata['License-Expression'] != 'MIT' and metadata['License'] != 'MIT':
+    if (
+        metadata['License-Expression'] != _EXPECTED_LICENSE
+        and metadata['License'] != _EXPECTED_LICENSE
+    ):
         raise AssertionError('license metadata is not MIT')
     urls = _project_urls(metadata)
     if urls != _EXPECTED_URLS:
         raise AssertionError(f'project URLs differ: {urls}')
     _assert_declared_dependencies(metadata)
     _assert_distribution_file_origin(distribution, purelib)
-    return distribution
 
 
 def _purelib_for_prefix(target: Path) -> Path:
@@ -384,8 +422,7 @@ def _assert_base_import(purelib: Path) -> ModuleType:
         if loaded_async:
             raise AssertionError(f'base import loaded async modules: {loaded_async}')
         mockgun = importlib.import_module('shotgun_api3.lib.mockgun')
-        if getattr(mockgun, '__all__', None) != _EXPECTED_MOCKGUN_EXPORTS:
-            raise AssertionError('mockgun public exports differ')
+        _assert_exports(mockgun, _EXPECTED_MOCKGUN_EXPORTS)
         if blocker.lookups:
             raise AssertionError(f'base public imports discovered httpx2: {blocker.lookups}')
     finally:
@@ -466,10 +503,7 @@ def _run_pytest(tests: Path, mode: _Mode, checkout: Path, purelib: Path) -> None
         config.write_text(
             '[pytest]\n'
             'addopts = -q --strict-markers --tb=short\n'
-            'markers =\n'
-            '    async_required: tests requiring the installed async extra\n'
-            '    live: tests requiring a live test site\n'
-            '    slow: tests that are slow\n',
+            'markers =\n' + ''.join(f'    {marker}\n' for marker in _EXPECTED_PYTEST_MARKERS),
             encoding='utf-8',
         )
         pytest = cast('_PytestModule', importlib.import_module('pytest'))
@@ -494,17 +528,13 @@ def _validate_paths(args: _Arguments, purelib: Path) -> Path:
     return args.tests.parent
 
 
-def main() -> int:
-    """Validate an installed artifact and run its applicable tier-1 tests.
-
-    Returns:
-        Zero when metadata, imports, and tests pass.
-    """
+def _main() -> int:
+    """Validate an installed artifact and run its applicable tier-1 tests."""
     args = _parse_args()
     purelib = _purelib_for_prefix(args.target)
     checkout = _validate_paths(args, purelib)
     _configure_import_path(purelib, checkout)
-    distribution = _assert_metadata(purelib)
+    _assert_metadata(purelib)
     importlib.import_module('urllib3')
     if args.mode == 'base':
         package = _assert_base_import(purelib)
@@ -512,7 +542,7 @@ def main() -> int:
         _purge_modules(_PACKAGE_NAME)
         package = importlib.import_module(_PACKAGE_NAME)
         _assert_async_import(package, purelib)
-    _assert_public_imports(package, distribution, purelib)
+    _assert_public_imports(package, purelib)
     for node, reason in _CHECKOUT_TEST_EXCLUSIONS.items():
         print(f'excluding checkout-only test {node}: {reason}')
     _run_pytest(args.tests, args.mode, checkout, purelib)
@@ -521,4 +551,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

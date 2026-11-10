@@ -4,7 +4,7 @@ import io
 import json
 import re
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 from unittest.mock import patch
@@ -13,18 +13,32 @@ import pytest
 
 from shotgun_api3 import _driver, _errors, _files, _protocol
 from shotgun_api3._client import Shotgun
-from shotgun_api3._config import ObserverEvent, ProgressEvent, RequestEvent, ResponseEvent
+from shotgun_api3._config import ProgressEvent, RequestEvent, ResponseEvent, _ObserverEvent
 from shotgun_api3._errors import ShotgunError
 from shotgun_api3._transport import (
-    CaseInsensitiveHeaders,
     SendError,
     TransportError,
     TransportRequest,
     TransportResponse,
 )
+from tests._origin_cases import (
+    ALLOWED_ORIGIN_CASES,
+    REJECTED_ORIGIN_CASES,
+)
 from tests._pyright import run_pyright
-from tests._transports import _FakeTransport
-from tests.conftest import _fake_client, _fake_transport, _make_response
+from tests._transports import FakeTransport
+from tests.conftest import fake_client, fake_transport, make_response
+from tests.files._async_client import async_file_client
+from tests.files._responses import (
+    forbidden_text_response,
+    form_fields,
+    raw_upload_transcript,
+    read_response,
+    upload_headers,
+)
+from tests.files._upload_cases import (
+    UPLOAD_METHOD_NAMES,
+)
 
 _DIRECT_INFO: dict[str, object] = {
     'version': [9, 0, 0],
@@ -42,7 +56,114 @@ _FORM_INFO: dict[str, object] = {
 _TRANSIENT_IMAGE = 'https://x.example/images/status/transient/thumbnail_pending.png'
 
 
-class _ConsumingFakeTransport(_FakeTransport):
+@pytest.mark.anyio
+@pytest.mark.parametrize('file_size', [3, 4, 5], ids=['below', 'at', 'above'])
+@pytest.mark.parametrize(
+    ('entrypoint', 'field_name'),
+    [
+        ('upload', None),
+        ('upload', 'sg_uploaded_movie'),
+        ('upload', 'image'),
+        ('upload', 'filmstrip_image'),
+        ('upload_thumbnail', None),
+        ('upload_filmstrip_thumbnail', None),
+    ],
+)
+async def test_upload_route_matches_across_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    file_size: int,
+    entrypoint: str,
+    field_name: str | None,
+) -> None:
+    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
+    source = tmp_path / 'route.bin'
+    source.write_bytes(b'x' * file_size)
+    thumbnail = entrypoint != 'upload' or field_name in {'image', 'filmstrip_image'}
+    upload_type = 'Thumbnail' if thumbnail else 'Attachment'
+    multipart = file_size > 4
+    allocation = f'1 https://storage.example/object timestamp {upload_type} upload-1' + (
+        ' opaque' if multipart else ''
+    )
+    responses: list[Any] = [forbidden_text_response(allocation)]
+    if multipart:
+        for number in (1, 2):
+            responses.extend(
+                [
+                    forbidden_text_response(f'1 https://storage.example/part-{number}'),
+                    forbidden_text_response(headers={'etag': f'e{number}'}),
+                ]
+            )
+        responses.append(forbidden_text_response('1'))
+    else:
+        responses.append(forbidden_text_response())
+    responses.append(forbidden_text_response('1:7 route.bin'))
+    sync = _upload_client(responses)
+    async_client, async_transport = async_file_client(responses)
+    sync_call = getattr(sync, entrypoint)
+    async_call = getattr(async_client, entrypoint)
+    kwargs = {'field_name': field_name} if entrypoint == 'upload' else {}
+
+    assert sync_call('Version', 5, str(source), **kwargs) == 7
+    assert await async_call('Version', 5, str(source), **kwargs) == 7
+
+    sync_requests = fake_transport(sync).requests
+    async_requests = async_transport.requests
+    for requests in (sync_requests, async_requests):
+        allocation_request = requests[1]
+        assert allocation_request.url.endswith(_files.GET_UPLOAD_LINK_INFO)
+        assert isinstance(allocation_request.body, bytes)
+        allocation_fields = form_fields(allocation_request.body)
+        assert allocation_fields['upload_type'] == upload_type
+        assert allocation_fields['multipart_upload'] == str(multipart).lower()
+        assert (
+            any(request.url.endswith(_files.COMPLETE_MULTIPART) for request in requests)
+            == multipart
+        )
+    assert [request.url for request in sync_requests] == [
+        request.url for request in async_requests
+    ]
+
+
+@pytest.mark.parametrize('filmstrip_thumbnail', [False, True], ids=['static', 'filmstrip'])
+def test_share_thumbnail_large_local_path_uses_direct_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    filmstrip_thumbnail: bool,
+) -> None:
+    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
+    source = tmp_path / 'image.jpg'
+    source.write_bytes(b'image')
+    allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
+    sg = _upload_client(
+        [
+            forbidden_text_response(allocation),
+            forbidden_text_response(),
+            forbidden_text_response('1:7 image.jpg'),
+        ]
+    )
+
+    with patch.object(sg, '_driver_lease', wraps=sg._driver_lease) as lease:
+        assert (
+            sg.share_thumbnail(
+                [{'type': 'Version', 'id': 5}],
+                thumbnail_path=str(source),
+                filmstrip_thumbnail=filmstrip_thumbnail,
+            )
+            == 7
+        )
+    lease.assert_called_once()
+    requests = fake_transport(sg).requests
+    assert [request.url for request in requests[1:]] == [
+        'https://x.example:443/upload/api_get_upload_link_info',
+        'https://storage.example/image',
+        'https://x.example:443/upload/api_link_file',
+    ]
+    assert isinstance(requests[1].body, bytes)
+    assert form_fields(requests[1].body)['multipart_upload'] == 'false'
+
+
+class _ConsumingFakeTransport(FakeTransport):
     bodies: list[bytes | None]
     body_ids: list[int | None]
 
@@ -59,9 +180,22 @@ class _ConsumingFakeTransport(_FakeTransport):
         return super().send(request)
 
 
-class _PartiallyConsumingFakeTransport(_FakeTransport):
+def _upload_transport(sg: Shotgun) -> _ConsumingFakeTransport:
+    transport = fake_transport(sg)
+    assert isinstance(transport, _ConsumingFakeTransport)
+    return transport
+
+
+def _rpc_call(sg: Shotgun, index: int) -> tuple[str, dict[str, Any]]:
+    body = _upload_transport(sg).bodies[index]
+    assert isinstance(body, bytes)
+    payload = cast('dict[str, Any]', json.loads(body))
+    return cast('str', payload['method_name']), cast('dict[str, Any]', payload['params'][1])
+
+
+class _PartiallyConsumingFakeTransport(FakeTransport):
     closed_before_retry: bool | None
-    first_handle_closed: Callable[[], bool]
+    _first_handle_closed: Callable[[], bool]
     partial_body: bytes | None
     replay_body: bytes | None
 
@@ -71,7 +205,7 @@ class _PartiallyConsumingFakeTransport(_FakeTransport):
         first_handle_closed: Callable[[], bool],
     ) -> None:
         self.closed_before_retry = None
-        self.first_handle_closed = first_handle_closed
+        self._first_handle_closed = first_handle_closed
         self.partial_body = None
         self.replay_body = None
         super().__init__(responses)
@@ -84,47 +218,9 @@ class _PartiallyConsumingFakeTransport(_FakeTransport):
             if self.partial_body is None:
                 self.partial_body = next(body)
             else:
-                self.closed_before_retry = self.first_handle_closed()
+                self.closed_before_retry = self._first_handle_closed()
                 self.replay_body = b''.join(body)
         return super().send(request)
-
-
-def _form_fields(body: bytes) -> dict[str, str]:
-    return dict(urllib.parse.parse_qsl(body.decode(), keep_blank_values=True))
-
-
-def _raw_upload_transcript(
-    requests: list[TransportRequest],
-    bodies: list[bytes | None],
-) -> list[tuple[str, str, dict[str, str], bytes | None]]:
-    return [
-        (request.method, request.url, dict(request.headers), body)
-        for request, body in zip(requests, bodies, strict=True)
-    ]
-
-
-def _read_response(entity: dict[str, object]) -> TransportResponse:
-    return _make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})
-
-
-def _rpc_call(sg: Shotgun, index: int) -> tuple[str, dict[str, Any]]:
-    body = cast('bytes', cast('_ConsumingFakeTransport', _fake_transport(sg)).bodies[index])
-    payload = cast('dict[str, Any]', json.loads(body))
-    return cast('str', payload['method_name']), cast('dict[str, Any]', payload['params'][1])
-
-
-def _text(
-    content: str = '',
-    *,
-    headers: Mapping[str, str] | None = None,
-    status: int = 200,
-) -> TransportResponse:
-    return TransportResponse(
-        status=status,
-        reason='OK' if status == 200 else 'Forbidden',
-        headers=CaseInsensitiveHeaders(headers or {'content-type': 'text/plain'}),
-        content=content.encode(),
-    )
 
 
 def _upload_client(
@@ -132,102 +228,9 @@ def _upload_client(
     server_info: dict[str, object] = _DIRECT_INFO,
 ) -> Shotgun:
     sg = Shotgun('https://x.example', script_name='script', api_key='key', connect=False)
-    transport = _ConsumingFakeTransport([_make_response(server_info), *responses])
-    sg._transport = transport
+    transport = _ConsumingFakeTransport([make_response(server_info), *responses])
+    sg.transport = transport
     return sg
-
-
-def _upload_headers(
-    body: bytes,
-    content_type: str,
-) -> dict[str, str]:
-    return {
-        'content-length': str(len(body)),
-        'content-type': content_type,
-        'user-agent': 'upload-transcript',
-    }
-
-
-@pytest.mark.parametrize('server_info', [_DIRECT_INFO, _FORM_INFO], ids=['direct', 'form'])
-@pytest.mark.parametrize(
-    ('base_url', 'http_proxy'),
-    [
-        ('http://remote.example', None),
-        ('http://localhost', 'proxy.example:3128'),
-        ('http://127.0.0.1', 'proxy.example:3128'),
-        ('http://[::1]', 'proxy.example:3128'),
-        ('http://localhost', 'localhost:3128'),
-        ('http://127.0.0.1', '127.0.0.1:3128'),
-        ('http://[::1]', '[::1]:3128'),
-    ],
-)
-def test_authenticated_file_http_upload_rejects_before_lease(
-    tmp_path: Path,
-    server_info: dict[str, object],
-    base_url: str,
-    http_proxy: str | None,
-) -> None:
-    path = tmp_path / 'clip.mov'
-    path.write_bytes(b'clip-data')
-    sg = Shotgun(
-        base_url,
-        script_name='dummy-script',
-        api_key='dummy-key',
-        http_proxy=http_proxy,
-        connect=False,
-    )
-    transport = _ConsumingFakeTransport([_make_response(server_info), _text('1:42')])
-    sg._transport = transport
-    events: list[object] = []
-    sg.config.on_request = events.append
-    with patch.object(sg, '_driver_lease', wraps=sg._driver_lease) as lease:
-        with pytest.raises(
-            ValueError,
-            match=r'^authenticated RPCs require HTTPS or a direct literal loopback HTTP origin$',
-        ):
-            sg.upload('Version', 1, str(path))
-        lease.assert_not_called()
-    assert transport.requests == []
-    assert events == []
-
-
-@pytest.mark.parametrize(
-    ('base_url', 'http_proxy'),
-    [
-        ('https://remote.example', None),
-        ('https://remote.example', 'proxy.example:3128'),
-        ('https://remote.example', 'localhost:3128'),
-        ('http://localhost', None),
-        ('http://LOCALHOST', None),
-        ('http://127.0.0.1', None),
-        ('http://127.42.0.1', None),
-        ('http://[::1]', None),
-    ],
-)
-def test_authenticated_file_upload_allows_https_and_literal_loopback(
-    tmp_path: Path, base_url: str, http_proxy: str | None
-) -> None:
-    path = tmp_path / 'clip.mov'
-    path.write_bytes(b'clip-data')
-    sg = Shotgun(
-        base_url,
-        http_proxy=http_proxy,
-        script_name='dummy-script',
-        api_key='dummy-key',
-        connect=False,
-    )
-    transport = _ConsumingFakeTransport(
-        [
-            _make_response(_DIRECT_INFO),
-            _text('1 https://storage.example/object timestamp Attachment upload-1'),
-            _text(''),
-            _text('1:42'),
-        ]
-    )
-    sg._transport = transport
-
-    assert sg.upload('Version', 1, str(path)) == 42
-    assert b'dummy-key' in cast('bytes', transport.bodies[-1])
 
 
 def test_build_share_thumbnail_fields_uses_current_wire_grammar() -> None:
@@ -254,91 +257,91 @@ def test_build_share_thumbnail_fields_uses_current_wire_grammar() -> None:
     }
 
 
-@pytest.mark.parametrize('value', [None, ''])
-def test_create_strips_empty_file_fields_without_uploading(value: object) -> None:
-    sg = _upload_client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
-
-    result = sg.create('Version', {'code': 'v001', 'image': value, 'filmstrip_image': value})
-
-    assert result == {'type': 'Version', 'id': 5, 'code': 'v001'}
-    method_name, params = _rpc_call(sg, 1)
-    assert method_name == 'create'
-    assert [field['field_name'] for field in params['fields']] == ['code']
-    assert len(_fake_transport(sg).requests) == 2
-
-
-@pytest.mark.parametrize('with_filmstrip', [False, True], ids=['image', 'image-and-filmstrip'])
-def test_create_uploads_file_fields_after_create_and_returns_current_values(
+@pytest.mark.parametrize('server_info', [_DIRECT_INFO, _FORM_INFO], ids=['direct', 'form'])
+@pytest.mark.parametrize(
+    ('base_url', 'http_proxy'),
+    REJECTED_ORIGIN_CASES,
+)
+def test_authenticated_file_http_upload_rejects_before_lease(
     tmp_path: Path,
-    with_filmstrip: bool,
+    server_info: dict[str, object],
+    base_url: str,
+    http_proxy: str | None,
 ) -> None:
-    image = tmp_path / 'thumb.png'
-    image.write_bytes(b'image')
-    strip = tmp_path / 'strip.png'
-    strip.write_bytes(b'strip')
-    data: dict[str, object] = {'code': 'v001', 'image': str(image)}
-    current: dict[str, object] = {'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}
-    uploads = [
-        _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
-        _text(),
-        _text('1:7 thumb.png'),
-    ]
-    if with_filmstrip:
-        data['filmstrip_image'] = str(strip)
-        current['filmstrip_image'] = 'https://storage.example/strip-signed'
-        uploads += [
-            _text('1 https://storage.example/strip timestamp Thumbnail upload-2'),
-            _text(),
-            _text('1:8 strip.png'),
-        ]
-    original = dict(data)
-    file_fields = [name for name in data if name != 'code']
-    sg = _upload_client(
+    path = tmp_path / 'clip.mov'
+    path.write_bytes(b'clip-data')
+    sg = Shotgun(
+        base_url,
+        script_name='dummy-script',
+        api_key='dummy-key',
+        http_proxy=http_proxy,
+        connect=False,
+    )
+    transport = _ConsumingFakeTransport(
+        [make_response(server_info), forbidden_text_response('1:42')]
+    )
+    sg.transport = transport
+    events: list[object] = []
+    sg.config.on_request = events.append
+    with patch.object(sg, '_driver_lease', wraps=sg._driver_lease) as lease:
+        with pytest.raises(
+            ValueError,
+            match=r'^authenticated RPCs require HTTPS or a direct literal loopback HTTP origin$',
+        ):
+            sg.upload('Version', 1, str(path))
+        lease.assert_not_called()
+    assert transport.requests == []
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ('base_url', 'http_proxy'),
+    ALLOWED_ORIGIN_CASES,
+)
+def test_authenticated_file_upload_allows_https_and_literal_loopback(
+    tmp_path: Path, base_url: str, http_proxy: str | None
+) -> None:
+    path = tmp_path / 'clip.mov'
+    path.write_bytes(b'clip-data')
+    sg = Shotgun(
+        base_url,
+        http_proxy=http_proxy,
+        script_name='dummy-script',
+        api_key='dummy-key',
+        connect=False,
+    )
+    transport = _ConsumingFakeTransport(
         [
-            _make_response({'type': 'Version', 'id': 5, 'code': 'v001', 'description': None}),
-            *uploads,
-            _read_response(current),
+            make_response(_DIRECT_INFO),
+            forbidden_text_response(
+                '1 https://storage.example/object timestamp Attachment upload-1'
+            ),
+            forbidden_text_response(''),
+            forbidden_text_response('1:42'),
         ]
     )
+    sg.transport = transport
 
-    result = sg.create('Version', data, ['description'])
-
-    assert data == original
-    assert result == {
-        'type': 'Version',
-        'id': 5,
-        'code': 'v001',
-        'description': None,
-        **{name: current[name] for name in file_fields},
-    }
-    method_name, params = _rpc_call(sg, 1)
-    assert method_name == 'create'
-    assert [field['field_name'] for field in params['fields']] == ['code']
-    assert params['return_fields'] == ['description']
-    bodies = cast('_ConsumingFakeTransport', _fake_transport(sg)).bodies
-    image_link = _form_fields(cast('bytes', bodies[4]))
-    assert (image_link['entity_type'], image_link['entity_id']) == ('Version', '5')
-    assert 'filmstrip' not in image_link
-    if with_filmstrip:
-        assert _form_fields(cast('bytes', bodies[7]))['filmstrip'] == 'true'
-    read_name, read_params = _rpc_call(sg, len(bodies) - 1)
-    assert read_name == 'read'
-    assert read_params['return_fields'] == file_fields
-    assert read_params['filters']['conditions'] == [
-        {'path': 'id', 'relation': 'is', 'values': [5]},
-    ]
+    assert sg.upload('Version', 1, str(path)) == 42
+    assert b'dummy-key' in cast('bytes', transport.bodies[-1])
 
 
 def test_default_direct_attachment_upload_omits_field_name(tmp_path: Path) -> None:
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'clip-data')
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg = _upload_client([_text(encoded), _text(), _text('1:42 clip.mov')])
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:42 clip.mov'),
+        ]
+    )
 
     assert sg.upload('Version', 5, str(movie)) == 42
 
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    assert _form_fields(cast('bytes', transport.bodies[3])) == {
+    transport = _upload_transport(sg)
+    assert form_fields(cast('bytes', transport.bodies[3])) == {
         'entity_type': 'Version',
         'entity_id': '5',
         'display_name': 'clip.mov',
@@ -368,16 +371,16 @@ def test_direct_storage_put_closes_partial_body_before_complete_replay(
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
     transport = _PartiallyConsumingFakeTransport(
         [
-            _make_response(_DIRECT_INFO),
-            _text(encoded),
+            make_response(_DIRECT_INFO),
+            forbidden_text_response(encoded),
             SendError('ambiguous'),
-            _text(),
-            _text('1:9 linked'),
+            forbidden_text_response(),
+            forbidden_text_response('1:9 linked'),
         ],
         lambda: bool(handles and handles[0].closed),
     )
     sg = Shotgun('https://x.example', script_name='script', api_key='key', connect=False)
-    sg._transport = transport
+    sg.transport = transport
     sg.config.rpc_attempt_interval = 0
 
     assert sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 9
@@ -394,12 +397,19 @@ def test_direct_storage_put_retries_with_fresh_complete_bodies(tmp_path: Path) -
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'restartable')
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg = _upload_client([_text(encoded), SendError('ambiguous'), _text(), _text('1:9 linked')])
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            SendError('ambiguous'),
+            forbidden_text_response(),
+            forbidden_text_response('1:9 linked'),
+        ]
+    )
     sg.config.rpc_attempt_interval = 0
 
     assert sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 9
 
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
+    transport = _upload_transport(sg)
     put_requests = [
         (request, body, body_id)
         for request, body, body_id in zip(
@@ -423,8 +433,14 @@ def test_direct_upload_uses_one_snapshot_and_forwards_observed_fields(tmp_path: 
     movie.write_bytes(b'clip-data')
     created_at = datetime.datetime(2026, 7, 18, 9, 10, 11, tzinfo=datetime.UTC)
     encoded = '1 https://storage.example/object 2026-07-18T09:10:11+00:00 Attachment upload-1'
-    events: list[ObserverEvent] = []
-    sg = _upload_client([_text(encoded), _text(), _text('1:42 Display Name.mov')])
+    events: list[_ObserverEvent] = []
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:42 Display Name.mov'),
+        ]
+    )
     sg.config.on_request = events.append
     sg.config.on_progress = events.append
     sg.config.user_agents = ('upload-transcript',)
@@ -442,7 +458,7 @@ def test_direct_upload_uses_one_snapshot_and_forwards_observed_fields(tmp_path: 
         == 42
     )
 
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
+    transport = _upload_transport(sg)
     requests = transport.requests
     allocation_body = (
         b'filename=clip.mov&upload_type=Attachment&multipart_upload=false&'
@@ -479,7 +495,7 @@ def test_direct_upload_uses_one_snapshot_and_forwards_observed_fields(tmp_path: 
         },
     ]
     assert transport.bodies[1:] == [allocation_body, b'clip-data', link_body]
-    assert _form_fields(cast('bytes', transport.bodies[1])) == {
+    assert form_fields(cast('bytes', transport.bodies[1])) == {
         'filename': 'clip.mov',
         'upload_type': 'Attachment',
         'multipart_upload': 'false',
@@ -489,7 +505,7 @@ def test_direct_upload_uses_one_snapshot_and_forwards_observed_fields(tmp_path: 
     }
     assert transport.bodies[2] == b'clip-data'
     assert requests[2].headers['content-length'] == str(len(b'clip-data'))
-    link_fields = _form_fields(cast('bytes', transport.bodies[3]))
+    link_fields = form_fields(cast('bytes', transport.bodies[3]))
     assert link_fields == {
         'entity_type': 'Version',
         'entity_id': '5',
@@ -534,28 +550,17 @@ def test_disk_body_iterators_are_lazy_and_close_their_handles(
     assert direct_handle.closed
 
 
-@pytest.mark.parametrize('method_name', ['create', 'update'])
-def test_file_field_upload_rejects_invalid_path_after_write(
-    tmp_path: Path,
-    method_name: str,
-) -> None:
-    missing = str(tmp_path / 'missing.png')
-    sg = _upload_client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
-    data = {'code': 'v001', 'image': missing}
+@pytest.mark.parametrize('value', [None, ''])
+def test_create_strips_empty_file_fields_without_uploading(value: object) -> None:
+    sg = _upload_client([make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
 
-    def write() -> object:
-        if method_name == 'create':
-            return sg.create('Version', data)
-        return sg.update('Version', 5, data)
+    result = sg.create('Version', {'code': 'v001', 'image': value, 'filmstrip_image': value})
 
-    with pytest.raises(
-        ShotgunError,
-        match=rf"^Path must be a valid file, got '{re.escape(missing)}'$",
-    ):
-        write()
-
-    assert _rpc_call(sg, 1)[0] == method_name
-    assert len(_fake_transport(sg).requests) == 2
+    assert result == {'type': 'Version', 'id': 5, 'code': 'v001'}
+    method_name, params = _rpc_call(sg, 1)
+    assert method_name == 'create'
+    assert [field['field_name'] for field in params['fields']] == ['code']
+    assert len(fake_transport(sg).requests) == 2
 
 
 def test_link_and_finalize_do_not_restart_after_ambiguous_send(
@@ -567,36 +572,40 @@ def test_link_and_finalize_do_not_restart_after_ambiguous_send(
     small.write_bytes(b'data')
     direct = _upload_client(
         [
-            _text('1 https://storage.example/object timestamp Attachment upload-1'),
-            _text(),
+            forbidden_text_response(
+                '1 https://storage.example/object timestamp Attachment upload-1'
+            ),
+            forbidden_text_response(),
             SendError('ambiguous'),
-            _text('1:unused'),
+            forbidden_text_response('1:unused'),
         ]
     )
     direct.config.rpc_attempt_interval = 0
 
     with pytest.raises(SendError, match='ambiguous'):
         direct.upload('Version', 5, str(small), field_name='sg_uploaded_movie')
-    assert len(_fake_transport(direct).requests) == 4
+    assert len(fake_transport(direct).requests) == 4
 
     large = tmp_path / 'large.mov'
     large.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
     multipart = _upload_client(
         [
-            _text('1 https://storage.example/multipart timestamp Attachment upload-1 opaque'),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
+            forbidden_text_response(
+                '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
+            ),
+            forbidden_text_response('1 https://storage.example/part-1'),
+            forbidden_text_response(headers={'etag': 'etag-1'}),
+            forbidden_text_response('1 https://storage.example/part-2'),
+            forbidden_text_response(headers={'etag': 'etag-2'}),
             SendError('ambiguous'),
-            _text('unused'),
+            forbidden_text_response('unused'),
         ]
     )
     multipart.config.rpc_attempt_interval = 0
 
     with pytest.raises(SendError, match='ambiguous'):
         multipart.upload('Version', 5, str(large), field_name='sg_uploaded_movie')
-    assert len(_fake_transport(multipart).requests) == 7
+    assert len(fake_transport(multipart).requests) == 7
 
 
 def test_multipart_part_put_missing_etag_is_driver_error_event(
@@ -606,12 +615,14 @@ def test_multipart_part_put_missing_etag_is_driver_error_event(
     monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
     movie = tmp_path / 'large.mov'
     movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sg = _upload_client(
         [
-            _text('1 https://storage.example/multipart timestamp Attachment upload-1 opaque'),
-            _text('1 https://storage.example/part-1'),
-            _text(),
+            forbidden_text_response(
+                '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
+            ),
+            forbidden_text_response('1 https://storage.example/part-1'),
+            forbidden_text_response(),
         ]
     )
     sg.config.on_response = events.append
@@ -623,7 +634,7 @@ def test_multipart_part_put_missing_etag_is_driver_error_event(
         sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
 
     response_events = [event for event in events if isinstance(event, ResponseEvent)]
-    assert len(response_events) == len(_fake_transport(sg).requests)
+    assert len(response_events) == len(fake_transport(sg).requests)
     assert response_events[-1].status == 200
     assert response_events[-1].route == 'part_put'
     assert response_events[-1].outcome == 'error'
@@ -639,22 +650,22 @@ def test_multipart_upload_uses_observed_part_boundary_etags_and_order(
     encoded = '1 https://storage.example/multipart timestamp Attachment upload-1 opaque-extra'
     sg = _upload_client(
         [
-            _text(encoded),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'eTaG': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'ETAG': 'etag-2'}),
-            _text('17'),
-            _text('1:84 large.mov'),
+            forbidden_text_response(encoded),
+            forbidden_text_response('1 https://storage.example/part-1'),
+            forbidden_text_response(headers={'eTaG': 'etag-1'}),
+            forbidden_text_response('1 https://storage.example/part-2'),
+            forbidden_text_response(headers={'ETAG': 'etag-2'}),
+            forbidden_text_response('17'),
+            forbidden_text_response('1:84 large.mov'),
         ]
     )
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sg.config.on_request = events.append
     sg.config.user_agents = ('upload-transcript',)
 
     assert sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 84
 
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
+    transport = _upload_transport(sg)
     allocation_body = (
         b'filename=large.mov&upload_type=Attachment&multipart_upload=true&'
         b'script_name=script&script_key=key'
@@ -677,57 +688,57 @@ def test_multipart_upload_uses_observed_part_boundary_etags_and_order(
         b'upload-1+opaque-extra&script_name=script&script_key=key'
     )
     form_content_type = 'application/x-www-form-urlencoded'
-    assert _raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
+    assert raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_info',
-            _upload_headers(allocation_body, form_content_type),
+            upload_headers(allocation_body, form_content_type),
             allocation_body,
         ),
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_for_part',
-            _upload_headers(part_one_body, form_content_type),
+            upload_headers(part_one_body, form_content_type),
             part_one_body,
         ),
         (
             'PUT',
             'https://storage.example/part-1',
-            _upload_headers(b'abcd', 'application/octet-stream'),
+            upload_headers(b'abcd', 'application/octet-stream'),
             b'abcd',
         ),
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_for_part',
-            _upload_headers(part_two_body, form_content_type),
+            upload_headers(part_two_body, form_content_type),
             part_two_body,
         ),
         (
             'PUT',
             'https://storage.example/part-2',
-            _upload_headers(b'e', 'application/octet-stream'),
+            upload_headers(b'e', 'application/octet-stream'),
             b'e',
         ),
         (
             'POST',
             'https://x.example:443/upload/api_complete_multipart_upload',
-            _upload_headers(complete_body, form_content_type),
+            upload_headers(complete_body, form_content_type),
             complete_body,
         ),
         (
             'POST',
             'https://x.example:443/upload/api_link_file',
-            _upload_headers(link_body, form_content_type),
+            upload_headers(link_body, form_content_type),
             link_body,
         ),
     ]
     assert transport.bodies[3] == b'abcd'
     assert transport.bodies[5] == b'e'
-    assert _form_fields(cast('bytes', transport.bodies[2]))['part_number'] == '1'
-    assert _form_fields(cast('bytes', transport.bodies[4]))['part_number'] == '2'
-    complete_fields = _form_fields(cast('bytes', transport.bodies[6]))
+    assert form_fields(cast('bytes', transport.bodies[2]))['part_number'] == '1'
+    assert form_fields(cast('bytes', transport.bodies[4]))['part_number'] == '2'
+    complete_fields = form_fields(cast('bytes', transport.bodies[6]))
     assert complete_fields['etags'] == 'etag-1,etag-2'
-    link_fields = _form_fields(cast('bytes', transport.bodies[7]))
+    link_fields = form_fields(cast('bytes', transport.bodies[7]))
     assert link_fields['upload_link_info'] == encoded
     assert not {'filename', 'timestamp', 'upload_id', 'upload_type'} & link_fields.keys()
     request_events = [event for event in events if isinstance(event, RequestEvent)]
@@ -743,27 +754,97 @@ def test_multipart_upload_uses_observed_part_boundary_etags_and_order(
     ]
 
 
-def test_part_etag_parser_requires_one_case_insensitive_header() -> None:
-    assert _files.parse_part_etag('', CaseInsensitiveHeaders({'eTaG': 'etag-1'})) == 'etag-1'
+@pytest.mark.parametrize('with_filmstrip', [False, True], ids=['image', 'image-and-filmstrip'])
+def test_create_uploads_file_fields_after_create_and_returns_current_values(
+    tmp_path: Path,
+    with_filmstrip: bool,
+) -> None:
+    image = tmp_path / 'thumb.png'
+    image.write_bytes(b'image')
+    strip = tmp_path / 'strip.png'
+    strip.write_bytes(b'strip')
+    data: dict[str, object] = {'code': 'v001', 'image': str(image)}
+    current: dict[str, object] = {'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}
+    uploads = [
+        forbidden_text_response('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+        forbidden_text_response(),
+        forbidden_text_response('1:7 thumb.png'),
+    ]
+    if with_filmstrip:
+        data['filmstrip_image'] = str(strip)
+        current['filmstrip_image'] = 'https://storage.example/strip-signed'
+        uploads += [
+            forbidden_text_response(
+                '1 https://storage.example/strip timestamp Thumbnail upload-2'
+            ),
+            forbidden_text_response(),
+            forbidden_text_response('1:8 strip.png'),
+        ]
+    original = dict(data)
+    file_fields = [name for name in data if name != 'code']
+    sg = _upload_client(
+        [
+            make_response({'type': 'Version', 'id': 5, 'code': 'v001', 'description': None}),
+            *uploads,
+            read_response(current),
+        ]
+    )
+
+    result = sg.create('Version', data, ['description'])
+
+    assert data == original
+    assert result == {
+        'type': 'Version',
+        'id': 5,
+        'code': 'v001',
+        'description': None,
+        **{name: current[name] for name in file_fields},
+    }
+    method_name, params = _rpc_call(sg, 1)
+    assert method_name == 'create'
+    assert [field['field_name'] for field in params['fields']] == ['code']
+    assert params['return_fields'] == ['description']
+    bodies = _upload_transport(sg).bodies
+    image_link = form_fields(cast('bytes', bodies[4]))
+    assert (image_link['entity_type'], image_link['entity_id']) == ('Version', '5')
+    assert 'filmstrip' not in image_link
+    if with_filmstrip:
+        assert form_fields(cast('bytes', bodies[7]))['filmstrip'] == 'true'
+    read_name, read_params = _rpc_call(sg, len(bodies) - 1)
+    assert read_name == 'read'
+    assert read_params['return_fields'] == file_fields
+    assert read_params['filters']['conditions'] == [
+        {'path': 'id', 'relation': 'is', 'values': [5]},
+    ]
+
+
+@pytest.mark.parametrize('method_name', ['create', 'update'])
+def test_file_field_upload_rejects_invalid_path_after_write(
+    tmp_path: Path,
+    method_name: str,
+) -> None:
+    missing = str(tmp_path / 'missing.png')
+    sg = _upload_client([make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
+    data = {'code': 'v001', 'image': missing}
+
+    def write() -> object:
+        if method_name == 'create':
+            return sg.create('Version', data)
+        return sg.update('Version', 5, data)
 
     with pytest.raises(
         ShotgunError,
-        match=r'^multipart part response did not include an ETag$',
+        match=rf"^Path must be a valid file, got '{re.escape(missing)}'$",
     ):
-        _files.parse_part_etag('', CaseInsensitiveHeaders({}))
+        write()
+
+    assert _rpc_call(sg, 1)[0] == method_name
+    assert len(fake_transport(sg).requests) == 2
 
 
 @pytest.mark.parametrize(
     'method_name',
-    [
-        'upload',
-        'upload_image',
-        'upload_filmstrip',
-        'upload_thumbnail',
-        'upload_filmstrip_thumbnail',
-        'share_thumbnail',
-        'share_filmstrip',
-    ],
+    UPLOAD_METHOD_NAMES,
 )
 def test_public_upload_refuses_legacy_form_before_upload_request(
     tmp_path: Path,
@@ -797,7 +878,7 @@ def test_public_upload_refuses_legacy_form_before_upload_request(
     ):
         invoke()
 
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     assert len(transport.requests) == 1
     body = transport.requests[0].body
     assert isinstance(body, bytes)
@@ -828,24 +909,31 @@ def test_malformed_upload_endpoint_response_is_driver_error_event(
     responses: list[TransportResponse | TransportError]
     if endpoint == 'allocation':
         movie.write_bytes(b'data')
-        responses = [_text('malformed')]
+        responses = [forbidden_text_response('malformed')]
     elif endpoint == 'link':
         movie.write_bytes(b'data')
-        responses = [_text(direct_allocation), _text(), _text('malformed')]
+        responses = [
+            forbidden_text_response(direct_allocation),
+            forbidden_text_response(),
+            forbidden_text_response('malformed'),
+        ]
     elif endpoint == 'part-link':
         movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
-        responses = [_text(multipart_allocation), _text('malformed')]
+        responses = [
+            forbidden_text_response(multipart_allocation),
+            forbidden_text_response('malformed'),
+        ]
     else:
         movie.write_bytes(b'a' * _files._MULTIPART_CHUNK_SIZE + b'z')
         responses = [
-            _text(multipart_allocation),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
-            _text('malformed'),
+            forbidden_text_response(multipart_allocation),
+            forbidden_text_response('1 https://storage.example/part-1'),
+            forbidden_text_response(headers={'etag': 'etag-1'}),
+            forbidden_text_response('1 https://storage.example/part-2'),
+            forbidden_text_response(headers={'etag': 'etag-2'}),
+            forbidden_text_response('malformed'),
         ]
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sg = _upload_client(responses)
     sg.config.on_response = events.append
 
@@ -853,7 +941,7 @@ def test_malformed_upload_endpoint_response_is_driver_error_event(
         sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
 
     response_events = [event for event in events if isinstance(event, ResponseEvent)]
-    assert len(response_events) == len(_fake_transport(sg).requests)
+    assert len(response_events) == len(fake_transport(sg).requests)
     assert response_events[-1].status == 200
     assert response_events[-1].route == expected_route
     assert response_events[-1].outcome == 'error'
@@ -867,7 +955,13 @@ def test_mutating_public_server_info_cannot_change_cached_upload_route(
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'route-me-directly')
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg = _upload_client([_text(encoded), _text(), _text('1:9 linked')])
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:9 linked'),
+        ]
+    )
 
     exposed = sg.server_info if public_owner == 'shotgun' else sg.server_caps.server_info
     exposed['s3_direct_uploads_enabled'] = False
@@ -875,7 +969,7 @@ def test_mutating_public_server_info_cannot_change_cached_upload_route(
     allowed_types['*'].clear()
 
     assert sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 9
-    assert [request.url for request in _fake_transport(sg).requests[1:]] == [
+    assert [request.url for request in fake_transport(sg).requests[1:]] == [
         'https://x.example:443/upload/api_get_upload_link_info',
         'https://storage.example/object',
         'https://x.example:443/upload/api_link_file',
@@ -885,15 +979,7 @@ def test_mutating_public_server_info_cannot_change_cached_upload_route(
 @pytest.mark.parametrize('path_source', [False, True], ids=['entity', 'path'])
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('http://remote.example', None),
-        ('http://localhost', 'proxy.example:3128'),
-        ('http://127.0.0.1', 'proxy.example:3128'),
-        ('http://[::1]', 'proxy.example:3128'),
-        ('http://localhost', 'localhost:3128'),
-        ('http://127.0.0.1', '127.0.0.1:3128'),
-        ('http://[::1]', '[::1]:3128'),
-    ],
+    REJECTED_ORIGIN_CASES,
 )
 def test_authenticated_file_http_share_rejects_before_lease(
     tmp_path: Path,
@@ -910,8 +996,8 @@ def test_authenticated_file_http_share_rejects_before_lease(
         http_proxy=http_proxy,
         connect=False,
     )
-    transport = _FakeTransport([_make_response(_DIRECT_INFO), _text('1:42')])
-    sg._transport = transport
+    transport = FakeTransport([make_response(_DIRECT_INFO), forbidden_text_response('1:42')])
+    sg.transport = transport
     events: list[object] = []
     sg.config.on_request = events.append
     with patch.object(sg, '_driver_lease', wraps=sg._driver_lease) as lease:
@@ -931,16 +1017,7 @@ def test_authenticated_file_http_share_rejects_before_lease(
 
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('https://remote.example', None),
-        ('https://remote.example', 'proxy.example:3128'),
-        ('https://remote.example', 'localhost:3128'),
-        ('http://localhost', None),
-        ('http://LOCALHOST', None),
-        ('http://127.0.0.1', None),
-        ('http://127.42.0.1', None),
-        ('http://[::1]', None),
-    ],
+    ALLOWED_ORIGIN_CASES,
 )
 @pytest.mark.parametrize('path_source', [False, True], ids=['entity', 'path'])
 def test_authenticated_file_share_allows_https_and_literal_loopback(
@@ -956,14 +1033,19 @@ def test_authenticated_file_share_allows_https_and_literal_loopback(
         api_key='dummy-key',
         connect=False,
     )
-    responses: list[TransportResponse | TransportError] = [_make_response(_DIRECT_INFO)]
+    responses: list[TransportResponse | TransportError] = [make_response(_DIRECT_INFO)]
     if path_source:
         responses.extend(
-            [_text('1 https://storage.example/image timestamp Thumbnail upload-1'), _text('')]
+            [
+                forbidden_text_response(
+                    '1 https://storage.example/image timestamp Thumbnail upload-1'
+                ),
+                forbidden_text_response(''),
+            ]
         )
-    responses.append(_text('1:42'))
-    transport = _FakeTransport(responses)
-    sg._transport = transport
+    responses.append(forbidden_text_response('1:42'))
+    transport = FakeTransport(responses)
+    sg.transport = transport
     path = tmp_path / 'image.jpg'
     path.write_bytes(b'image')
 
@@ -976,68 +1058,6 @@ def test_authenticated_file_share_allows_https_and_literal_loopback(
         == 42
     )
     assert b'dummy-key' in cast('bytes', transport.requests[-1].body)
-
-
-@pytest.mark.parametrize(
-    ('filmstrip_thumbnail', 'field_name'),
-    [(False, 'image'), (True, 'filmstrip_image')],
-)
-def test_share_thumbnail_path_exhausts_25_driver_owned_poll_reads(
-    tmp_path: Path,
-    filmstrip_thumbnail: bool,
-    field_name: str,
-) -> None:
-    image = tmp_path / 'image.jpg'
-    image.write_bytes(b'image')
-    allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    transient = {
-        'entities': [
-            {
-                'type': 'Version',
-                'id': 2,
-                field_name: 'https://x.example/images/status/transient/processing',
-            }
-        ],
-        'paging_info': {'entity_count': 1},
-    }
-    sg = _fake_client(
-        [
-            _text(allocation),
-            _text(''),
-            _text('1:41 image.jpg'),
-            *[_make_response(transient) for _index in range(25)],
-        ],
-        server_info=_DIRECT_INFO,
-    )
-    sg.config.rpc_attempt_interval = 0
-    sleeps: list[float] = []
-    transport = _fake_transport(sg)
-    sg._known_transport = transport
-    sg._driver = _driver.Driver(transport, _driver._DriverTiming(sleep=sleeps.append))
-
-    with pytest.raises(
-        _errors.ShotgunThumbnailNotReady,
-        match=r'^thumbnail source did not become ready$',
-    ):
-        sg.share_thumbnail(
-            [{'type': 'Version', 'id': 2}, {'type': 'Shot', 'id': 7}],
-            thumbnail_path=str(image),
-            filmstrip_thumbnail=filmstrip_thumbnail,
-        )
-
-    requests = _fake_transport(sg).requests
-    read_requests = [
-        request
-        for request in requests
-        if request.url == 'https://x.example:443/api3/json'
-        and isinstance(request.body, bytes)
-        and b'"method_name": "read"' in request.body
-    ]
-    assert len(read_requests) == 25
-    assert sleeps == [0.0] * 24
-    assert sum(request.url.endswith(_files.GET_UPLOAD_LINK_INFO) for request in requests) == 1
-    assert sum(request.url.endswith(_files.LINK_FILE) for request in requests) == 1
-    assert not any(request.url.endswith(_files.SHARE_THUMBNAIL) for request in requests)
 
 
 def test_share_thumbnail_path_polls_only_filmstrip_field_when_selected(
@@ -1056,13 +1076,13 @@ def test_share_thumbnail_path_polls_only_filmstrip_field_when_selected(
         ],
         'paging_info': {'entity_count': 1},
     }
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _text(allocation),
-            _text(''),
-            _text('1:41 filmstrip.jpg'),
-            _make_response(ready),
-            _text('1:42'),
+            forbidden_text_response(allocation),
+            forbidden_text_response(''),
+            forbidden_text_response('1:41 filmstrip.jpg'),
+            make_response(ready),
+            forbidden_text_response('1:42'),
         ],
         server_info=_DIRECT_INFO,
     )
@@ -1077,7 +1097,7 @@ def test_share_thumbnail_path_polls_only_filmstrip_field_when_selected(
         == 42
     )
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     link_body = requests[3].body
     assert isinstance(link_body, bytes)
     assert dict(urllib.parse.parse_qsl(link_body.decode()))['filmstrip'] == 'true'
@@ -1111,14 +1131,14 @@ def test_share_thumbnail_path_polls_static_source_then_shares_remaining_target(
         'entities': [{'type': 'Version', 'id': 2, 'image': 'https://x.example/image/ready.jpg'}],
         'paging_info': {'entity_count': 1},
     }
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _text(allocation),
-            _text(''),
-            _text('1:41 image.jpg'),
-            _make_response(transient),
-            _make_response(ready),
-            _text('1:42'),
+            forbidden_text_response(allocation),
+            forbidden_text_response(''),
+            forbidden_text_response('1:41 image.jpg'),
+            make_response(transient),
+            make_response(ready),
+            forbidden_text_response('1:42'),
         ],
         server_info=_DIRECT_INFO,
     )
@@ -1132,7 +1152,7 @@ def test_share_thumbnail_path_polls_static_source_then_shares_remaining_target(
         == 42
     )
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert [request.url for request in requests[1:]] == [
         'https://x.example:443/upload/api_get_upload_link_info',
         'https://storage.example/image',
@@ -1167,8 +1187,12 @@ def test_share_thumbnail_path_uploads_and_links_one_target_once(tmp_path: Path) 
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
     allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg = _fake_client(
-        [_text(allocation), _text(''), _text('1:41 image.jpg')],
+    sg = fake_client(
+        [
+            forbidden_text_response(allocation),
+            forbidden_text_response(''),
+            forbidden_text_response('1:41 image.jpg'),
+        ],
         server_info=_DIRECT_INFO,
     )
 
@@ -1181,7 +1205,7 @@ def test_share_thumbnail_path_uploads_and_links_one_target_once(tmp_path: Path) 
         == 41
     )
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert [request.url for request in requests[1:]] == [
         'https://x.example:443/upload/api_get_upload_link_info',
         'https://storage.example/image',
@@ -1214,30 +1238,82 @@ def test_share_thumbnail_public_signature_preserves_forwarded_kwargs() -> None:
 
 
 @pytest.mark.parametrize(
-    ('thumbnail_path', 'source_entity'),
-    [(None, None), ('image.jpg', {'type': 'Version', 'id': 1})],
+    ('filmstrip_thumbnail', 'field_name'),
+    [(False, 'image'), (True, 'filmstrip_image')],
 )
-def test_share_thumbnail_requires_exactly_one_source(
-    thumbnail_path: str | None,
-    source_entity: dict[str, Any] | None,
+def test_share_thumbnail_path_exhausts_25_driver_owned_poll_reads(
+    tmp_path: Path,
+    filmstrip_thumbnail: bool,
+    field_name: str,
 ) -> None:
-    sg = _fake_client([])
+    image = tmp_path / 'image.jpg'
+    image.write_bytes(b'image')
+    allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
+    transient = {
+        'entities': [
+            {
+                'type': 'Version',
+                'id': 2,
+                field_name: 'https://x.example/images/status/transient/processing',
+            }
+        ],
+        'paging_info': {'entity_count': 1},
+    }
+    sg = fake_client(
+        [
+            forbidden_text_response(allocation),
+            forbidden_text_response(''),
+            forbidden_text_response('1:41 image.jpg'),
+            *[make_response(transient) for _index in range(25)],
+        ],
+        server_info=_DIRECT_INFO,
+    )
+    sg.config.rpc_attempt_interval = 0
+    sleeps: list[float] = []
+    transport = fake_transport(sg)
+    sg._known_transport = transport
+    sg._driver = _driver.Driver(transport, _driver._DriverTiming(sleep=sleeps.append))
 
     with pytest.raises(
-        ShotgunError,
-        match=r'^exactly one of thumbnail_path and source_entity is required$',
+        _errors.ShotgunThumbnailNotReady,
+        match=r'^thumbnail source did not become ready$',
     ):
         sg.share_thumbnail(
-            [{'type': 'Version', 'id': 2}],
-            thumbnail_path=thumbnail_path,
-            source_entity=source_entity,
+            [{'type': 'Version', 'id': 2}, {'type': 'Shot', 'id': 7}],
+            thumbnail_path=str(image),
+            filmstrip_thumbnail=filmstrip_thumbnail,
         )
 
-    assert _fake_transport(sg).requests == []
+    requests = fake_transport(sg).requests
+    read_requests = [
+        request
+        for request in requests
+        if request.url == 'https://x.example:443/api3/json'
+        and isinstance(request.body, bytes)
+        and b'"method_name": "read"' in request.body
+    ]
+    assert len(read_requests) == 25
+    assert sleeps == [0.0] * 24
+    assert sum(request.url.endswith(_files.GET_UPLOAD_LINK_INFO) for request in requests) == 1
+    assert sum(request.url.endswith(_files.LINK_FILE) for request in requests) == 1
+    assert not any(request.url.endswith(_files.SHARE_THUMBNAIL) for request in requests)
+
+
+def test_share_thumbnail_source_entity_ignores_keywords() -> None:
+    sg = fake_client([forbidden_text_response('1:31')])
+    assert (
+        sg.share_thumbnail(
+            [{'type': 'Version', 'id': 2}],
+            source_entity={'type': 'Version', 'id': 1},
+            field_name='ignored',
+            display_naem=object(),
+        )
+        == 31
+    )
 
 
 def test_share_thumbnail_source_posts_exact_current_fields() -> None:
-    sg = _fake_client([_text('1:31')])
+    sg = fake_client([forbidden_text_response('1:31')])
     entities = [{'type': 'Version', 'id': 2}, {'type': 'Shot', 'id': 7}]
 
     assert (
@@ -1250,7 +1326,7 @@ def test_share_thumbnail_source_posts_exact_current_fields() -> None:
     )
 
     assert entities == [{'type': 'Version', 'id': 2}, {'type': 'Shot', 'id': 7}]
-    request = _fake_transport(sg).requests[1]
+    request = fake_transport(sg).requests[1]
     assert request.url == 'https://x.example:443/upload/share_thumbnail'
     assert isinstance(request.body, bytes)
     assert dict(urllib.parse.parse_qsl(request.body.decode())) == {
@@ -1263,7 +1339,7 @@ def test_share_thumbnail_source_posts_exact_current_fields() -> None:
 
 
 def test_share_thumbnail_source_preserves_exact_endpoint_transcript() -> None:
-    sg = _upload_client([_text('1:31')])
+    sg = _upload_client([forbidden_text_response('1:31')])
     sg.config.user_agents = ('upload-transcript',)
 
     assert (
@@ -1279,12 +1355,12 @@ def test_share_thumbnail_source_preserves_exact_endpoint_transcript() -> None:
         b'entities=Version_2%2CShot_7&filmstrip_thumbnail=1&source_entity=Version_1&'
         b'script_name=script&script_key=key'
     )
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    assert _raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
+    transport = _upload_transport(sg)
+    assert raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
         (
             'POST',
             'https://x.example:443/upload/share_thumbnail',
-            _upload_headers(body, 'application/x-www-form-urlencoded'),
+            upload_headers(body, 'application/x-www-form-urlencoded'),
             body,
         )
     ]
@@ -1360,6 +1436,29 @@ def test_thumbnail_source_ready_classifies_empty_transient_and_ready() -> None:
 
 
 @pytest.mark.parametrize(
+    ('thumbnail_path', 'source_entity'),
+    [(None, None), ('image.jpg', {'type': 'Version', 'id': 1})],
+)
+def test_share_thumbnail_requires_exactly_one_source(
+    thumbnail_path: str | None,
+    source_entity: dict[str, Any] | None,
+) -> None:
+    sg = fake_client([])
+
+    with pytest.raises(
+        ShotgunError,
+        match=r'^exactly one of thumbnail_path and source_entity is required$',
+    ):
+        sg.share_thumbnail(
+            [{'type': 'Version', 'id': 2}],
+            thumbnail_path=thumbnail_path,
+            source_entity=source_entity,
+        )
+
+    assert fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize(
     ('result', 'message'),
     [
         (None, 'thumbnail readiness read did not return a dictionary'),
@@ -1375,49 +1474,16 @@ def test_thumbnail_source_ready_rejects_invalid_results(
         _files.thumbnail_source_ready(result, 'image')
 
 
-@pytest.mark.parametrize(
-    ('method_name', 'expected_extra'),
-    [('upload_thumbnail', {}), ('upload_filmstrip_thumbnail', {'filmstrip': 'true'})],
-)
-def test_thumbnail_wrappers_select_thumbnail_upload_and_forward_kwargs(
-    tmp_path: Path,
-    method_name: str,
-    expected_extra: dict[str, str],
-) -> None:
-    image = tmp_path / 'image.jpg'
-    image.write_bytes(b'image')
-    encoded = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg = _upload_client([_text(encoded), _text(), _text('1:7 image.jpg')])
-
-    method = cast('object', getattr(sg, method_name))
-    assert callable(method)
-    assert method('Version', 5, str(image), display_name='Nice Image') == 7
-
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    allocation_fields = _form_fields(cast('bytes', transport.bodies[1]))
-    assert allocation_fields['upload_type'] == 'Thumbnail'
-    link_fields = _form_fields(cast('bytes', transport.bodies[3]))
-    assert link_fields == {
-        'entity_type': 'Version',
-        'entity_id': '5',
-        'display_name': 'Nice Image',
-        **expected_extra,
-        'upload_link_info': encoded,
-        'script_name': 'script',
-        'script_key': 'key',
-    }
-
-
 def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(tmp_path: Path) -> None:
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'data')
-    sg = _upload_client([SendError('ambiguous'), _text('unused')])
+    sg = _upload_client([SendError('ambiguous'), forbidden_text_response('unused')])
     sg.config.rpc_attempt_interval = 0
 
     with pytest.raises(SendError, match='ambiguous'):
         sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie')
 
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     assert len(transport.requests) == 2
     assert transport.requests[1].url.endswith(_files.GET_UPLOAD_LINK_INFO)
 
@@ -1427,12 +1493,14 @@ def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> N
     image.write_bytes(b'image')
     sg = _upload_client(
         [
-            _make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
-            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
-            _text(),
-            _text('1:7 thumb.png'),
-            _read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
-            _make_response({'type': 'Version', 'id': 5, 'image': None}),
+            make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
+            forbidden_text_response(
+                '1 https://storage.example/thumb timestamp Thumbnail upload-1'
+            ),
+            forbidden_text_response(),
+            forbidden_text_response('1:7 thumb.png'),
+            read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
+            make_response({'type': 'Version', 'id': 5, 'image': None}),
         ]
     )
 
@@ -1452,32 +1520,41 @@ def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> N
         [{'field_name': 'description', 'value': 'new'}],
         [{'field_name': 'image', 'value': None}],
     ]
-    assert len(_fake_transport(sg).requests) == 7
+    assert len(fake_transport(sg).requests) == 7
 
 
 @pytest.mark.parametrize(
-    ('field_name', 'expected_extra'),
-    [('image', {}), ('filmstrip_image', {'filmstrip': 'true'})],
+    ('method_name', 'expected_extra'),
+    [('upload_thumbnail', {}), ('upload_filmstrip_thumbnail', {'filmstrip': 'true'})],
 )
-def test_upload_display_thumbnail_fields_use_thumbnail_wire_protocol(
+def test_thumbnail_wrappers_select_thumbnail_upload_and_forward_kwargs(
     tmp_path: Path,
-    field_name: str,
+    method_name: str,
     expected_extra: dict[str, str],
 ) -> None:
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
     encoded = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg = _upload_client([_text(encoded), _text(), _text('1:7 image.jpg')])
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:7 image.jpg'),
+        ]
+    )
 
-    assert sg.upload('Task', 5, str(image), field_name) == 7
+    method = cast('object', getattr(sg, method_name))
+    assert callable(method)
+    assert method('Version', 5, str(image), display_name='Nice Image') == 7
 
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    allocation_fields = _form_fields(cast('bytes', transport.bodies[1]))
+    transport = _upload_transport(sg)
+    allocation_fields = form_fields(cast('bytes', transport.bodies[1]))
     assert allocation_fields['upload_type'] == 'Thumbnail'
-    link_fields = _form_fields(cast('bytes', transport.bodies[3]))
+    link_fields = form_fields(cast('bytes', transport.bodies[3]))
     assert link_fields == {
-        'entity_type': 'Task',
+        'entity_type': 'Version',
         'entity_id': '5',
+        'display_name': 'Nice Image',
         **expected_extra,
         'upload_link_info': encoded,
         'script_name': 'script',
@@ -1570,6 +1647,42 @@ def test_upload_helpers_preserve_the_evidence_backed_wire_grammar() -> None:
 
 
 @pytest.mark.parametrize(
+    ('field_name', 'expected_extra'),
+    [('image', {}), ('filmstrip_image', {'filmstrip': 'true'})],
+)
+def test_upload_display_thumbnail_fields_use_thumbnail_wire_protocol(
+    tmp_path: Path,
+    field_name: str,
+    expected_extra: dict[str, str],
+) -> None:
+    image = tmp_path / 'image.jpg'
+    image.write_bytes(b'image')
+    encoded = '1 https://storage.example/image timestamp Thumbnail upload-1'
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:7 image.jpg'),
+        ]
+    )
+
+    assert sg.upload('Task', 5, str(image), field_name) == 7
+
+    transport = _upload_transport(sg)
+    allocation_fields = form_fields(cast('bytes', transport.bodies[1]))
+    assert allocation_fields['upload_type'] == 'Thumbnail'
+    link_fields = form_fields(cast('bytes', transport.bodies[3]))
+    assert link_fields == {
+        'entity_type': 'Task',
+        'entity_id': '5',
+        **expected_extra,
+        'upload_link_info': encoded,
+        'script_name': 'script',
+        'script_key': 'key',
+    }
+
+
+@pytest.mark.parametrize(
     ('encoded', 'multipart'),
     [
         ('0 https://storage.example/object timestamp Attachment upload-1', False),
@@ -1584,21 +1697,6 @@ def test_upload_link_info_rejects_unobserved_response_shapes(
 ) -> None:
     with pytest.raises(ShotgunError, match=r'^upload allocation returned an invalid response$'):
         _files.UploadLinkInfo(encoded, multipart=multipart)
-
-
-@pytest.mark.parametrize('byte_path', [False, True], ids=['unicode-str', 'utf8-bytes'])
-def test_upload_accepts_unicode_and_utf8_byte_paths(tmp_path: Path, byte_path: bool) -> None:
-    source = tmp_path / 'caf\u00e9_\u65e5\u672c.jpg'
-    source.write_bytes(b'image-data')
-    path = str(source).encode('utf-8') if byte_path else str(source)
-    encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg = _upload_client([_text(encoded), _text(), _text('1:42 linked')])
-
-    assert sg.upload('Version', 5, path, 'sg_uploaded_movie') == 42
-
-    transport = cast('_ConsumingFakeTransport', _fake_transport(sg))
-    assert transport.bodies[2] == b'image-data'
-    assert _form_fields(cast('bytes', transport.bodies[1]))['filename'] == source.name
 
 
 def test_upload_public_signatures_match_the_observed_surface() -> None:
@@ -1662,7 +1760,28 @@ def test_upload_rejects_invalid_created_at_before_network(tmp_path: Path) -> Non
     with pytest.raises(ShotgunError, match=r'^created_at must be a datetime\.datetime instance$'):
         upload('Version', 5, str(image), created_at='2026-02-15T10:30:00Z')
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize('byte_path', [False, True], ids=['unicode-str', 'utf8-bytes'])
+def test_upload_accepts_unicode_and_utf8_byte_paths(tmp_path: Path, byte_path: bool) -> None:
+    source = tmp_path / 'caf\u00e9_\u65e5\u672c.jpg'
+    source.write_bytes(b'image-data')
+    path = str(source).encode('utf-8') if byte_path else str(source)
+    encoded = '1 https://storage.example/object timestamp Attachment upload-1'
+    sg = _upload_client(
+        [
+            forbidden_text_response(encoded),
+            forbidden_text_response(),
+            forbidden_text_response('1:42 linked'),
+        ]
+    )
+
+    assert sg.upload('Version', 5, path, 'sg_uploaded_movie') == 42
+
+    transport = _upload_transport(sg)
+    assert transport.bodies[2] == b'image-data'
+    assert form_fields(cast('bytes', transport.bodies[1]))['filename'] == source.name
 
 
 @pytest.mark.parametrize(
@@ -1676,9 +1795,99 @@ def test_upload_rejects_invalid_files_before_http(tmp_path: Path, kind: str, mes
     path = tmp_path / 'clip.mov'
     if kind == 'empty':
         path.touch()
-    sg = _fake_client([])
+    sg = fake_client([])
 
     with pytest.raises(ShotgunError, match=f'^{re.escape(message.format(path))}$'):
         sg.upload('Version', 5, str(path), field_name='sg_uploaded_movie')
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize('keyword', ['field_name', 'display_naem'])
+def test_share_thumbnail_path_errors_name_share_thumbnail(
+    tmp_path: Path,
+    keyword: str,
+) -> None:
+    image = tmp_path / 'image.jpg'
+    image.write_bytes(b'image')
+    sg = fake_client([])
+    share_thumbnail = cast('Callable[..., object]', sg.share_thumbnail)
+    with pytest.raises(TypeError) as caught:
+        share_thumbnail(
+            [{'type': 'Version', 'id': 2}],
+            thumbnail_path=str(image),
+            **{keyword: 'value'},
+        )
+    assert 'Shotgun.share_thumbnail()' in str(caught.value)
+    assert keyword in str(caught.value)
+    assert fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize('operation', ['upload link', 'share_thumbnail'])
+def test_link_failure_names_operation_and_target(operation: str) -> None:
+    with pytest.raises(_errors.ShotgunError) as caught:
+        _files.parse_link_completion(
+            '0: server-private reason',
+            operation=operation,
+            entities=[{'type': 'Shot', 'id': 41}],
+        )
+
+    message = str(caught.value)
+    assert operation in message
+    assert 'entity_type=Shot' in message
+    assert 'entity_id=41' in message
+    assert 'server-private reason' not in message
+
+
+@pytest.mark.parametrize('response', ['', '0', 'garbage', '1:bad'])
+def test_unparseable_link_failure_keeps_generic_text(response: str) -> None:
+    with pytest.raises(_errors.ShotgunError, match=r'^upload link returned an invalid response$'):
+        _files.parse_link_completion(
+            response,
+            operation='share_thumbnail',
+            entities=[{'type': 'Shot', 'id': 41}],
+        )
+
+
+@pytest.mark.parametrize('operation', ['upload link', 'share_thumbnail'])
+def test_link_failure_names_operation_and_target_through_sync_client(
+    tmp_path: Path, operation: str
+) -> None:
+    source = tmp_path / 'source.bin'
+    source.write_bytes(b'image')
+    responses: list[TransportResponse | TransportError] = [
+        TransportResponse(200, 'OK', {}, b'0: secret server reason')
+    ]
+    if operation == 'upload link':
+        responses = [
+            TransportResponse(
+                200, 'OK', {}, b'1 https://storage.example/image timestamp Attachment upload-1'
+            ),
+            TransportResponse(200, 'OK', {}, b''),
+            *responses,
+        ]
+    sg = fake_client(
+        responses,
+        server_info={
+            'version': [9, 0, 0],
+            's3_direct_uploads_enabled': True,
+            's3_enabled_upload_types': {'*': ['*']},
+        },
+    )
+
+    def call() -> None:
+        if operation == 'upload link':
+            sg.upload('Shot', 41, str(source))
+        else:
+            sg.share_thumbnail(
+                [{'type': 'Shot', 'id': 41}],
+                source_entity={'type': 'Shot', 'id': 7},
+            )
+
+    with pytest.raises(_errors.ShotgunError) as caught:
+        call()
+
+    message = str(caught.value)
+    assert operation in message
+    assert 'entity_type=Shot entity_id=41' in message
+    assert 'secret server reason' not in message

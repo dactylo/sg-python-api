@@ -94,15 +94,8 @@ async def _run(args: _Arguments, script_name: str, api_key: str) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the asynchronous public-client example.
-
-    Args:
-        argv: Command-line arguments, or `None` to read `sys.argv`.
-
-    Returns:
-        Zero on success, or one for an expected example failure.
-    """
+def _main(argv: Sequence[str] | None = None) -> int:
+    """Run the asynchronous public-client example."""
     args = _parse_args(argv)
     try:
         script_name, api_key = _load_credentials(args.credentials_file)
@@ -113,4 +106,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

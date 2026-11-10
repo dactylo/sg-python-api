@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
-import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from tests._git import git_env
+from shotgun_api3 import _version
+from tests._git import commit_fixture, git_env
+from tests.tooling._wheels import write_wheel
 
 _FAKE_GIT = r"""#!/bin/sh
 set -eu
@@ -66,7 +66,10 @@ if [ "${1:-}" = '-m' ] && [ "${2:-}" = 'installer' ]; then
     [ -n "$destination" ]
     package_root="$destination/opt/custom/lib/python3.13/site-packages"
     mkdir -p "$package_root/shotgun_api3"
-    printf '%s\n' "__version__ = '0.1.2'" >"$package_root/shotgun_api3/__init__.py"
+    printf '%s\n' "__version__ = '3.10.5'" >"$package_root/shotgun_api3/__init__.py"
+    mkdir -p "$package_root/sg_python_api-9.9.9.dist-info"
+    printf 'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 9.9.9\n' \
+        >"$package_root/sg_python_api-9.9.9.dist-info/METADATA"
     exit 0
 fi
 
@@ -134,7 +137,12 @@ _SEPARATOR = (
     '------------------ | --------------------- | ------ | ------ | '
     '------- | ----- |'
 )
-_WHEEL_NAME = 'sg_python_api-0.1.2-py3-none-any.whl'
+_WHEEL_NAME = 'sg_python_api-9.9.9-py3-none-any.whl'
+
+
+def _assert_secrets_absent(text: str) -> None:
+    for secret in ('RAW AUTODESK', 'script-secret', 'human-secret'):
+        assert secret not in text
 
 
 def _credential_env() -> dict[str, str]:
@@ -162,6 +170,22 @@ def _driver_source() -> str:
     )[0]
 
 
+def _fake_git_marker(tmp_path: Path, env: dict[str, str]) -> Path:
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    git_marker = tmp_path / 'git-called'
+    fake_git = fake_bin / 'git'
+    fake_git.write_text(
+        '#!/bin/sh\nset -eu\nprintf called >"$GIT_MARKER"\nexit 99\n',
+        encoding='ascii',
+        newline='\n',
+    )
+    fake_git.chmod(0o755)
+    env['GIT_MARKER'] = str(git_marker)
+    env['PATH'] = f'{fake_bin}{os.pathsep}{env["PATH"]}'
+    return git_marker
+
+
 def _git(candidate: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     assert _GIT is not None
     return subprocess.run(
@@ -187,10 +211,36 @@ def _ledger_rows(
     # The gate stamps its own UTC date between the two bounds, so it matches one of them even
     # when a run crosses midnight.
     return {
-        f'| {day.isoformat()} | {candidate_commit} | 0.1.2 | {wheel_hash} | '
-        f'v3.10.3 | 6f56cf219152d0e8a8e92d7f0507b28f02f86905 | {tally} |'
+        f'| {day.isoformat()} | {candidate_commit} | 9.9.9 | {wheel_hash} | '
+        f'v3.10.5 | cf5eb6a000d34f0ae0d447ff8725763d2692967a | {tally} |'
         for day in run_dates
     }
+
+
+def _run_gate(candidate: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ['sh', str(candidate / 'scripts' / _RUNNER.name)],
+        cwd=candidate,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _tally_counts(results_xml: Path) -> dict[str, str]:
+    xml = results_xml.read_text(encoding='utf-8')
+    suite = re.search(r'<testsuite\b([^>]*)>', xml)
+    assert suite is not None
+    return dict(re.findall(r'\b(errors|failures|skipped)="([0-9]+)"', suite.group(1)))
+
+
+def _write_distribution(site_packages: Path, version: str) -> None:
+    info = site_packages / f'sg_python_api-{version}.dist-info'
+    info.mkdir(parents=True)
+    (info / 'METADATA').write_text(
+        f'Metadata-Version: 2.4\nName: sg-python-api\nVersion: {version}\n', encoding='ascii'
+    )
 
 
 def _run_driver_collection(
@@ -199,6 +249,7 @@ def _run_driver_collection(
     *,
     import_during_test: bool = False,
     module_present: bool = False,
+    distribution_version: str = '9.9.9',
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     driver_path = tmp_path / 'conformance_driver.py'
     driver_path.write_text(_driver_source(), encoding='ascii')
@@ -208,8 +259,9 @@ def _run_driver_collection(
     package_root = site_packages / 'shotgun_api3'
     library_root = package_root / 'lib'
     library_root.mkdir(parents=True)
-    (package_root / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
+    (package_root / '__init__.py').write_text("__version__ = '3.10.5'\n", encoding='ascii')
     (library_root / '__init__.py').write_text('', encoding='ascii')
+    _write_distribution(site_packages, distribution_version)
     if module_present:
         module_basename = module_name.rsplit('.', maxsplit=1)[1]
         (library_root / f'{module_basename}.py').write_text('', encoding='ascii')
@@ -235,7 +287,7 @@ def _run_driver_collection(
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.2',
+            '9.9.9',
         ],
         capture_output=True,
         text=True,
@@ -244,30 +296,18 @@ def _run_driver_collection(
     return result, results_xml
 
 
-def _run_gate(candidate: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ['sh', str(candidate / 'scripts' / _RUNNER.name)],
-        cwd=candidate,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 def _write_wheel_fixture(candidate: Path) -> str:
     wheel = candidate / 'dist' / 'validated-artifacts' / 'source' / _WHEEL_NAME
     wheel.parent.mkdir(parents=True)
-    metadata = zipfile.ZipInfo(
-        'sg_python_api-0.1.2.dist-info/METADATA',
-        date_time=(1980, 1, 1, 0, 0, 0),
+    return write_wheel(
+        wheel,
+        {
+            'sg_python_api-9.9.9.dist-info/METADATA': (
+                'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 9.9.9\n'
+            )
+        },
+        fixed_timestamp=True,
     )
-    with zipfile.ZipFile(wheel, mode='w') as archive:
-        archive.writestr(
-            metadata,
-            'Metadata-Version: 2.4\nName: sg-python-api\nVersion: 0.1.2\n',
-        )
-    return hashlib.sha256(wheel.read_bytes()).hexdigest()
 
 
 def _prepare_gate_candidate(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
@@ -280,22 +320,18 @@ def _prepare_gate_candidate(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
         _REPO_ROOT / 'scripts' / '_artifact_evidence.py',
         candidate / 'scripts' / '_artifact_evidence.py',
     )
+    shutil.copy2(
+        _REPO_ROOT / 'scripts' / 'artifact_inputs.txt',
+        candidate / 'scripts' / 'artifact_inputs.txt',
+    )
     wheel_hash = _write_wheel_fixture(candidate)
     (candidate / '.gitignore').write_text('dist/\n', encoding='ascii')
     (candidate / 'dist' / 'conformance-results.md').write_text(_HEADER + '\n', encoding='ascii')
     (candidate / 'artifact-input.txt').write_text('validated input\n', encoding='ascii')
     _git(candidate, 'init', '--quiet')
     _git(candidate, 'add', '.')
-    _git(
-        candidate,
-        '-c',
-        'user.name=Conformance Test',
-        '-c',
-        'user.email=conformance@example.invalid',
-        'commit',
-        '--quiet',
-        '-m',
-        'candidate',
+    commit_fixture(
+        candidate, 'candidate', identity=('Conformance Test', 'conformance@example.invalid')
     )
     candidate_commit = _git(candidate, 'rev-parse', 'HEAD').stdout.strip()
     (candidate / 'dist' / 'artifact-results.md').write_text(
@@ -320,7 +356,7 @@ def _prepare_gate_candidate(tmp_path: Path) -> tuple[Path, dict[str, str], str]:
     env['CANDIDATE_ROOT'] = str(candidate)
     env['COMMAND_LOG'] = str(tmp_path / 'commands.log')
     Path(env['COMMAND_LOG']).write_text('', encoding='ascii')
-    env['FAKE_OFFICIAL_COMMIT'] = '6f56cf219152d0e8a8e92d7f0507b28f02f86905'
+    env['FAKE_OFFICIAL_COMMIT'] = 'cf5eb6a000d34f0ae0d447ff8725763d2692967a'
     env['REAL_GIT_PATH'] = subprocess.run(
         ['sh', '-c', 'printf "%s" "$PATH"'],
         env=env,
@@ -361,19 +397,20 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
     site_packages = install_root / 'lib' / 'python' / 'site-packages'
     candidate = site_packages / 'shotgun_api3'
     candidate.mkdir(parents=True)
-    (candidate / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
+    (candidate / '__init__.py').write_text("__version__ = '9.9.9'\n", encoding='ascii')
+    _write_distribution(site_packages, '9.9.9')
 
     competing_site = tmp_path / 'competing-site'
     competitor = competing_site / 'shotgun_api3'
     competitor.mkdir(parents=True)
-    (competitor / '__init__.py').write_text("__version__ = '0.1.2'\n", encoding='ascii')
+    (competitor / '__init__.py').write_text("__version__ = '9.9.9'\n", encoding='ascii')
 
     tests_root = tmp_path / 'tests'
     tests_root.mkdir()
     (tests_root / 'test_candidate.py').write_text(
         'def test_candidate_is_importable():\n'
         '    import shotgun_api3\n'
-        "    assert shotgun_api3.__version__ == '0.1.2'\n",
+        "    assert shotgun_api3.__version__ == '9.9.9'\n",
         encoding='ascii',
     )
     results_xml = tmp_path / 'results.xml'
@@ -397,7 +434,7 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
             str(install_root),
             str(tests_root),
             str(results_xml),
-            '0.1.2',
+            '9.9.9',
         ],
         capture_output=True,
         text=True,
@@ -405,6 +442,37 @@ def test_candidate_import_precedes_competing_site_package(tmp_path: Path) -> Non
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_conformance_ref_matches_compatibility_target() -> None:
+    match = re.search(
+        r"^OFFICIAL_REF='([^']+)'$", _RUNNER.read_text(encoding='ascii'), re.MULTILINE
+    )
+
+    assert match is not None
+    assert match.group(1) == f'v{_version.COMPATIBILITY_VERSION}'
+
+
+@pytest.mark.parametrize(('distribution_version', 'accepted'), [('9.9.9', True), ('8.8.8', False)])
+def test_driver_checks_installed_distribution_version(
+    tmp_path: Path, distribution_version: str, *, accepted: bool
+) -> None:
+    # The candidate's __version__ reports the compatibility target, not its release.
+    result, results_xml = _run_driver_collection(
+        tmp_path,
+        'shotgun_api3.lib.other_missing',
+        module_present=True,
+        distribution_version=distribution_version,
+    )
+
+    mismatch = 'Installed candidate version does not match artifact validation evidence'
+    assert (mismatch not in result.stderr) is accepted, result.stderr
+    if accepted:
+        assert result.returncode == 0, result.stderr
+        assert results_xml.is_file()
+    else:
+        assert result.returncode == 86
+        assert not results_xml.exists()
 
 
 def test_driver_does_not_skip_documented_httplib2_runtime_import(tmp_path: Path) -> None:
@@ -415,10 +483,7 @@ def test_driver_does_not_skip_documented_httplib2_runtime_import(tmp_path: Path)
     )
 
     assert result.returncode == 1, result.stdout + result.stderr
-    xml = results_xml.read_text(encoding='utf-8')
-    suite = re.search(r'<testsuite\b([^>]*)>', xml)
-    assert suite is not None
-    counts = dict(re.findall(r'\b(errors|failures|skipped)="([0-9]+)"', suite.group(1)))
+    counts = _tally_counts(results_xml)
     assert counts == {'errors': '0', 'failures': '1', 'skipped': '0'}
 
 
@@ -439,10 +504,7 @@ def test_driver_imports_present_documented_httplib2_module(tmp_path: Path) -> No
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    xml = results_xml.read_text(encoding='utf-8')
-    suite = re.search(r'<testsuite\b([^>]*)>', xml)
-    assert suite is not None
-    counts = dict(re.findall(r'\b(errors|failures|skipped)="([0-9]+)"', suite.group(1)))
+    counts = _tally_counts(results_xml)
     assert counts == {'errors': '0', 'failures': '0', 'skipped': '0'}
 
 
@@ -455,56 +517,20 @@ def test_driver_rejects_unadapted_httplib2_collection_import(tmp_path: Path) -> 
     assert result.returncode == 2
 
 
-def test_git_fallthrough_supports_path_resolving_shim(tmp_path: Path) -> None:
-    candidate, env, _ = _prepare_gate_candidate(tmp_path)
-    shim = tmp_path / 'git-shim'
-    shim.write_text(
-        '#!/bin/sh\n'
-        'set -eu\n'
-        'if [ "${SHIM_ACTIVE:-}" = 1 ]; then exit 99; fi\n'
-        'export SHIM_ACTIVE=1\n'
-        'exec git "$@"\n',
-        encoding='ascii',
-        newline='\n',
-    )
-    shim.chmod(0o755)
-    env.pop('SHIM_ACTIVE', None)
-    env['REAL_GIT'] = str(shim)
-
-    result = subprocess.run(
-        ['sh', str(tmp_path / 'bin' / 'git'), '-C', str(candidate), 'rev-parse', 'HEAD'],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == _git(candidate, 'rev-parse', 'HEAD').stdout
-
-
 def test_missing_artifact_evidence_fails_before_git(tmp_path: Path) -> None:
     candidate = tmp_path / 'candidate'
-    fake_bin = tmp_path / 'bin'
     (candidate / 'scripts').mkdir(parents=True)
-    fake_bin.mkdir()
     shutil.copy2(_RUNNER, candidate / 'scripts' / _RUNNER.name)
     shutil.copy2(
         _REPO_ROOT / 'scripts' / '_artifact_evidence.py',
         candidate / 'scripts' / '_artifact_evidence.py',
     )
-    git_marker = tmp_path / 'git-called'
-    fake_git = fake_bin / 'git'
-    fake_git.write_text(
-        '#!/bin/sh\nset -eu\nprintf called >"$GIT_MARKER"\nexit 99\n',
-        encoding='ascii',
-        newline='\n',
+    shutil.copy2(
+        _REPO_ROOT / 'scripts' / 'artifact_inputs.txt',
+        candidate / 'scripts' / 'artifact_inputs.txt',
     )
-    fake_git.chmod(0o755)
     env = _credential_env()
-    env['GIT_MARKER'] = str(git_marker)
-    env['PATH'] = f'{fake_bin}{os.pathsep}{env["PATH"]}'
+    git_marker = _fake_git_marker(tmp_path, env)
 
     result = subprocess.run(
         ['sh', str(candidate / 'scripts' / _RUNNER.name)],
@@ -521,19 +547,8 @@ def test_missing_artifact_evidence_fails_before_git(tmp_path: Path) -> None:
 
 
 def test_missing_credentials_fail_before_external_commands(tmp_path: Path) -> None:
-    fake_bin = tmp_path / 'bin'
-    fake_bin.mkdir()
-    git_marker = tmp_path / 'git-called'
-    fake_git = fake_bin / 'git'
-    fake_git.write_text(
-        '#!/bin/sh\nset -eu\nprintf called >"$GIT_MARKER"\nexit 99\n',
-        encoding='ascii',
-        newline='\n',
-    )
-    fake_git.chmod(0o755)
     env = git_env()
-    env['GIT_MARKER'] = str(git_marker)
-    env['PATH'] = f'{fake_bin}{os.pathsep}{env["PATH"]}'
+    git_marker = _fake_git_marker(tmp_path, env)
     for name in (
         'SG_TEST_HUMAN_LOGIN',
         'SG_TEST_HUMAN_PASSWORD',
@@ -570,17 +585,13 @@ def test_pytest_failures_produce_a_valid_sanitized_tally(tmp_path: Path) -> None
     assert result.returncode == 1, result.stderr
     assert 'passed: 1\nfailed: 2\nskipped: 1\n' in result.stdout
     combined_output = result.stdout + result.stderr
-    assert 'RAW AUTODESK' not in combined_output
-    assert 'script-secret' not in combined_output
-    assert 'human-secret' not in combined_output
+    _assert_secrets_absent(combined_output)
     ledger_after = _ledger_lines(candidate)
     assert ledger_after[:-1] == ledger_before
     assert ledger_after[-1] in _ledger_rows(
         run_dates, candidate_commit, wheel_hash, '1 | 2 | 1 | FAIL (pytest exit 1)'
     )
-    assert 'RAW AUTODESK' not in ledger_after[-1]
-    assert 'script-secret' not in ledger_after[-1]
-    assert 'human-secret' not in ledger_after[-1]
+    _assert_secrets_absent(ledger_after[-1])
     assert list(Path(env['TMPDIR']).iterdir()) == []
 
 
@@ -609,16 +620,8 @@ def test_stale_artifact_input_fails_before_clone(
     if change_state in {'committed', 'staged'}:
         _git(candidate, 'add', 'artifact-input.txt')
     if change_state == 'committed':
-        _git(
-            candidate,
-            '-c',
-            'user.name=Conformance Test',
-            '-c',
-            'user.email=conformance@example.invalid',
-            'commit',
-            '--quiet',
-            '-m',
-            'stale input',
+        commit_fixture(
+            candidate, 'stale input', identity=('Conformance Test', 'conformance@example.invalid')
         )
 
     result = _run_gate(candidate, env)
@@ -668,34 +671,30 @@ def test_success_prints_only_sanitized_tally_and_cleans_workspace(
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         f'candidate commit: {candidate_commit}',
-        'candidate version: 0.1.2',
+        'candidate version: 9.9.9',
         f'artifact sha256: {wheel_hash}',
-        'official suite ref: v3.10.3',
-        'official suite commit: 6f56cf219152d0e8a8e92d7f0507b28f02f86905',
+        'official suite ref: v3.10.5',
+        'official suite commit: cf5eb6a000d34f0ae0d447ff8725763d2692967a',
         'passed: 2',
         'failed: 0',
         'skipped: 1',
     ]
     combined_output = result.stdout + result.stderr
-    assert 'RAW AUTODESK' not in combined_output
-    assert 'script-secret' not in combined_output
-    assert 'human-secret' not in combined_output
+    _assert_secrets_absent(combined_output)
     ledger_after = _ledger_lines(candidate)
     assert ledger_after[:-1] == ledger_before
     assert ledger_after[-1] in _ledger_rows(
         run_dates, candidate_commit, wheel_hash, '2 | 0 | 1 | PASS'
     )
-    assert 'RAW AUTODESK' not in ledger_after[-1]
-    assert 'script-secret' not in ledger_after[-1]
-    assert 'human-secret' not in ledger_after[-1]
+    _assert_secrets_absent(ledger_after[-1])
     assert list(Path(env['TMPDIR']).iterdir()) == []
 
     commands = Path(env['COMMAND_LOG']).read_text(encoding='ascii')
     assert (
-        'clone --quiet --no-checkout --depth 1 --branch v3.10.3 '
+        'clone --quiet --no-checkout --depth 1 --branch v3.10.5 '
         'https://github.com/shotgunsoftware/python-api'
     ) in commands
-    assert 'checkout --quiet --detach 6f56cf219152d0e8a8e92d7f0507b28f02f86905' in commands
+    assert 'checkout --quiet --detach cf5eb6a000d34f0ae0d447ff8725763d2692967a' in commands
     assert '-m installer --destdir' in commands
     assert '-I ' in commands
 
@@ -712,9 +711,7 @@ def test_work_root_inside_candidate_fails_before_clone_or_config(tmp_path: Path)
     assert result.stdout == ''
     assert result.stderr == 'Disposable work root must be outside the repository\n'
     combined_output = result.stdout + result.stderr
-    assert 'RAW AUTODESK' not in combined_output
-    assert 'script-secret' not in combined_output
-    assert 'human-secret' not in combined_output
+    _assert_secrets_absent(combined_output)
     commands = Path(env['COMMAND_LOG']).read_text(encoding='ascii')
     assert not any(
         marker in commands

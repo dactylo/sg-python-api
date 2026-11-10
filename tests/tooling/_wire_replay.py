@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from shotgun_api3._client import Shotgun
 
 
-_REPLAY_RECIPES: Mapping[
+REPLAY_RECIPES: Mapping[
     str,
     Callable[[Shotgun, Mapping[str, object] | None], object],
 ] = {
@@ -64,7 +64,7 @@ _REPLAY_RECIPES: Mapping[
     ),
 }
 
-_ASYNC_REPLAY_RECIPES: Mapping[
+ASYNC_REPLAY_RECIPES: Mapping[
     str,
     Callable[[AsyncShotgun, Mapping[str, object] | None], Awaitable[object]],
 ] = {

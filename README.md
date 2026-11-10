@@ -20,7 +20,7 @@ This documentation uses SG for Flow Production Tracking, formerly named Shotgun 
   for application tests.
 
 sg-python-api is an independent implementation of the documented API of Autodesk's Python client
-`3.10.3`. Some behavior differs on purpose, so validate your application's workflows against a test
+`3.10.5`. Some behavior differs on purpose, so validate your application's workflows against a test
 site before replacing its production client. The [migration guide](docs/migration-guide.md) walks
 through the switch, and the [compatibility reference](COMPATIBILITY.md) lists the differences.
 
@@ -102,23 +102,20 @@ asyncio.run(main())
 ```
 
 The output matches the synchronous example. The `async with` block closes the client even when an
-operation fails. Without the `async` extra, importing `AsyncShotgun` raises `ImportError`.
-
-Share an `AsyncShotgun` only among tasks on one event loop, and cancel its work by cancelling the
-task. A cancelled write may already have reached the server, so check its outcome before repeating
-it. The [async reference](COMPATIBILITY.md#async-extension-surfaces) covers shutdown and
-cancellation in detail.
+operation fails. Share an `AsyncShotgun` only among tasks on one event loop. See the
+[async reference](COMPATIBILITY.md#async-extension-surfaces) for lifecycle and cancellation
+details.
 
 ## Documentation
 
-| If you want to...                                     | Read                                                                               |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Replace Autodesk's client in an existing application  | [Migration guide](docs/migration-guide.md)                                         |
-| Check what behaves differently from Autodesk's client | [Compatibility](COMPATIBILITY.md)                                                  |
-| Tune pooling and page prefetch, or observe requests   | [Configuration extensions](COMPATIBILITY.md#configuration-and-observer-extensions) |
-| Confirm which client loads and run a smoke test       | [Testing an installation](docs/testing.md)                                         |
-| Compare measured latency and transfer memory          | [Benchmarks](docs/benchmarks.md)                                                   |
-| See changes by version                                | [Changelog](CHANGELOG.md)                                                          |
+| If you want to...                                                  | Read                                                                               |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| Replace Autodesk's client in an existing application               | [Migration guide](docs/migration-guide.md)                                         |
+| Check what behaves differently from Autodesk's client              | [Compatibility](COMPATIBILITY.md)                                                  |
+| Tune pooling, TCP keepalive, or page prefetch, or observe requests | [Configuration extensions](COMPATIBILITY.md#configuration-and-observer-extensions) |
+| Confirm which client loads and run a smoke test                    | [Testing an installation](docs/testing.md)                                         |
+| Compare measured latency and transfer memory                       | [Benchmarks](docs/benchmarks.md)                                                   |
+| See changes by version                                             | [Changelog](CHANGELOG.md)                                                          |
 
 ## Development
 
@@ -127,11 +124,11 @@ With those tools installed, run:
 
 ```sh
 make setup
-make check
+make check TEST_FLAGS="-m 'not live'"
 ```
 
-`make check` also runs the live-site tests, which create and delete records, whenever the
-`SG_TEST_*` variables described in the development guide are set.
+See [live-site tests](docs/development.md#live-site-tests) to configure tests that create and
+retire records on a disposable site.
 
 ## License
 

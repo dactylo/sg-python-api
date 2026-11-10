@@ -1,9 +1,10 @@
 """Async transport vocabulary and streaming response handling."""
 
 import asyncio
+from abc import abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from ._transport import (
     CaseInsensitiveHeaders,
@@ -57,7 +58,14 @@ class AsyncStreamingResponse:
             raise TransportError('streaming response is closed')
 
     async def close(self) -> None:
-        """Release resources associated with the streaming response."""
+        """Run the response cleanup callback at most once.
+
+        The callback is cleared before invocation, so a failed cleanup is not
+        retried by later calls.
+
+        Raises:
+            Exception: If the supplied cleanup callback fails.
+        """
         close_fn = self._close_fn
         self._close_fn = None
         if close_fn is not None:
@@ -98,10 +106,37 @@ class AsyncStreamingResponse:
         return self._iterate(size)
 
 
+@runtime_checkable
+class AsyncUploadObserver(Protocol):
+    """Separate worker-thread upload reads from event-loop progress callbacks.
+
+    Implementations pull chunks without observing them. The async transport
+    invokes the observer on its event loop after each worker-thread pull.
+    """
+
+    @abstractmethod
+    def observe_async_chunk(self, chunk: bytes) -> None:
+        """Account for one uploaded chunk on the event loop.
+
+        Args:
+            chunk: Chunk returned by `pull_for_async()`.
+        """
+        ...
+
+    @abstractmethod
+    def pull_for_async(self) -> bytes | None:
+        """Pull a chunk without invoking its progress observer.
+
+        Returns:
+            The next chunk, or `None` when no more chunks are available.
+        """
+        ...
+
+
 class AsyncTransport(Protocol):
     """HTTP backend operations required by the async driver.
 
-    Task cancellation replaces the sync transport's `abort` operation. The
+    Task cancellation interrupts asynchronous transport operations. The
     synchronous lease pair brackets one complete logical RPC so draining close
     operations cannot interrupt a retry loop between attempts.
     """

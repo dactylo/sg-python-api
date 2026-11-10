@@ -23,29 +23,21 @@ more samples before drawing conclusions about tail latency. The
 [pool and prefetch controls](../COMPATIBILITY.md#configuration-and-observer-extensions) describe
 what the client settings change.
 
-## What the results do not show
-
-Only two paired samples were collected per operation and mode, and network and server load were not
-controlled. The results therefore do not establish a general performance advantage for either
-client, a reliable tail-latency estimate, or suitable tuning for your application.
-
-The results describe one measured build and environment. They do not validate other builds with the
-same version number, later changes to the source, or a production deployment. The maintainers
-retain the raw report of this measured run outside this repository. A new run writes its own raw
-report.
+Only two paired samples are available per operation and mode, with uncontrolled network and server
+load. They do not establish a general performance advantage, a reliable tail-latency estimate, or
+suitable tuning for another workload or environment.
 
 ## Measurement conditions
 
 In the tables below, "replacement" means sg-python-api and "official" means Autodesk's client.
 
-| Setting                     | Value                                                                   |
-| --------------------------- | ----------------------------------------------------------------------- |
-| Replacement package version | `0.1.1`                                                                 |
-| Autodesk client version     | `3.10.2`                                                                |
-| Python                      | `3.14.6`                                                                |
-| Platform                    | macOS, arm64                                                            |
-| Samples                     | Two paired rounds per client, operation, and cold/warm mode             |
-| Validation                  | Each measured result and the final resource cleanup passed their checks |
+| Setting                     | Value                                                       |
+| --------------------------- | ----------------------------------------------------------- |
+| Replacement package version | `0.1.1`                                                     |
+| Autodesk client version     | `3.10.2`                                                    |
+| Python                      | `3.14.6`                                                    |
+| Platform                    | macOS, arm64                                                |
+| Samples                     | Two paired rounds per client, operation, and cold/warm mode |
 
 ## Latency
 
@@ -103,14 +95,9 @@ thread, while the replacement row shares one client across four persistent threa
 concurrent reads and exclude thread and client setup and closure from timing. These ownership
 choices reflect how each client can be used; they are part of the comparison.
 
-A full run writes disposable server records and uploads files. At the default 2 paired rounds, the
-workload budget is 18 worker processes, 184 server entities, and 332,032,784 uploaded bytes. A
-larger even `BENCH_N`, up to 20, increases the budget to as much as 162 worker processes, 1,840
-server entities, and 3,320,327,840 uploaded bytes. Each worker has a one-hour timeout, with
-resource recovery and cleanup checks after interruption. See the
-[development guide](development.md#artifacts-conformance-and-benchmarks) to measure your own site.
-It needs a disposable site and project, and you should account for these costs before a run.
+To measure your own site, follow [Measure performance](development.md#measure-performance). That
+task lists the disposable-site prerequisites, workload budgets, and command settings.
 
-The replacement's upload route labels come from its observed request metadata. The official
-client's upload labels come from server capability evidence. A route comparison applies only where
-that route was available; it does not establish legacy fallback behavior on other sites.
+Upload route labels use request metadata for sg-python-api and server capabilities for Autodesk's
+client. Compare a route only when it is available on your site. These results do not describe
+legacy form-upload fallback.

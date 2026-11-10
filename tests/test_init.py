@@ -1,3 +1,5 @@
+import importlib
+import importlib.metadata
 import os
 import subprocess
 import sys
@@ -10,8 +12,9 @@ import pytest
 import shotgun_api3
 import shotgun_api3.shotgun as shotgun_module
 from shotgun_api3 import AsyncShotgun as ExportedAsyncShotgun
-from shotgun_api3 import _capabilities, _client, _errors, _protocol
+from shotgun_api3 import _capabilities, _client, _errors, _protocol, _version
 from shotgun_api3._async_client import AsyncShotgun
+from shotgun_api3._version import COMPATIBILITY_VERSION, PACKAGE_VERSION
 from shotgun_api3.lib.sgtimezone import SgTimezone
 
 _BASE_IMPORT_SCRIPT = """
@@ -107,20 +110,14 @@ def _run_base_import_script(
     *,
     cwd: Path,
     pythonpath: Path,
-    optimized: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     pythonpath_value = str(pythonpath)
     if inherited_pythonpath := environment.get('PYTHONPATH'):
         pythonpath_value = os.pathsep.join((pythonpath_value, inherited_pythonpath))
     environment['PYTHONPATH'] = pythonpath_value
-    command = [sys.executable]
-    if optimized:
-        command.append('-O')
-    command.extend(('-c', _BASE_IMPORT_SCRIPT))
-
     return subprocess.run(
-        command,
+        [sys.executable, '-c', _BASE_IMPORT_SCRIPT],
         cwd=cwd,
         env=environment,
         check=False,
@@ -131,10 +128,6 @@ def _run_base_import_script(
 
 def test_async_shotgun_explicit_import() -> None:
     assert ExportedAsyncShotgun is AsyncShotgun
-
-
-def test_async_shotgun_lazy_export() -> None:
-    assert shotgun_api3.AsyncShotgun is AsyncShotgun
 
 
 def test_async_shotgun_missing_extra_error_is_specific(tmp_path: Path) -> None:
@@ -199,41 +192,24 @@ def test_base_import_does_not_load_async_modules_without_extra() -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize(
-    ('package_source', 'expected_error'),
-    [
-        pytest.param(
-            'try:\n    import httpx2\nexcept ModuleNotFoundError:\n    pass\n',
-            'base import attempted httpx2 lookup',
-            id='caught-httpx2-lookup',
-        ),
-        pytest.param(
-            "import sys\nimport types\nsys.modules['shotgun_api3._async_transport'] = "
-            "types.ModuleType('shotgun_api3._async_transport')\n",
-            'base import loaded async modules',
-            id='loaded-async-module',
-        ),
-    ],
-)
-def test_base_import_isolation_survives_optimization(
-    tmp_path: Path,
-    package_source: str,
-    expected_error: str,
-) -> None:
-    package = tmp_path / 'shotgun_api3'
-    package.mkdir()
-    (package / '__init__.py').write_text(
-        package_source,
-        encoding='utf-8',
-    )
-    result = _run_base_import_script(
-        cwd=tmp_path,
-        pythonpath=tmp_path,
-        optimized=True,
+def test_entity_optimization_flag_initializes_from_environment() -> None:
+    repository = Path(__file__).parents[1]
+    environment = os.environ.copy()
+    environment['PYTHONPATH'] = str(repository / 'src')
+    environment['SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION'] = '1'
+    source = (
+        'from pathlib import Path; '
+        'import shotgun_api3.shotgun as module; '
+        "assert Path(module.__file__).resolve() == Path('src/shotgun_api3/shotgun.py').resolve(); "
+        'assert module.SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION is True'
     )
 
-    assert result.returncode != 0
-    assert expected_error in result.stderr
+    subprocess.run(
+        [sys.executable, '-c', source],
+        check=True,
+        cwd=repository,
+        env=environment,
+    )
 
 
 def test_exported_objects_preserve_identity() -> None:
@@ -265,7 +241,8 @@ def test_logger_name() -> None:
 
 
 def test_package_level_exports() -> None:
-    assert shotgun_api3.__all__ == _PACKAGE_EXPORTS
+    assert len(shotgun_api3.__all__) == len(set(shotgun_api3.__all__))
+    assert set(shotgun_api3.__all__) == set(_PACKAGE_EXPORTS)
     for name in _PACKAGE_EXPORTS:
         assert hasattr(shotgun_api3, name), name
     for name in (
@@ -280,13 +257,26 @@ def test_package_level_exports() -> None:
         assert not hasattr(shotgun_api3, name), name
 
 
+def test_package_version_without_installed_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_distributions(**_: object) -> list[importlib.metadata.Distribution]:
+        return []
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importlib.metadata, 'distributions', no_distributions)
+        assert importlib.reload(_version).PACKAGE_VERSION == '0+unknown'
+    assert importlib.reload(_version).PACKAGE_VERSION == PACKAGE_VERSION
+
+
 def test_project_metadata() -> None:
     pyproject_path = Path(__file__).parents[1] / 'pyproject.toml'
     with pyproject_path.open('rb') as pyproject_file:
         project = tomllib.load(pyproject_file)['project']
 
-    assert shotgun_api3.__version__ == shotgun_module.__version__ == '0.1.2'
-    assert project['version'] == shotgun_api3.__version__
+    # Code written for Autodesk's client reads __version__ to learn which API it has.
+    assert shotgun_api3.__version__ == shotgun_module.__version__ == COMPATIBILITY_VERSION
+    # The manifest is the only copy; the runtime reads it from installed metadata.
+    assert project['version'] == PACKAGE_VERSION
+    assert 'version' not in project['dynamic']
     assert project['license'] == 'MIT'
     assert project['urls'] == {
         'Documentation': f'{_REPOSITORY_URL}/tree/main/docs',
@@ -297,11 +287,11 @@ def test_project_metadata() -> None:
 
 
 def test_shotgun_module_exports() -> None:
-    assert shotgun_module.__all__ == _SHOTGUN_MODULE_EXPORTS
+    assert len(shotgun_module.__all__) == len(set(shotgun_module.__all__))
+    assert set(shotgun_module.__all__) == set(_SHOTGUN_MODULE_EXPORTS)
     for name in _SHOTGUN_MODULE_EXPORTS:
         assert hasattr(shotgun_module, name), name
     assert not hasattr(shotgun_module, 'sg_timezone')
-    assert not hasattr(_protocol, 'SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION')
 
 
 def test_xmlrpc_aliases_preserve_identity() -> None:

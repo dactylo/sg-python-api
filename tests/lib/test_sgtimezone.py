@@ -1,7 +1,9 @@
 import datetime
 import os
+import runpy
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -309,3 +311,14 @@ def test_utc_has_zero_offset_dst_and_name() -> None:
     assert utc.utcoffset(value) == datetime.timedelta(0)
     assert utc.dst(value) == datetime.timedelta(0)
     assert utc.tzname(value) == 'UTC'
+
+
+def test_wildcard_import_exposes_supported_names(tmp_path: Path) -> None:
+    module_path = tmp_path / 'wildcard_import.py'
+    module_path.write_text('from shotgun_api3.lib.sgtimezone import *\n', encoding='utf-8')
+    namespace = runpy.run_path(str(module_path))
+    assert {name for name in namespace if not name.startswith('__')} == {
+        'LocalTimezone',
+        'SgTimezone',
+        'UTC',
+    }

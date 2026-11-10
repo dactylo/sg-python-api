@@ -1,11 +1,10 @@
-import copy
 import dataclasses
 import inspect
 import json
 import warnings
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, cast, get_overloads, get_type_hints
+from typing import Any, cast, get_type_hints
 
 import pytest
 
@@ -13,29 +12,30 @@ from shotgun_api3 import _config as config_module
 from shotgun_api3 import _errors, _files
 from shotgun_api3._async_client import AsyncShotgun
 from shotgun_api3._async_driver import AsyncDriver, _AsyncDriverTiming
+from shotgun_api3._async_transport import AsyncTransport
 from shotgun_api3._client import Shotgun
 from shotgun_api3._config import (
-    CompatibilityWarningCode,
     CompatibilityWarningEvent,
-    ObserverEvent,
     ResponseEvent,
     RetryEvent,
+    _CompatibilityWarningCode,
+    _ObserverEvent,
 )
 from shotgun_api3._driver import Driver, _DriverTiming
 from shotgun_api3._transport import (
     CaseInsensitiveHeaders,
     TimeoutConfig,
+    Transport,
     TransportError,
     TransportRequest,
     TransportResponse,
 )
 from tests._pyright import run_pyright
 
-from .conftest import _fake_async_transport, _fake_client, _fake_transport
+from .conftest import FakeAsyncClient, fake_async_transport, fake_client, fake_transport
 
 pytestmark = pytest.mark.async_required
 
-FakeAsyncClient = Callable[..., AsyncShotgun]
 
 _CLIENT_METHOD_PARITY_METHODS = (
     'activity_stream_read',
@@ -69,9 +69,6 @@ _CLIENT_METHOD_PARITY_METHODS = (
 
 _CRUD_PARITY_METHODS = ('batch', 'create', 'delete', 'find', 'find_one', 'revive', 'update')
 
-_CREATE_ENTRY_SUFFIX = 'users must contain dictionaries with humanUserId and subscription keys'
-_CREATE_ID_SUFFIX = 'users must contain string or integer humanUserId values'
-_CREATE_VALUE_SUFFIX = 'users must contain valid subscription values'
 _ENTITY = {'type': 'Shot', 'id': 1, 'code': 'X'}
 _INVALID_PAGE_ID = True
 _PAGE = {'entities': [_ENTITY], 'paging_info': {'entity_count': 1}}
@@ -109,16 +106,15 @@ class _Trace:
 
 @dataclasses.dataclass(frozen=True)
 class _Scenario:
-    async_call: Callable[[AsyncShotgun], Coroutine[object, object, object]]
+    call: Callable[[Shotgun | AsyncShotgun], object]
     expected: _Failure | _Success
     expected_methods: tuple[str, ...]
     name: str
     script: Callable[[_Trace], list[TransportResponse | TransportError]]
-    sync_call: Callable[[Shotgun], object]
     expected_closed_responses: tuple[str, ...] = ('result',)
     expected_response_outcomes: tuple[str, ...] = ('success', 'success')
     expected_sleeps: tuple[float, ...] = ()
-    expected_warning_codes: tuple[CompatibilityWarningCode, ...] = ()
+    expected_warning_codes: tuple[_CompatibilityWarningCode, ...] = ()
     expected_operation_auth: dict[str, object] | None = None
     legacy_infinite_timeout: bool = False
     localized: bool = False
@@ -159,17 +155,17 @@ def _batch_requests() -> list[dict[str, Any]]:
 
 
 def _configure(sg: AsyncShotgun | Shotgun, scenario: _Scenario, trace: _Trace) -> None:
-    def observe_response(event: ObserverEvent) -> None:
+    def observe_response(event: _ObserverEvent) -> None:
         assert isinstance(event, ResponseEvent)
         trace.response_events.append(event)
         if scenario.mutate_session_uuid_after_readiness and len(trace.response_events) == 1:
             sg.config.session_uuid = 'later-session'
 
-    def observe_retry(event: ObserverEvent) -> None:
+    def observe_retry(event: _ObserverEvent) -> None:
         assert isinstance(event, RetryEvent)
         trace.retry_events.append(event)
 
-    def observe_warning(event: ObserverEvent) -> None:
+    def observe_warning(event: _ObserverEvent) -> None:
         assert isinstance(event, CompatibilityWarningEvent)
         trace.warning_events.append(event)
 
@@ -189,6 +185,14 @@ def _configure(sg: AsyncShotgun | Shotgun, scenario: _Scenario, trace: _Trace) -
     if scenario.session_uuid is not None:
         fields['session_uuid'] = scenario.session_uuid
     sg.config.update_fields(**fields)
+
+
+async def _execute_call(sg: Shotgun | AsyncShotgun, scenario: _Scenario) -> object:
+    result = scenario.call(sg)
+    assert inspect.iscoroutine(result) is isinstance(sg, AsyncShotgun)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 def _fault(trace: _Trace, label: str, code: int) -> TransportResponse:
@@ -211,9 +215,9 @@ def _install_async_timing(monkeypatch: pytest.MonkeyPatch, trace: _Trace) -> Non
     async def sleep(delay: float) -> None:
         trace.sleeps.append(delay)
 
-    def build(transport: object) -> AsyncDriver:
+    def build(transport: AsyncTransport) -> AsyncDriver:
         return AsyncDriver(
-            cast('Any', transport),
+            transport,
             _AsyncDriverTiming(
                 clock=lambda: 0.0,
                 jitter_seed=lambda: 0.0,
@@ -226,9 +230,9 @@ def _install_async_timing(monkeypatch: pytest.MonkeyPatch, trace: _Trace) -> Non
 
 
 def _install_sync_timing(monkeypatch: pytest.MonkeyPatch, trace: _Trace) -> None:
-    def build(transport: object) -> Driver:
+    def build(transport: Transport) -> Driver:
         return Driver(
-            cast('Any', transport),
+            transport,
             _DriverTiming(
                 clock=lambda: 0.0,
                 jitter_seed=lambda: 0.0,
@@ -258,7 +262,7 @@ def _assert_transcript(scenario: _Scenario, transcript: list[_RequestTranscript]
         else:
             assert 'locale' not in headers
         if scenario.legacy_infinite_timeout:
-            assert request.timeout == TimeoutConfig(connect=None, read=None, total=None)
+            assert request.timeout == TimeoutConfig(connect=None, read=None)
     if scenario.expected_operation_auth is not None:
         operation = transcript[-1]
         assert isinstance(operation.body, bytes)
@@ -267,31 +271,14 @@ def _assert_transcript(scenario: _Scenario, transcript: list[_RequestTranscript]
         assert params[0] == scenario.expected_operation_auth
 
 
-async def _observe_async(
-    sg: AsyncShotgun,
-    scenario: _Scenario,
-) -> _Failure | _Success:
+async def _observe(sg: Shotgun | AsyncShotgun, scenario: _Scenario) -> _Failure | _Success:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always', DeprecationWarning)
         if isinstance(scenario.expected, _Success):
-            observed = _Success(await scenario.async_call(sg))
+            observed = _Success(await _execute_call(sg, scenario))
         else:
             with pytest.raises(scenario.expected.exception) as raised:
-                await scenario.async_call(sg)
-            assert type(raised.value) is scenario.expected.exception
-            observed = _Failure(type(raised.value))
-    assert [str(warning.message) for warning in caught] == []
-    return observed
-
-
-def _observe_sync(sg: Shotgun, scenario: _Scenario) -> _Failure | _Success:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter('always', DeprecationWarning)
-        if isinstance(scenario.expected, _Success):
-            observed = _Success(scenario.sync_call(sg))
-        else:
-            with pytest.raises(scenario.expected.exception) as raised:
-                scenario.sync_call(sg)
+                await _execute_call(sg, scenario)
             assert type(raised.value) is scenario.expected.exception
             observed = _Failure(type(raised.value))
     assert [str(warning.message) for warning in caught] == []
@@ -312,6 +299,7 @@ def _prepared_upload(path: Path) -> _files.PreparedUpload:
             upload_type='Attachment',
             filmstrip=False,
         ),
+        path=str(path),
     )
 
 
@@ -338,7 +326,7 @@ def _retry_response(trace: _Trace, label: str) -> TransportResponse:
 def _scenarios() -> tuple[_Scenario, ...]:
     return (
         _Scenario(
-            async_call=lambda sg: sg.batch(_batch_requests()),
+            call=lambda sg: sg.batch(_batch_requests()),
             expected=_Success([_ENTITY, {'type': 'Shot', 'id': 1, 'code': 'Y'}, True]),
             expected_methods=('info', 'batch'),
             name='batch',
@@ -349,26 +337,23 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     [_ENTITY, {'type': 'Shot', 'id': 1, 'code': 'Y'}, True],
                 )
             ],
-            sync_call=lambda sg: sg.batch(_batch_requests()),
         ),
         _Scenario(
-            async_call=lambda sg: sg.create('Shot', {'code': 'X'}, ['code']),
+            call=lambda sg: sg.create('Shot', {'code': 'X'}, ['code']),
             expected=_Success(_ENTITY),
             expected_methods=('info', 'create'),
             name='create',
             script=lambda trace: [_response(trace, 'result', _ENTITY)],
-            sync_call=lambda sg: sg.create('Shot', {'code': 'X'}, ['code']),
         ),
         _Scenario(
-            async_call=lambda sg: sg.delete('Shot', 1),
+            call=lambda sg: sg.delete('Shot', 1),
             expected=_Success(result=True),
             expected_methods=('info', 'delete'),
             name='delete',
             script=lambda trace: [_response(trace, 'result', result=True)],
-            sync_call=lambda sg: sg.delete('Shot', 1),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find(
+            call=lambda sg: sg.find(
                 'Shot',
                 [['id', 'is', 1]],
                 ['code'],
@@ -378,99 +363,83 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'read'),
             name='find',
             script=lambda trace: [_response(trace, 'result', _PAGE)],
-            sync_call=lambda sg: sg.find(
-                'Shot',
-                [['id', 'is', 1]],
-                ['code'],
-                [{'field_name': 'code', 'direction': 'desc'}],
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find_one('Shot', [['id', 'is', 1]], ['code']),
+            call=lambda sg: sg.find_one('Shot', [['id', 'is', 1]], ['code']),
             expected=_Success(_ENTITY),
             expected_methods=('info', 'read'),
             name='find_one',
             script=lambda trace: [_response(trace, 'result', _PAGE)],
-            sync_call=lambda sg: sg.find_one('Shot', [['id', 'is', 1]], ['code']),
         ),
         _Scenario(
-            async_call=lambda sg: sg.revive('Shot', 1),
+            call=lambda sg: sg.revive('Shot', 1),
             expected=_Success(result=True),
             expected_methods=('info', 'revive'),
             name='revive',
             script=lambda trace: [_response(trace, 'result', result=True)],
-            sync_call=lambda sg: sg.revive('Shot', 1),
         ),
         _Scenario(
-            async_call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
+            call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
             expected=_Success({'type': 'Shot', 'id': 1, 'code': 'Y'}),
             expected_methods=('info', 'update'),
             name='update',
             script=lambda trace: [
                 _response(trace, 'result', {'type': 'Shot', 'id': 1, 'code': 'Y'})
             ],
-            sync_call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.batch([]),
+            call=lambda sg: sg.batch([]),
             expected=_Success([]),
             expected_methods=(),
             name='batch_empty',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.batch([]),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.batch(_batch_requests()),
+            call=lambda sg: sg.batch(_batch_requests()),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'batch'),
             name='batch_invalid_result',
             script=lambda trace: [_response(trace, 'result', {'not': 'a list'})],
-            sync_call=lambda sg: sg.batch(_batch_requests()),
         ),
         _Scenario(
-            async_call=lambda sg: sg.create('Shot', {'code': 'X'}),
+            call=lambda sg: sg.create('Shot', {'code': 'X'}),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'create'),
             name='create_invalid_result',
             script=lambda trace: [_response(trace, 'result', ['not a dictionary'])],
-            sync_call=lambda sg: sg.create('Shot', {'code': 'X'}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.delete('Shot', 1),
+            call=lambda sg: sg.delete('Shot', 1),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'delete'),
             name='delete_invalid_result',
             script=lambda trace: [_response(trace, 'result', 1)],
-            sync_call=lambda sg: sg.delete('Shot', 1),
         ),
         _Scenario(
-            async_call=lambda sg: sg.revive('Shot', 1),
+            call=lambda sg: sg.revive('Shot', 1),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'revive'),
             name='revive_invalid_result',
             script=lambda trace: [_response(trace, 'result', 'true')],
-            sync_call=lambda sg: sg.revive('Shot', 1),
         ),
         _Scenario(
-            async_call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
+            call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'update'),
             name='update_invalid_result',
             script=lambda trace: [_response(trace, 'result', result=False)],
-            sync_call=lambda sg: sg.update('Shot', 1, {'code': 'Y'}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'read'),
             name='find_invalid_dictionary_result',
             script=lambda trace: [_response(trace, 'result', ['not a dictionary'])],
-            sync_call=lambda sg: sg.find('Shot', []),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'read'),
             name='find_invalid_entities_result',
@@ -481,10 +450,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     {'entities': {'id': 1}, 'paging_info': {'entity_count': 1}},
                 )
             ],
-            sync_call=lambda sg: sg.find('Shot', []),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'read'),
             name='find_invalid_entity_member',
@@ -495,30 +463,27 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     {'entities': [1], 'paging_info': {'entity_count': 1}},
                 )
             ],
-            sync_call=lambda sg: sg.find('Shot', []),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'read'),
             name='find_invalid_paging_result',
             script=lambda trace: [
                 _response(trace, 'result', {'entities': [_ENTITY], 'paging_info': []})
             ],
-            sync_call=lambda sg: sg.find('Shot', []),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Failure(_errors.AuthenticationFault),
             expected_methods=('info', 'read'),
             name='find_authentication_fault',
             script=lambda trace: [_fault(trace, 'fault', 102)],
-            sync_call=lambda sg: sg.find('Shot', []),
             expected_closed_responses=('fault',),
             expected_response_outcomes=('success', 'error'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Success([_ENTITY]),
             expected_methods=('info', 'read', 'read'),
             name='find_retries_502',
@@ -526,27 +491,24 @@ def _scenarios() -> tuple[_Scenario, ...]:
                 _retry_response(trace, 'retry'),
                 _response(trace, 'result', _PAGE),
             ],
-            sync_call=lambda sg: sg.find('Shot', []),
             expected_closed_responses=('retry', 'result'),
             expected_response_outcomes=('success', 'retry', 'success'),
             expected_sleeps=(0.0,),
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Success([_ENTITY]),
             expected_methods=('info', 'read'),
             name='find_localized_true',
             script=lambda trace: [_response(trace, 'result', _PAGE)],
-            sync_call=lambda sg: sg.find('Shot', []),
             localized=True,
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', []),
+            call=lambda sg: sg.find('Shot', []),
             expected=_Success([_ENTITY]),
             expected_methods=('info', 'read'),
             name='find_legacy_infinite_timeout',
             script=lambda trace: [_response(trace, 'result', _PAGE)],
-            sync_call=lambda sg: sg.find('Shot', []),
             expected_warning_codes=(
                 'legacy-infinite-timeout',
                 'legacy-infinite-timeout',
@@ -555,7 +517,7 @@ def _scenarios() -> tuple[_Scenario, ...]:
             secret_auth=True,
         ),
         _Scenario(
-            async_call=lambda sg: sg.find('Shot', [], limit=2),
+            call=lambda sg: sg.find('Shot', [], limit=2),
             expected=_Success(
                 [
                     {'type': 'Shot', 'id': 1},
@@ -582,12 +544,11 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     },
                 ),
             ],
-            sync_call=lambda sg: sg.find('Shot', [], limit=2),
             expected_closed_responses=('page-1', 'page-2'),
             expected_response_outcomes=('success', 'success', 'success'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.summarize(
+            call=lambda sg: sg.summarize(
                 'Shot',
                 [],
                 [{'field': 'id', 'type': 'count'}],
@@ -596,30 +557,23 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'summarize'),
             name='summarize',
             script=lambda trace: [_response(trace, 'result', {'summaries': {'id': {'count': 3}}})],
-            sync_call=lambda sg: sg.summarize(
-                'Shot',
-                [],
-                [{'field': 'id', 'type': 'count'}],
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_read(),
+            call=lambda sg: sg.schema_read(),
             expected=_Success({'Shot': {}}),
             expected_methods=('info', 'schema_read'),
             name='schema_read',
             script=lambda trace: [_response(trace, 'result', {'Shot': {}})],
-            sync_call=lambda sg: sg.schema_read(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.text_search('boat', {'Shot': []}),
+            call=lambda sg: sg.text_search('boat', {'Shot': []}),
             expected=_Success({'matches': []}),
             expected_methods=('info', 'query_display_name_cache'),
             name='text_search',
             script=lambda trace: [_response(trace, 'result', {'matches': []})],
-            sync_call=lambda sg: sg.text_search('boat', {'Shot': []}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.follow(
+            call=lambda sg: sg.follow(
                 {'type': 'HumanUser', 'id': 1},
                 {'type': 'Shot', 'id': 2},
             ),
@@ -627,13 +581,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'follow'),
             name='follow',
             script=lambda trace: [_response(trace, 'result', {'followed': True})],
-            sync_call=lambda sg: sg.follow(
-                {'type': 'HumanUser', 'id': 1},
-                {'type': 'Shot', 'id': 2},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.work_schedule_update(
+            call=lambda sg: sg.work_schedule_update(
                 '2026-07-04',
                 working=False,
                 project={'type': 'Project', 'id': 1},
@@ -643,17 +593,11 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=(),
             name='work_schedule_exclusivity',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.work_schedule_update(
-                '2026-07-04',
-                working=False,
-                project={'type': 'Project', 'id': 1},
-                user={'type': 'HumanUser', 'id': 2},
-            ),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.authenticate_human_user('me', 'pw', 'two-factor'),
+            call=lambda sg: sg.authenticate_human_user('me', 'pw', 'two-factor'),
             expected=_Success({'type': 'HumanUser', 'id': 7, 'login': 'me'}),
             expected_methods=('info', 'read'),
             name='auth_human_user',
@@ -667,7 +611,6 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     },
                 )
             ],
-            sync_call=lambda sg: sg.authenticate_human_user('me', 'pw', 'two-factor'),
             expected_operation_auth={
                 'user_login': 'me',
                 'user_password': 'pw',
@@ -679,27 +622,25 @@ def _scenarios() -> tuple[_Scenario, ...]:
             session_uuid='captured-session',
         ),
         _Scenario(
-            async_call=lambda sg: sg.entity_types(),
+            call=lambda sg: sg.entity_types(),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=(),
             name='entity_types_alias',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.entity_types(),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema('Shot'),
+            call=lambda sg: sg.schema('Shot'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=(),
             name='schema_alias',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.schema('Shot'),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.activity_stream_read(
+            call=lambda sg: sg.activity_stream_read(
                 'Shot',
                 2,
                 {'Shot': ['code']},
@@ -711,33 +652,23 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'activity_stream'),
             name='activity_stream_read',
             script=lambda trace: [_response(trace, 'result', {'updates': []})],
-            sync_call=lambda sg: sg.activity_stream_read(
-                'Shot',
-                2,
-                {'Shot': ['code']},
-                10,
-                20,
-                50,
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.export_page(12, 'csv', layout_name='summary'),
+            call=lambda sg: sg.export_page(12, 'csv', layout_name='summary'),
             expected=_Success('csv,data'),
             expected_methods=('info', 'export_page'),
             name='export_page',
             script=lambda trace: [_response(trace, 'result', 'csv,data')],
-            sync_call=lambda sg: sg.export_page(12, 'csv', layout_name='summary'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.followers({'type': 'Shot', 'id': 2}),
+            call=lambda sg: sg.followers({'type': 'Shot', 'id': 2}),
             expected=_Success([{'type': 'HumanUser', 'id': 1}]),
             expected_methods=('info', 'followers'),
             name='followers',
             script=lambda trace: [_response(trace, 'result', [{'type': 'HumanUser', 'id': 1}])],
-            sync_call=lambda sg: sg.followers({'type': 'Shot', 'id': 2}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.following(
+            call=lambda sg: sg.following(
                 {'type': 'HumanUser', 'id': 1},
                 {'type': 'Project', 'id': 3},
                 'Shot',
@@ -746,14 +677,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'following'),
             name='following',
             script=lambda trace: [_response(trace, 'result', [{'type': 'Shot', 'id': 2}])],
-            sync_call=lambda sg: sg.following(
-                {'type': 'HumanUser', 'id': 1},
-                {'type': 'Project', 'id': 3},
-                'Shot',
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.nav_expand(
+            call=lambda sg: sg.nav_expand(
                 '/Project/3',
                 'entity',
                 {'Shot': ['code']},
@@ -762,14 +688,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'nav_expand'),
             name='nav_expand',
             script=lambda trace: [_response(trace, 'result', {'label': 'Project'})],
-            sync_call=lambda sg: sg.nav_expand(
-                '/Project/3',
-                'entity',
-                {'Shot': ['code']},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.nav_search_entity(
+            call=lambda sg: sg.nav_search_entity(
                 '/',
                 {'type': 'Shot', 'id': 2},
                 'entity',
@@ -778,30 +699,23 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'nav_search'),
             name='nav_search_entity',
             script=lambda trace: [_response(trace, 'result', [{'path': '/Project/3/Shot/2'}])],
-            sync_call=lambda sg: sg.nav_search_entity(
-                '/',
-                {'type': 'Shot', 'id': 2},
-                'entity',
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.nav_search_string('/', 'boat', 'entity'),
+            call=lambda sg: sg.nav_search_string('/', 'boat', 'entity'),
             expected=_Success([{'path': '/Project/3/Shot/2'}]),
             expected_methods=('info', 'nav_search'),
             name='nav_search_string',
             script=lambda trace: [_response(trace, 'result', [{'path': '/Project/3/Shot/2'}])],
-            sync_call=lambda sg: sg.nav_search_string('/', 'boat', 'entity'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.note_thread_read(41, {'Note': ['created_by']}),
+            call=lambda sg: sg.note_thread_read(41, {'Note': ['created_by']}),
             expected=_Success([{'type': 'Note', 'id': 41}]),
             expected_methods=('info', 'note_thread_contents'),
             name='note_thread_read',
             script=lambda trace: [_response(trace, 'result', [{'type': 'Note', 'id': 41}])],
-            sync_call=lambda sg: sg.note_thread_read(41, {'Note': ['created_by']}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
+            call=lambda sg: sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
             expected=_Success([{'path': '/Project/3/Shot/2'}]),
             expected_methods=('info', 'nav_search', 'nav_search'),
             name='nav_search_entity_retries_as_read',
@@ -809,13 +723,12 @@ def _scenarios() -> tuple[_Scenario, ...]:
                 _retry_response(trace, 'retry'),
                 _response(trace, 'result', [{'path': '/Project/3/Shot/2'}]),
             ],
-            sync_call=lambda sg: sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
             expected_closed_responses=('retry', 'result'),
             expected_response_outcomes=('success', 'retry', 'success'),
             expected_sleeps=(0.0,),
         ),
         _Scenario(
-            async_call=lambda sg: sg.nav_search_string('/', 'boat'),
+            call=lambda sg: sg.nav_search_string('/', 'boat'),
             expected=_Success([{'path': '/Project/3/Shot/2'}]),
             expected_methods=('info', 'nav_search', 'nav_search'),
             name='nav_search_string_retries_as_read',
@@ -823,13 +736,12 @@ def _scenarios() -> tuple[_Scenario, ...]:
                 _retry_response(trace, 'retry'),
                 _response(trace, 'result', [{'path': '/Project/3/Shot/2'}]),
             ],
-            sync_call=lambda sg: sg.nav_search_string('/', 'boat'),
             expected_closed_responses=('retry', 'result'),
             expected_response_outcomes=('success', 'retry', 'success'),
             expected_sleeps=(0.0,),
         ),
         _Scenario(
-            async_call=lambda sg: sg.note_thread_read(41),
+            call=lambda sg: sg.note_thread_read(41),
             expected=_Success([{'type': 'Note', 'id': 41}]),
             expected_methods=('info', 'note_thread_contents', 'note_thread_contents'),
             name='note_thread_read_retries_as_read',
@@ -837,29 +749,26 @@ def _scenarios() -> tuple[_Scenario, ...]:
                 _retry_response(trace, 'retry'),
                 _response(trace, 'result', [{'type': 'Note', 'id': 41}]),
             ],
-            sync_call=lambda sg: sg.note_thread_read(41),
             expected_closed_responses=('retry', 'result'),
             expected_response_outcomes=('success', 'retry', 'success'),
             expected_sleeps=(0.0,),
         ),
         _Scenario(
-            async_call=lambda sg: sg.preferences_read(['timezone']),
+            call=lambda sg: sg.preferences_read(['timezone']),
             expected=_Success({'timezone': 'UTC'}),
             expected_methods=('info', 'preferences_read'),
             name='preferences_read',
             script=lambda trace: [_response(trace, 'result', {'timezone': 'UTC'})],
-            sync_call=lambda sg: sg.preferences_read(['timezone']),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_entity_read({'type': 'Project', 'id': 3}),
+            call=lambda sg: sg.schema_entity_read({'type': 'Project', 'id': 3}),
             expected=_Success({'Shot': {}}),
             expected_methods=('info', 'schema_entity_read'),
             name='schema_entity_read',
             script=lambda trace: [_response(trace, 'result', {'Shot': {}})],
-            sync_call=lambda sg: sg.schema_entity_read({'type': 'Project', 'id': 3}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_field_create(
+            call=lambda sg: sg.schema_field_create(
                 'Shot',
                 'text',
                 'New Field',
@@ -869,23 +778,16 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'schema_field_create'),
             name='schema_field_create',
             script=lambda trace: [_response(trace, 'result', 'sg_new_field')],
-            sync_call=lambda sg: sg.schema_field_create(
-                'Shot',
-                'text',
-                'New Field',
-                {'description': 'Description'},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_field_delete('Shot', 'sg_new_field'),
+            call=lambda sg: sg.schema_field_delete('Shot', 'sg_new_field'),
             expected=_Success(result=True),
             expected_methods=('info', 'schema_field_delete'),
             name='schema_field_delete',
             script=lambda trace: [_response(trace, 'result', result=True)],
-            sync_call=lambda sg: sg.schema_field_delete('Shot', 'sg_new_field'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_field_read(
+            call=lambda sg: sg.schema_field_read(
                 'Shot',
                 'code',
                 {'type': 'Project', 'id': 3},
@@ -894,14 +796,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'schema_field_read'),
             name='schema_field_read',
             script=lambda trace: [_response(trace, 'result', {'code': {}})],
-            sync_call=lambda sg: sg.schema_field_read(
-                'Shot',
-                'code',
-                {'type': 'Project', 'id': 3},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_field_update(
+            call=lambda sg: sg.schema_field_update(
                 'Shot',
                 'sg_new_field',
                 {'name': 'Renamed'},
@@ -911,15 +808,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'schema_field_update'),
             name='schema_field_update',
             script=lambda trace: [_response(trace, 'result', result=True)],
-            sync_call=lambda sg: sg.schema_field_update(
-                'Shot',
-                'sg_new_field',
-                {'name': 'Renamed'},
-                {'type': 'Project', 'id': 3},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.unfollow(
+            call=lambda sg: sg.unfollow(
                 {'type': 'HumanUser', 'id': 1},
                 {'type': 'Shot', 'id': 2},
             ),
@@ -927,13 +818,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'unfollow'),
             name='unfollow',
             script=lambda trace: [_response(trace, 'result', {'followed': False})],
-            sync_call=lambda sg: sg.unfollow(
-                {'type': 'HumanUser', 'id': 1},
-                {'type': 'Shot', 'id': 2},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.update_project_last_accessed(
+            call=lambda sg: sg.update_project_last_accessed(
                 {'type': 'Project', 'id': 3},
                 {'type': 'HumanUser', 'id': 1},
             ),
@@ -941,25 +828,18 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'update_project_last_accessed_by_current_user'),
             name='update_project_last_accessed',
             script=lambda trace: [_response(trace, 'result', {'updated': True})],
-            sync_call=lambda sg: sg.update_project_last_accessed(
-                {'type': 'Project', 'id': 3},
-                {'type': 'HumanUser', 'id': 1},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.user_subscriptions_create(
+            call=lambda sg: sg.user_subscriptions_create(
                 [{'humanUserId': '1', 'subscription': ['artist'], 'label': 'extra'}]
             ),
             expected=_Success(result=True),
             expected_methods=('info', 'user_subscriptions_create'),
             name='user_subscriptions_create',
             script=lambda trace: [_response(trace, 'result', {'1': None})],
-            sync_call=lambda sg: sg.user_subscriptions_create(
-                [{'humanUserId': '1', 'subscription': ['artist'], 'label': 'extra'}]
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.user_subscriptions_read(),
+            call=lambda sg: sg.user_subscriptions_read(),
             expected=_Success(
                 [
                     {'humanUserId': '1', 'subscription': None},
@@ -975,10 +855,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
                     trace, 'result', {'1': None, '2': 'artist', 'user-A': ['reviewer'], '4': []}
                 )
             ],
-            sync_call=lambda sg: sg.user_subscriptions_read(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.work_schedule_read(
+            call=lambda sg: sg.work_schedule_read(
                 '2026-07-01',
                 '2026-07-31',
                 project={'type': 'Project', 'id': 3},
@@ -987,14 +866,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'work_schedule_read'),
             name='work_schedule_read',
             script=lambda trace: [_response(trace, 'result', {'working_days': []})],
-            sync_call=lambda sg: sg.work_schedule_read(
-                '2026-07-01',
-                '2026-07-31',
-                project={'type': 'Project', 'id': 3},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.work_schedule_read(
+            call=lambda sg: sg.work_schedule_read(
                 '2026-07-01',
                 '2026-07-31',
                 project={'type': 'Project', 'id': 3},
@@ -1004,15 +878,9 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'work_schedule_read'),
             name='work_schedule_read_project_and_user',
             script=lambda trace: [_response(trace, 'result', {'working_days': []})],
-            sync_call=lambda sg: sg.work_schedule_read(
-                '2026-07-01',
-                '2026-07-31',
-                project={'type': 'Project', 'id': 3},
-                user={'type': 'HumanUser', 'id': 7},
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.work_schedule_update(
+            call=lambda sg: sg.work_schedule_update(
                 '2026-07-04',
                 working=False,
                 description='holiday',
@@ -1023,115 +891,93 @@ def _scenarios() -> tuple[_Scenario, ...]:
             expected_methods=('info', 'work_schedule_update'),
             name='work_schedule_update',
             script=lambda trace: [_response(trace, 'result', {'updated': True})],
-            sync_call=lambda sg: sg.work_schedule_update(
-                '2026-07-04',
-                working=False,
-                description='holiday',
-                project={'type': 'Project', 'id': 3},
-                recalculate_field='sg_date',
-            ),
         ),
         _Scenario(
-            async_call=lambda sg: sg.export_page(cast('int', _INVALID_PAGE_ID), 'csv'),
+            call=lambda sg: sg.export_page(_INVALID_PAGE_ID, 'csv'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=(),
             name='export_page_validation_failure',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.export_page(cast('int', _INVALID_PAGE_ID), 'csv'),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.following({'type': 'HumanUser', 'id': 1}),
+            call=lambda sg: sg.following({'type': 'HumanUser', 'id': 1}),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'following'),
             name='list_result_failure',
             script=lambda trace: [_response(trace, 'result', {'not': 'a list'})],
-            sync_call=lambda sg: sg.following({'type': 'HumanUser', 'id': 1}),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_field_delete('Shot', 'sg_field'),
+            call=lambda sg: sg.schema_field_delete('Shot', 'sg_field'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'schema_field_delete'),
             name='boolean_result_failure',
             script=lambda trace: [_response(trace, 'result', 1)],
-            sync_call=lambda sg: sg.schema_field_delete('Shot', 'sg_field'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.schema_read(),
+            call=lambda sg: sg.schema_read(),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'schema_read'),
             name='dictionary_result_failure',
             script=lambda trace: [_response(trace, 'result', [])],
-            sync_call=lambda sg: sg.schema_read(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.export_page(12, 'csv'),
+            call=lambda sg: sg.export_page(12, 'csv'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'export_page'),
             name='string_result_failure',
             script=lambda trace: [_response(trace, 'result', {})],
-            sync_call=lambda sg: sg.export_page(12, 'csv'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.authenticate_human_user('me', 'bad'),
+            call=lambda sg: sg.authenticate_human_user('me', 'bad'),
             expected=_Success(None),
             expected_methods=('info', 'read'),
             name='authentication_fault_returns_none',
             script=lambda trace: [_fault(trace, 'fault', 102)],
-            sync_call=lambda sg: sg.authenticate_human_user('me', 'bad'),
             expected_closed_responses=('fault',),
             expected_response_outcomes=('success', 'error'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
+            call=lambda sg: sg.authenticate_human_user('me', 'pw'),
             expected=_Failure(_errors.MissingTwoFactorAuthenticationFault),
             expected_methods=('info', 'read'),
             name='missing_two_factor_propagates',
             script=lambda trace: [_fault(trace, 'fault', 106)],
-            sync_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
             expected_closed_responses=('fault',),
             expected_response_outcomes=('success', 'error'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
+            call=lambda sg: sg.authenticate_human_user('me', 'pw'),
             expected=_Failure(_errors.Fault),
             expected_methods=('info', 'read'),
             name='other_auth_fault_propagates',
             script=lambda trace: [_fault(trace, 'fault', 999)],
-            sync_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
             expected_closed_responses=('fault',),
             expected_response_outcomes=('success', 'error'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
+            call=lambda sg: sg.authenticate_human_user('me', 'pw'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=('info', 'read'),
             name='auth_result_failure',
             script=lambda trace: [_response(trace, 'result', [])],
-            sync_call=lambda sg: sg.authenticate_human_user('me', 'pw'),
         ),
         _Scenario(
-            async_call=lambda sg: sg.work_schedule_read('2026-02-30', '2026-07-31'),
+            call=lambda sg: sg.work_schedule_read('2026-02-30', '2026-07-31'),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=(),
             name='schedule_date_failure',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.work_schedule_read('2026-02-30', '2026-07-31'),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
         _Scenario(
-            async_call=lambda sg: sg.user_subscriptions_create(
-                [{'subscription': 'missing-user-id'}]
-            ),
+            call=lambda sg: sg.user_subscriptions_create([{'subscription': 'missing-user-id'}]),
             expected=_Failure(_errors.ShotgunError),
             expected_methods=(),
             name='subscription_validation_failure',
             script=lambda _trace: [],
-            sync_call=lambda sg: sg.user_subscriptions_create(
-                [{'subscription': 'missing-user-id'}]
-            ),
             expected_closed_responses=(),
             expected_response_outcomes=(),
         ),
@@ -1167,16 +1013,6 @@ def test_client_method_runtime_and_annotation_signatures_match() -> None:
         assert get_type_hints(async_method) == get_type_hints(sync_method)
         assert inspect.iscoroutinefunction(async_method)
         assert not inspect.iscoroutinefunction(sync_method)
-        sync_overloads = get_overloads(sync_method)
-        async_overloads = get_overloads(async_method)
-        assert len(async_overloads) == len(sync_overloads)
-        for sync_overload, async_overload in zip(
-            sync_overloads,
-            async_overloads,
-            strict=True,
-        ):
-            assert inspect.signature(async_overload) == inspect.signature(sync_overload)
-            assert get_type_hints(async_overload) == get_type_hints(sync_overload)
 
 
 def test_client_method_static_surface_accepts_complete_contract(tmp_path: Path) -> None:
@@ -1187,40 +1023,11 @@ def test_client_method_static_surface_accepts_complete_contract(tmp_path: Path) 
 from shotgun_api3 import AsyncShotgun
 
 async def probe(sg: AsyncShotgun) -> None:
-    assert_type(await sg.activity_stream_read('Shot', 1), dict[str, object])
-    assert_type(await sg.authenticate_human_user('me', 'pw'), dict[str, object] | None)
     assert_type(await sg.export_page(1, 'csv'), str)
-    assert_type(
-        await sg.follow({'type': 'HumanUser', 'id': 1}, {'type': 'Shot', 'id': 2}),
-        dict[str, object],
-    )
-    assert_type(await sg.followers({'type': 'Shot', 'id': 2}), list[dict[str, object]])
-    assert_type(await sg.following({'type': 'HumanUser', 'id': 1}), list[dict[str, object]])
-    assert_type(await sg.nav_expand('/'), dict[str, object])
-    assert_type(
-        await sg.nav_search_entity('/', {'type': 'Shot', 'id': 2}),
-        list[dict[str, object]],
-    )
-    assert_type(await sg.nav_search_string('/', 'boat'), list[dict[str, object]])
-    assert_type(await sg.note_thread_read(1), list[dict[str, object]])
-    assert_type(await sg.preferences_read(), dict[str, object])
-    assert_type(await sg.schema_entity_read(), dict[str, object])
-    assert_type(await sg.schema_field_create('Shot', 'text', 'Label'), str)
     assert_type(await sg.schema_field_delete('Shot', 'sg_field'), bool)
-    assert_type(await sg.schema_field_read('Shot'), dict[str, object])
     assert_type(await sg.schema_field_update('Shot', 'sg_field', {}), bool)
-    assert_type(await sg.schema_read(), dict[str, object])
-    assert_type(await sg.summarize('Shot', [], []), dict[str, object])
-    assert_type(await sg.text_search('boat', {'Shot': []}), dict[str, object])
-    assert_type(
-        await sg.unfollow({'type': 'HumanUser', 'id': 1}, {'type': 'Shot', 'id': 2}),
-        dict[str, object],
-    )
     assert_type(await sg.update_project_last_accessed({'type': 'Project', 'id': 3}), None)
     assert_type(await sg.user_subscriptions_create([]), bool)
-    assert_type(await sg.user_subscriptions_read(), list[dict[str, object]])
-    assert_type(await sg.work_schedule_read('2026-07-01', '2026-07-31'), dict[str, object])
-    assert_type(await sg.work_schedule_update('2026-07-04', False), dict[str, object])
 """,
         encoding='utf-8',
     )
@@ -1261,16 +1068,6 @@ def test_crud_runtime_and_annotation_signatures_match() -> None:
         assert get_type_hints(async_method) == get_type_hints(sync_method)
         assert inspect.iscoroutinefunction(async_method)
         assert not inspect.iscoroutinefunction(sync_method)
-        sync_overloads = get_overloads(sync_method)
-        async_overloads = get_overloads(async_method)
-        assert len(async_overloads) == len(sync_overloads)
-        for sync_overload, async_overload in zip(
-            sync_overloads,
-            async_overloads,
-            strict=True,
-        ):
-            assert inspect.signature(async_overload) == inspect.signature(sync_overload)
-            assert get_type_hints(async_overload) == get_type_hints(sync_overload)
 
 
 def test_crud_static_surface_rejects_invalid_calls(tmp_path: Path) -> None:
@@ -1398,18 +1195,18 @@ async def test_sync_async_scenario_parity(
 ) -> None:
     sync_trace = _Trace()
     async_trace = _Trace()
-    sync_sg = _fake_client(scenario.script(sync_trace))
+    sync_sg = fake_client(scenario.script(sync_trace))
     async_sg = fake_async_client(scenario.script(async_trace))
     _configure(sync_sg, scenario, sync_trace)
     _configure(async_sg, scenario, async_trace)
     _install_sync_timing(monkeypatch, sync_trace)
     _install_async_timing(monkeypatch, async_trace)
 
-    sync_result = _observe_sync(sync_sg, scenario)
-    async_result = await _observe_async(async_sg, scenario)
+    sync_result = await _observe(sync_sg, scenario)
+    async_result = await _observe(async_sg, scenario)
 
-    sync_transcript = _transcript(_fake_transport(sync_sg).requests)
-    async_transcript = _transcript(_fake_async_transport(async_sg).requests)
+    sync_transcript = _transcript(fake_transport(sync_sg).requests)
+    async_transcript = _transcript(fake_async_transport(async_sg).requests)
     assert sync_result == async_result == scenario.expected
     _assert_transcript(scenario, sync_transcript)
     _assert_transcript(scenario, async_transcript)
@@ -1417,159 +1214,6 @@ async def test_sync_async_scenario_parity(
     _assert_trace(scenario, async_trace)
     assert async_transcript == sync_transcript
     assert async_trace == sync_trace
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize('human_user_id', ['7', 7])
-@pytest.mark.parametrize('subscription', [None, 'artist', ['artist'], []])
-async def test_user_subscriptions_create_forwards_accepted_values_and_copies_entries(
-    fake_async_client: FakeAsyncClient,
-    human_user_id: str | int,
-    subscription: object,
-) -> None:
-    users = [{'humanUserId': human_user_id, 'subscription': subscription, 'label': ['extra']}]
-    original_subscription = copy.deepcopy(subscription)
-    sg = fake_async_client([_response(_Trace(), 'result', {'7': None})])
-
-    def mutate_after_readiness(event: ObserverEvent) -> None:
-        if isinstance(event, ResponseEvent) and event.operation == 'read':
-            users[0]['humanUserId'] = 'changed'
-            users[0]['subscription'] = 'changed'
-            cast('list[str]', users[0]['label'])[0] = 'changed'
-            if isinstance(subscription, list):
-                cast('list[object]', subscription).append('changed')
-
-    sg.config.on_response = mutate_after_readiness
-
-    assert await sg.user_subscriptions_create(users) is True
-
-    request = _fake_async_transport(sg).requests[-1]
-    assert isinstance(request.body, bytes)
-    body = cast('dict[str, object]', json.loads(request.body))
-    params = cast('list[object]', body['params'])
-    assert params[-1] == {'7': original_subscription}
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize('identifiers', [('7', '7'), (7, 7), ('7', 7), (7, '7')])
-async def test_user_subscriptions_create_rejects_async_duplicates_before_readiness(
-    fake_async_client: FakeAsyncClient,
-    identifiers: tuple[str | int, str | int],
-) -> None:
-    sg = fake_async_client([])
-    users = [{'humanUserId': item, 'subscription': 'sensitive'} for item in identifiers]
-
-    with pytest.raises(
-        _errors.ShotgunError,
-        match=r'^user_subscriptions_create users must not contain duplicate user IDs$',
-    ):
-        await sg.user_subscriptions_create(users)
-
-    assert _fake_async_transport(sg).requests == []
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ('result', 'expected'),
-    [
-        ({}, True),
-        ({'7': None, '9': None}, True),
-        ({'7': None, '9': 'sensitive'}, False),
-        ({'7': False}, False),
-        ({'7': 0}, False),
-        ({'7': ''}, False),
-        ({'7': []}, False),
-        ({'7': {}}, False),
-    ],
-)
-async def test_user_subscriptions_create_interprets_async_per_user_results(
-    fake_async_client: FakeAsyncClient, result: object, expected: bool
-) -> None:
-    sg = fake_async_client([_response(_Trace(), 'result', result)])
-
-    assert await sg.user_subscriptions_create([]) is expected
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize('result', [True, False, None, 1, 'sensitive', [], [None]])
-async def test_user_subscriptions_create_rejects_async_non_mapping_results(
-    fake_async_client: FakeAsyncClient, result: object
-) -> None:
-    sg = fake_async_client([_response(_Trace(), 'result', result)])
-
-    with pytest.raises(
-        _errors.ShotgunError,
-        match=r'^user_subscriptions_create returned an invalid result mapping$',
-    ):
-        await sg.user_subscriptions_create([])
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ('users', 'message_suffix'),
-    [
-        ({'humanUserId': '7', 'subscription': 'artist'}, 'users must be a list'),
-        (['sensitive-member'], _CREATE_ENTRY_SUFFIX),
-        ([{'subscription': 'artist'}], _CREATE_ENTRY_SUFFIX),
-        ([{'user_id': '7', 'subscription': 'artist'}], _CREATE_ENTRY_SUFFIX),
-        ([{'humanUserId': '7'}], _CREATE_ENTRY_SUFFIX),
-        ([{'humanUserId': 7.0, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
-        ([{'humanUserId': True, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
-        ([{'humanUserId': False, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
-        ([{'humanUserId': None, 'subscription': 'artist'}], _CREATE_ID_SUFFIX),
-        ([{'humanUserId': '7', 'subscription': 1}], _CREATE_VALUE_SUFFIX),
-        ([{'humanUserId': '7', 'subscription': True}], _CREATE_VALUE_SUFFIX),
-        ([{'humanUserId': '7', 'subscription': {'sensitive': 'value'}}], _CREATE_VALUE_SUFFIX),
-        ([{'humanUserId': '7', 'subscription': ['artist', 2]}], _CREATE_VALUE_SUFFIX),
-    ],
-)
-async def test_user_subscriptions_create_rejects_malformed_async_entries(
-    fake_async_client: FakeAsyncClient,
-    users: object,
-    message_suffix: str,
-) -> None:
-    sg = fake_async_client([])
-    method = cast(
-        'Callable[[object], Coroutine[object, object, object]]',
-        sg.user_subscriptions_create,
-    )
-
-    with pytest.raises(
-        _errors.ShotgunError,
-        match=rf'^user_subscriptions_create {message_suffix}$',
-    ) as error:
-        await method(users)
-
-    assert 'sensitive' not in str(error.value)
-    assert _fake_async_transport(sg).requests == []
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ('result', 'message_suffix'),
-    [
-        (['sensitive-result'], 'did not return a dictionary'),
-        ({'': 'artist'}, 'returned an invalid user ID'),
-        ({'7': ['artist', 2]}, 'returned an invalid subscription'),
-        ({'7': {'sensitive': 'value'}}, 'returned an invalid subscription'),
-        ({'7': 1}, 'returned an invalid subscription'),
-        ({'7': True}, 'returned an invalid subscription'),
-    ],
-)
-async def test_user_subscriptions_read_rejects_malformed_async_results(
-    fake_async_client: FakeAsyncClient,
-    result: object,
-    message_suffix: str,
-) -> None:
-    sg = fake_async_client([_response(_Trace(), 'result', result)])
-
-    with pytest.raises(
-        _errors.ShotgunError,
-        match=rf'^user_subscriptions_read {message_suffix}$',
-    ) as error:
-        await sg.user_subscriptions_read()
-
-    assert 'sensitive' not in str(error.value)
 
 
 @pytest.mark.anyio
@@ -1593,14 +1237,14 @@ async def test_sync_async_upload_allocation_requires_identical_origin(tmp_path: 
 
     with pytest.raises(ValueError, match=message) as sync_error:
         sync_allocate(
-            cast('Any', None),
+            None,
             config_module.snapshot(sync_sg.config),
             prepared,
             multipart=False,
         )
     with pytest.raises(ValueError, match=message) as async_error:
         await async_allocate(
-            cast('Any', None),
+            None,
             config_module.snapshot(async_sg.config),
             prepared,
             multipart=False,

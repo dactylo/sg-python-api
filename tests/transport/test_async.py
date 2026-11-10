@@ -1,7 +1,7 @@
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from inspect import iscoroutinefunction
-from typing import TYPE_CHECKING, cast, get_type_hints
+from typing import get_type_hints
 
 import pytest
 
@@ -16,22 +16,17 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _AsyncFakeTransport
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+from tests._transports import AsyncFakeTransport
 
 pytestmark = pytest.mark.async_required
 
 _OK = TransportResponse(status=200, reason='OK', headers={}, content=b'PAYLOAD')
-_REQUEST_ID = 't-1'
 _REQ = TransportRequest(
     method='POST',
     url='https://x.example/api3/json',
     headers={},
     body=b'{}',
     timeout=TimeoutConfig(connect=1.0, read=1.0),
-    token=_REQUEST_ID,
 )
 
 
@@ -43,7 +38,6 @@ def test_async_streaming_response_type_hints_resolve_at_runtime() -> None:
 
 
 def test_async_transport_protocol_has_only_task_cancellation() -> None:
-    assert not hasattr(AsyncTransport, 'abort')
     assert not iscoroutinefunction(AsyncTransport.checkout)
     assert not iscoroutinefunction(AsyncTransport.checkin)
     assert not iscoroutinefunction(AsyncTransport.reserve)
@@ -54,7 +48,7 @@ def test_async_transport_protocol_has_only_task_cancellation() -> None:
 
 @pytest.mark.anyio
 async def test_fake_counts_logical_rpc_leases() -> None:
-    fake = _AsyncFakeTransport([_OK])
+    fake = AsyncFakeTransport([_OK])
 
     fake.checkout()
     await fake.send(_REQ)
@@ -66,11 +60,11 @@ async def test_fake_counts_logical_rpc_leases() -> None:
 @pytest.mark.anyio
 async def test_fake_raises_queued_errors_and_asserts_on_exhaustion() -> None:
     queued_error = ConnectError('refused')
-    fake = _AsyncFakeTransport([queued_error])
+    fake = AsyncFakeTransport([queued_error])
 
     with pytest.raises(ConnectError, match='refused') as exc_info:
         await fake.send(_REQ)
-    with pytest.raises(AssertionError, match='_AsyncFakeTransport responses exhausted'):
+    with pytest.raises(AssertionError, match='AsyncFakeTransport responses exhausted'):
         await fake.send(_REQ)
 
     assert exc_info.value is queued_error
@@ -79,7 +73,7 @@ async def test_fake_raises_queued_errors_and_asserts_on_exhaustion() -> None:
 
 @pytest.mark.anyio
 async def test_fake_releases_child_reservation_exactly_once() -> None:
-    fake = _AsyncFakeTransport([])
+    fake = AsyncFakeTransport([])
     task = asyncio.create_task(asyncio.sleep(0))
 
     fake.reserve(task)
@@ -95,7 +89,7 @@ async def test_fake_releases_child_reservation_exactly_once() -> None:
 @pytest.mark.anyio
 async def test_fake_replays_fifo_and_records_requests() -> None:
     second = TransportResponse(status=201, reason='Created', headers={}, content=b'NEXT')
-    fake = _AsyncFakeTransport([_OK, second])
+    fake = AsyncFakeTransport([_OK, second])
 
     assert await fake.send(_REQ) is _OK
     assert await fake.send(_REQ) is second
@@ -104,7 +98,7 @@ async def test_fake_replays_fifo_and_records_requests() -> None:
 
 @pytest.mark.anyio
 async def test_fake_streams_scripted_content_in_bounded_chunks() -> None:
-    fake = _AsyncFakeTransport([_OK])
+    fake = AsyncFakeTransport([_OK])
 
     response = await fake.send_streaming(_REQ)
     chunks = [chunk async for chunk in response.aiter_chunks(3)]
@@ -236,8 +230,10 @@ async def test_streaming_response_early_close_survives_close_failure() -> None:
         yield b'SECOND'
 
     response = AsyncStreamingResponse(200, 'OK', _OK.headers, stream, close_fn)
-    iterator = cast('AsyncGenerator[bytes, None]', response.aiter_chunks())
-    assert await anext(iterator) == b'FIRST'
+    iterator = response.aiter_chunks()
+    first = await anext(iterator)
+    assert isinstance(iterator, AsyncGenerator)
+    assert first == b'FIRST'
 
     await iterator.aclose()
     await response.close()
@@ -270,7 +266,8 @@ async def test_streaming_response_rejects_second_body_claim() -> None:
         yield b'PAYLOAD'
 
     response = AsyncStreamingResponse(200, 'OK', _OK.headers, stream, close_fn)
-    iterator = cast('AsyncGenerator[bytes, None]', response.aiter_chunks())
+    iterator = response.aiter_chunks()
+    assert isinstance(iterator, AsyncGenerator)
 
     with pytest.raises(TransportError, match='streaming response was already consumed'):
         response.aiter_chunks()

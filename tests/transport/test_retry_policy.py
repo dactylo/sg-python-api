@@ -3,17 +3,18 @@ import datetime
 import locale
 import random
 from types import MappingProxyType
-from typing import Any, cast
 
 import pytest
 
 from shotgun_api3 import _protocol
+from shotgun_api3._config import Config, RetryEvent, snapshot
+from shotgun_api3._execution import AttemptOutcomes, AttemptState
 
 
 def test_attempt_exhaustion_stops_retrying() -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             3,
             _protocol.Failure('http_status', 'transient', 503, None),
             max_attempts=3,
@@ -43,13 +44,12 @@ def test_classify_batch_inspects_every_member(
     normalized_params: object,
     replay_safe: bool,
 ) -> None:
-    assert _protocol.classify(
+    assert _protocol._classify(
         'batch',
         normalized_params,
     ) == _protocol.OperationDescriptor(
         category='batch',
         replay_safe=replay_safe,
-        body_restartable=True,
         endpoint_role=None,
     )
 
@@ -71,12 +71,9 @@ def test_classify_endpoint_roles(
     category: _protocol.OperationCategory,
     replay_safe: bool,
 ) -> None:
-    assert _protocol.classify_endpoint(
-        endpoint_role, body_restartable=False
-    ) == _protocol.OperationDescriptor(
+    assert _protocol.classify_endpoint(endpoint_role) == _protocol.OperationDescriptor(
         category=category,
         replay_safe=replay_safe,
-        body_restartable=False,
         endpoint_role=endpoint_role,
     )
 
@@ -89,23 +86,21 @@ def test_classify_human_authentication_explicitly(
     has_one_use_auth_token: bool,
     replay_safe: bool,
 ) -> None:
-    assert _protocol.classify(
+    assert _protocol._classify(
         'authenticate_human_user',
         {},
         has_one_use_auth_token=has_one_use_auth_token,
     ) == _protocol.OperationDescriptor(
         category='human_authentication',
         replay_safe=replay_safe,
-        body_restartable=True,
         endpoint_role=None,
     )
 
 
 def test_classify_info_remains_unknown_and_unsafe() -> None:
-    assert _protocol.classify('info', {}) == _protocol.OperationDescriptor(
+    assert _protocol._classify('info', {}) == _protocol.OperationDescriptor(
         category='unknown',
         replay_safe=False,
-        body_restartable=True,
         endpoint_role=None,
     )
 
@@ -150,10 +145,9 @@ def test_classify_rpc_methods(
     category: _protocol.OperationCategory,
     replay_safe: bool,
 ) -> None:
-    assert _protocol.classify(method_name, {}) == _protocol.OperationDescriptor(
+    assert _protocol._classify(method_name, {}) == _protocol.OperationDescriptor(
         category=category,
         replay_safe=replay_safe,
-        body_restartable=True,
         endpoint_role=None,
     )
 
@@ -168,7 +162,6 @@ def test_classify_rpc_operation_treats_driver_info_as_safe_read() -> None:
         _protocol.OperationDescriptor(
             category='read',
             replay_safe=True,
-            body_restartable=True,
             endpoint_role=None,
         )
     )
@@ -188,13 +181,12 @@ def test_classify_session_token_exchange(
     category: _protocol.OperationCategory,
     replay_safe: bool,
 ) -> None:
-    assert _protocol.classify(
+    assert _protocol._classify(
         'get_session_token',
         normalized_params,
     ) == _protocol.OperationDescriptor(
         category=category,
         replay_safe=replay_safe,
-        body_restartable=True,
         endpoint_role=None,
     )
 
@@ -212,7 +204,7 @@ def test_decide_rejects_non_finite_explicit_delays(
 ) -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('http_status', 'rate_limit', 429, retry_after),
             max_attempts=3,
@@ -223,29 +215,10 @@ def test_decide_rejects_non_finite_explicit_delays(
     )
 
 
-def test_decide_requires_named_policy_parameters() -> None:
-    operation = _protocol.classify('read', {})
-    failure = _protocol.Failure('ambiguous_after_send', 'transient', None, None)
-    invalid_decide = cast('Any', _protocol.decide)
-
-    with pytest.raises(TypeError):
-        invalid_decide(operation, 1, failure, 3, 4.0, 1_000.000000003)
-    decision = _protocol.decide(
-        operation,
-        1,
-        failure,
-        max_attempts=3,
-        base_interval=4.0,
-        now=1_000.000000003,
-    )
-    assert decision is not None
-    assert 0.0 <= decision <= 4.0
-
-
 def test_decide_stops_for_oversized_retry_after() -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('http_status', 'rate_limit', 429, 'too-large'),
             max_attempts=3,
@@ -266,21 +239,20 @@ def test_decide_uses_computed_backoff_for_malformed_retry_after() -> None:
     assert failure is not None
     assert failure == _protocol.Failure('http_status', 'rate_limit', 429, None)
     decision = _protocol.decide(
-        _protocol.classify('read', {}),
+        _protocol._classify('read', {}),
         1,
         failure,
         max_attempts=3,
         base_interval=4.0,
         now=1_000.25,
     )
-    assert decision is not None
-    assert 0.0 <= decision <= 4.0
+    assert decision == 3.9856847123991876
 
 
 def test_explicit_retry_after_replaces_jitter() -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('http_status', 'rate_limit', 429, 7.0),
             max_attempts=3,
@@ -305,7 +277,7 @@ def test_jitter_does_not_read_or_mutate_module_global_rng(
         context.setattr(random, 'seed', unexpected_global_rng)
         context.setattr(random, 'uniform', unexpected_global_rng)
         decision = _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('ambiguous_after_send', 'transient', None, None),
             max_attempts=3,
@@ -319,7 +291,7 @@ def test_jitter_does_not_read_or_mutate_module_global_rng(
 
 
 def test_jitter_is_capped_and_derived_only_from_explicit_inputs() -> None:
-    operation = _protocol.classify('read', {})
+    operation = _protocol._classify('read', {})
     failure = _protocol.Failure('ambiguous_after_send', 'transient', None, None)
     decisions = [
         _protocol.decide(
@@ -350,7 +322,7 @@ def test_jitter_is_capped_and_derived_only_from_explicit_inputs() -> None:
 
 
 def test_nearby_jitter_seeds_decorrelate() -> None:
-    operation = _protocol.classify('read', {})
+    operation = _protocol._classify('read', {})
     failure = _protocol.Failure('ambiguous_after_send', 'transient', None, None)
 
     first = _protocol.decide(
@@ -514,29 +486,13 @@ def test_parse_retry_after_rejects_non_http_date_zones(header: str) -> None:
     assert _protocol._parse_retry_after({'Retry-After': header}, 784_111_767.0) is None
 
 
-def test_pre_send_failure_does_not_retry_unrestartable_body() -> None:
-    operation = _protocol.classify('read', {}, body_restartable=False)
-
-    assert (
-        _protocol.decide(
-            operation,
-            1,
-            _protocol.Failure('pre_send', 'transient', None, None),
-            max_attempts=3,
-            base_interval=4.0,
-            now=1_000.25,
-        )
-        is None
-    )
-
-
 @pytest.mark.parametrize('category', ['rate_limit', 'maintenance'])
 def test_pre_send_retries_only_transient_failures(
     category: _protocol._FailureCategory,
 ) -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('pre_send', category, None, None),
             max_attempts=3,
@@ -550,9 +506,9 @@ def test_pre_send_retries_only_transient_failures(
 @pytest.mark.parametrize(
     'operation',
     [
-        _protocol.classify('read', {}),
-        _protocol.classify('create', {}),
-        _protocol.classify('batch', [{'request_type': 'update'}]),
+        _protocol._classify('read', {}),
+        _protocol._classify('create', {}),
+        _protocol._classify('batch', [{'request_type': 'update'}]),
         _protocol.classify_endpoint('allocation'),
     ],
 )
@@ -571,33 +527,13 @@ def test_pre_send_transient_failure_retries_restartable_bodies(
     assert 0.0 <= decision <= 4.0
 
 
-@pytest.mark.parametrize('phase', ['ambiguous_after_send', 'body_read', 'http_status'])
-def test_replay_safe_operation_requires_restartable_body(
-    phase: _protocol._FailurePhase,
-) -> None:
-    operation = _protocol.classify_endpoint('part_put', body_restartable=False)
-    status = 503 if phase == 'http_status' else None
-
-    assert (
-        _protocol.decide(
-            operation,
-            1,
-            _protocol.Failure(phase, 'transient', status, None),
-            max_attempts=3,
-            base_interval=4.0,
-            now=1_000.25,
-        )
-        is None
-    )
-
-
 @pytest.mark.parametrize(
     'operation',
     [
-        _protocol.classify('read', {}),
-        _protocol.classify('batch', [{'request_type': 'read'}]),
-        _protocol.classify('authenticate_human_user', {}),
-        _protocol.classify('get_session_token', {}),
+        _protocol._classify('read', {}),
+        _protocol._classify('batch', [{'request_type': 'read'}]),
+        _protocol._classify('authenticate_human_user', {}),
+        _protocol._classify('get_session_token', {}),
         _protocol.classify_endpoint('download'),
         _protocol.classify_endpoint('object_put'),
         _protocol.classify_endpoint('part_put'),
@@ -622,7 +558,6 @@ def test_retry_policy_data_is_frozen() -> None:
     operation = _protocol.OperationDescriptor(
         category='read',
         replay_safe=True,
-        body_restartable=True,
         endpoint_role=None,
     )
     failure = _protocol.Failure(
@@ -662,7 +597,7 @@ def test_safe_body_read_failure_retries_from_byte_zero(
 @pytest.mark.parametrize('status', sorted({502, 503, 504}))
 def test_safe_read_retries_exact_transient_http_statuses(status: int) -> None:
     decision = _protocol.decide(
-        _protocol.classify('read', {}),
+        _protocol._classify('read', {}),
         1,
         _protocol.Failure('http_status', 'transient', status, None),
         max_attempts=3,
@@ -682,7 +617,7 @@ def test_safe_read_retries_server_signaled_categories(
     status: int,
 ) -> None:
     decision = _protocol.decide(
-        _protocol.classify('read', {}),
+        _protocol._classify('read', {}),
         1,
         _protocol.Failure('http_status', category, status, None),
         max_attempts=3,
@@ -695,14 +630,14 @@ def test_safe_read_retries_server_signaled_categories(
 
 @pytest.mark.parametrize(
     'category',
-    ['abort', 'authentication', 'configuration', 'proxy_auth', 'tls'],
+    ['authentication', 'configuration', 'proxy_auth', 'tls'],
 )
 def test_terminal_failure_categories_always_stop(
     category: _protocol._FailureCategory,
 ) -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('http_status', category, 503, 7.0),
             max_attempts=3,
@@ -719,7 +654,7 @@ def test_transient_http_status_outside_allowlist_does_not_retry(
 ) -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('read', {}),
+            _protocol._classify('read', {}),
             1,
             _protocol.Failure('http_status', 'transient', status, None),
             max_attempts=3,
@@ -733,16 +668,16 @@ def test_transient_http_status_outside_allowlist_does_not_retry(
 @pytest.mark.parametrize(
     'operation',
     [
-        _protocol.classify('create', {}),
-        _protocol.classify('update', {}),
-        _protocol.classify('delete', {}),
-        _protocol.classify('revive', {}),
-        _protocol.classify('batch', [{'request_type': 'read'}, {'request_type': 'update'}]),
-        _protocol.classify('get_session_token', {'auth_token': 'one-use'}),
+        _protocol._classify('create', {}),
+        _protocol._classify('update', {}),
+        _protocol._classify('delete', {}),
+        _protocol._classify('revive', {}),
+        _protocol._classify('batch', [{'request_type': 'read'}, {'request_type': 'update'}]),
+        _protocol._classify('get_session_token', {'auth_token': 'one-use'}),
         _protocol.classify_endpoint('allocation'),
         _protocol.classify_endpoint('link'),
         _protocol.classify_endpoint('finalize'),
-        _protocol.classify('unknown_method', {}),
+        _protocol._classify('unknown_method', {}),
     ],
 )
 def test_unsafe_operations_do_not_retry_ambiguous_transmission(
@@ -761,10 +696,71 @@ def test_unsafe_operations_do_not_retry_ambiguous_transmission(
     )
 
 
+@pytest.mark.parametrize(
+    ('retry_after', 'expected_delay', 'should_retry'),
+    [
+        pytest.param('0', 0.0, True, id='delta-zero'),
+        pytest.param('30', 30.0, True, id='delta-cap'),
+        pytest.param('31', None, False, id='delta-oversized'),
+        pytest.param('9' * 5_000, None, False, id='delta-very-long-oversized'),
+        pytest.param('Wed, 01 Jan 2025 00:00:00 GMT', 0.0, True, id='date-zero'),
+        pytest.param('Wed, 01 Jan 2025 00:00:30 GMT', 30.0, True, id='date-cap'),
+        pytest.param('Wed, 01 Jan 2025 00:00:31 GMT', None, False, id='date-oversized'),
+        pytest.param('tomorrow', None, True, id='malformed'),
+        pytest.param('-1', None, True, id='negative'),
+        pytest.param('NaN', None, True, id='nan'),
+        pytest.param('Infinity', None, True, id='positive-infinity'),
+        pytest.param('-Infinity', None, True, id='negative-infinity'),
+    ],
+)
+def test_retry_after_never_exceeds_backoff_cap(
+    retry_after: str,
+    expected_delay: float | None,
+    should_retry: bool,
+) -> None:
+    config = Config()
+    config.set_server_params('https://x.example')
+    config.update_fields(max_rpc_attempts=3, rpc_attempt_interval=4000)
+    state = AttemptState(
+        context=snapshot(config),
+        control=None,
+        number=1,
+        operation=_protocol._classify('read', {}),
+        route='rpc',
+        started=0.0,
+    )
+    outcomes = AttemptOutcomes(clock=lambda: 0.0, jitter_seed=lambda: 1000.25)
+    failure = _protocol.classify_http_failure(
+        429, {'retry-after': retry_after}, now=1_735_689_600.0
+    )
+
+    assert failure is not None
+    retry = outcomes.retry(state, failure, 429)
+
+    if not should_retry:
+        assert retry is None
+        return
+    assert retry is not None
+    if expected_delay is None:
+        expected_delay = _protocol.decide(
+            state.operation,
+            1,
+            _protocol.Failure('http_status', 'rate_limit', 429, None),
+            max_attempts=config.max_rpc_attempts,
+            base_interval=config.rpc_attempt_interval / 1000.0,
+            now=1000.25,
+        )
+        assert expected_delay is not None
+    assert retry.event == RetryEvent(
+        operation='read', route='rpc', attempt=1, delay=expected_delay, status=429
+    )
+    assert retry.event.delay <= 30.0
+
+
 def test_write_does_not_retry_body_read_failure() -> None:
     assert (
         _protocol.decide(
-            _protocol.classify('create', {}),
+            _protocol._classify('create', {}),
             1,
             _protocol.Failure('body_read', 'transient', None, None),
             max_attempts=3,

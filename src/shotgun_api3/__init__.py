@@ -4,6 +4,10 @@ Import `Shotgun` directly from this package. Import `AsyncShotgun` explicitly
 after installing the `async` extra; it is loaded lazily and excluded from star
 imports.
 
+Import initializes the compatibility logger and reads
+`SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION`; the value `1` disables entity-link
+optimization.
+
 Close synchronous clients with `close()`. Use asynchronous clients through an
 async context manager or call `await close()`. The public `sg_timezone` object
 is the shared timezone configuration used for datetime conversion.

@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+_PROJECT = Path(__file__).resolve().parents[1] / 'pyproject.toml'
 
 
 def run_pyright(probe: Path, *, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -10,7 +10,7 @@ def run_pyright(probe: Path, *, cwd: Path) -> subprocess.CompletedProcess[str]:
         [
             str(Path(sys.executable).with_name('pyright')),
             '--project',
-            str(PROJECT),
+            str(_PROJECT),
             '--pythonpath',
             sys.executable,
             '--outputjson',

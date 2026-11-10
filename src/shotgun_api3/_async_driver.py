@@ -13,7 +13,7 @@ from io import BytesIO
 from typing import Protocol, TypeVar, cast
 
 from . import _protocol, _transport
-from ._async_transport import AsyncTransport
+from ._async_transport import AsyncTransport, AsyncUploadObserver
 from ._config import (
     EventRoute,
     ObserverCallback,
@@ -37,7 +37,6 @@ from ._execution import (
     build_rpc_request,
 )
 from ._transport import (
-    ReadTimeoutError,
     SendError,
     TransportError,
     TransportRequest,
@@ -51,23 +50,15 @@ _HTTP_REDIRECT = 302
 
 @dataclasses.dataclass(frozen=True)
 class AsyncAttemptControl:
-    """Consume async attempt bytes under deadline and progress control."""
+    """Consume async attempt bytes with progress reporting."""
 
     _attempt: int
-    _clock: Callable[[], float]
-    _deadline: float | None
     _observer: ObserverCallback | None
     _operation: _protocol.OperationCategory
     _route: EventRoute
 
-    def _check_deadline(self) -> None:
-        """Raise when cumulative monotonic attempt time exceeds its limit."""
-        if self._deadline is not None and self._clock() > self._deadline:
-            raise ReadTimeoutError('total attempt timeout exceeded')
-
-    async def _consume_buffered(self, body: bytes, total_bytes: int | None = None) -> bytes:
+    async def consume_buffered(self, body: bytes, total_bytes: int | None = None) -> bytes:
         """Observe a received buffered body without rebuilding it."""
-        self._check_deadline()
         if body:
             notify_observer(
                 self._observer,
@@ -81,22 +72,13 @@ class AsyncAttemptControl:
             )
         return body
 
-    def _remaining_timeout(self) -> float | None:
-        """Return the remaining cumulative attempt timeout."""
-        if self._deadline is None:
-            return None
-        remaining = self._deadline - self._clock()
-        if remaining < 0:
-            raise ReadTimeoutError('total attempt timeout exceeded')
-        return remaining
-
     async def consume_into(
         self,
         chunks: AsyncIterator[bytes],
         sink: Callable[[bytes], object | Awaitable[object]],
         total_bytes: int | None = None,
     ) -> None:
-        """Write async chunks under deadline and progress control.
+        """Write async chunks with progress reporting.
 
         Args:
             chunks: Fresh response-body chunks for this attempt.
@@ -104,8 +86,7 @@ class AsyncAttemptControl:
             total_bytes: Known complete body size, when available.
 
         Raises:
-            ReadTimeoutError: If cumulative attempt time exceeds the total
-                limit.
+            Exception: If reading a chunk or invoking the sink fails.
         """
         transferred = 0
         async for chunk in chunks:
@@ -113,7 +94,6 @@ class AsyncAttemptControl:
             if inspect.isawaitable(sink_result):
                 await sink_result
             transferred += len(chunk)
-            self._check_deadline()
             if chunk:
                 notify_observer(
                     self._observer,
@@ -131,7 +111,7 @@ class AsyncAttemptControl:
         chunks: AsyncIterator[bytes],
         total_bytes: int | None = None,
     ) -> bytes:
-        """Collect async chunks while enforcing the attempt deadline.
+        """Collect async chunks while reporting progress.
 
         Args:
             chunks: Fresh response-body chunks for this attempt.
@@ -141,8 +121,7 @@ class AsyncAttemptControl:
             Concatenated response bytes.
 
         Raises:
-            ReadTimeoutError: If cumulative attempt time exceeds the total
-                limit.
+            Exception: If reading a chunk fails.
         """
         body = BytesIO()
         await self.consume_into(chunks, body.write, total_bytes=total_bytes)
@@ -239,11 +218,8 @@ class AsyncDriver:
     ) -> AttemptState[AsyncAttemptControl]:
         """Build immutable timing and observer state for one fresh attempt."""
         started = self._clock()
-        deadline = None if context.timeout.total is None else started + context.timeout.total
         control = AsyncAttemptControl(
             _attempt=attempt,
-            _clock=self._clock,
-            _deadline=deadline,
             _observer=context.on_progress,
             _operation=operation.category,
             _route=route,
@@ -296,7 +272,6 @@ class AsyncDriver:
                 response_status = response.status
                 response_headers = response.headers
                 correlation_id = response_correlation_id(response_headers)
-                state.control._check_deadline()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 failure = _protocol.classify_http_failure(
                     response_status,
                     response_headers,
@@ -416,7 +391,6 @@ class AsyncDriver:
         request: TransportRequest,
         state: AttemptState[AsyncAttemptControl],
         *,
-        redirected: bool,
         streaming: bool,
     ) -> AsyncLiveResponse | AttemptRetry:
         """Send once and close the request body under response ownership."""
@@ -425,8 +399,6 @@ class AsyncDriver:
         response_status: int | None = None
         try:
             try:
-                if redirected:
-                    request = _request_with_remaining_timeout(request, state.control)
                 if streaming:
                     response = await self._transport.send_streaming(request)
                 else:
@@ -496,7 +468,6 @@ class AsyncDriver:
                     sent = await self._send_request(
                         request,
                         state,
-                        redirected=redirected,
                         streaming=execution_options.streaming,
                     )
                     if isinstance(sent, AttemptRetry):
@@ -561,7 +532,7 @@ class AsyncDriver:
                 buffered.headers,
                 buffered.content,
             )
-            body = await control._consume_buffered(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            body = await control.consume_buffered(
                 buffered.content,
                 total_bytes=len(buffered.content),
             )
@@ -636,6 +607,11 @@ class AsyncDriver:
 
         Yields:
             Decoded RPC results in page order.
+
+        Raises:
+            TransportError: If a page exhausts its transport attempts.
+            Exception: If building, validating, decoding, or cleaning up a page
+                operation fails.
         """
         if context.page_prefetch <= 0:
             page = first_page
@@ -686,6 +662,7 @@ class AsyncDriver:
         Raises:
             ValueError: If `attempts` is not positive or `interval` is
                 negative.
+            Exception: If the predicate or configured sleep fails.
         """
         if attempts <= 0:
             raise ValueError('poll attempts must be positive')
@@ -721,7 +698,7 @@ class _AsyncBufferedResponse(AsyncLiveResponse, Protocol):
         ...
 
 
-class _ObservedRequestBody(Iterator[bytes]):
+class _ObservedRequestBody(Iterator[bytes], AsyncUploadObserver):
     """Publish progress while owning exact-once request-body cleanup."""
 
     def __init__(
@@ -753,7 +730,13 @@ class _ObservedRequestBody(Iterator[bytes]):
         return chunk
 
     def close(self) -> None:
-        """Close the source iterator exactly once."""
+        """Close the source iterator at most once.
+
+        Later calls do not repeat cleanup even when the first close fails.
+
+        Raises:
+            Exception: If the source iterator's cleanup fails.
+        """
         with self._condition:
             if self._closed:
                 return
@@ -781,15 +764,10 @@ class _ObservedRequestBody(Iterator[bytes]):
 
         Args:
             chunk: Chunk pulled from the source iterator.
-
-        Raises:
-            ReadTimeoutError: If the attempt deadline passed before the chunk
-                could be returned.
         """
         self._transferred += len(chunk)
         if not chunk:
             return
-        self._state.control._check_deadline()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         notify_observer(
             self._state.context.on_progress,
             ProgressEvent(
@@ -807,6 +785,9 @@ class _ObservedRequestBody(Iterator[bytes]):
         Returns:
             The next chunk, or `None` when the source is exhausted or the body
             is closing or closed.
+
+        Raises:
+            Exception: If the source iterator fails.
         """
         with self._condition:
             chunks = self._chunks
@@ -887,17 +868,6 @@ def _request_with_progress(
             _transport.content_length(request.headers),
             state,
         ),
-    )
-
-
-def _request_with_remaining_timeout(
-    request: TransportRequest,
-    control: AsyncAttemptControl,
-) -> TransportRequest:
-    """Restrict a redirect hop to its remaining cumulative attempt timeout."""
-    return _transport.narrow_total_timeout(
-        request,
-        control._remaining_timeout(),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     )
 
 

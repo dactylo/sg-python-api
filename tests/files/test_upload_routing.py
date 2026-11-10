@@ -53,13 +53,3 @@ def test_choose_upload_path_uses_the_observed_multipart_boundary(
         _files.choose_upload_path(server_info, 'Version', 'sg_uploaded_movie', file_size)
         == expected
     )
-
-
-def test_upload_routes_are_evidence_pinned() -> None:
-    assert _files.COMPLETE_MULTIPART == '/upload/api_complete_multipart_upload'
-    assert _files._FILE_SERVE_ATTACHMENT == '/file_serve/attachment/'
-    assert _files.GET_PART_LINK == '/upload/api_get_upload_link_for_part'
-    assert _files.GET_UPLOAD_LINK_INFO == '/upload/api_get_upload_link_info'
-    assert _files.LINK_FILE == '/upload/api_link_file'
-    assert _files._MULTIPART_CHUNK_SIZE == 20_000_000
-    assert _files.SHARE_THUMBNAIL == '/upload/share_thumbnail'

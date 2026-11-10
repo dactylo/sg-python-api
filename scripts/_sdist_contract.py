@@ -10,6 +10,7 @@ import io
 import stat
 import sys
 import tarfile
+import tomllib
 import zipfile
 from email.parser import BytesParser
 from email.policy import default
@@ -21,21 +22,23 @@ if TYPE_CHECKING:
 
 _ARTIFACT_ARGUMENT_COUNT = 6
 _COMMAND_ARGUMENT_COUNT = 3
-_DIRECT_DOC_PART_COUNT = 2
-_EXPECTED_VERSION = '0.1.2'
+_EXPECTED_VERSION = tomllib.loads(
+    (Path(__file__).resolve().parents[1] / 'pyproject.toml').read_text(encoding='utf-8')
+)['project']['version']
+_EXPECTED_LICENSE = 'MIT'
+_EXPECTED_NAME = 'sg-python-api'
+_EXPECTED_REQUIRES_PYTHON = '>=3.11'
 _REGULAR_MEMBER_TYPES = frozenset({tarfile.AREGTYPE, tarfile.REGTYPE})
 _ROOT_SOURCE_FILES = frozenset(
     {
         '.gitignore',
-        'COMPATIBILITY.md',
         'LICENSE',
-        'Makefile',
         'README.md',
         'pyproject.toml',
     }
 )
 _SDIST_ROOT_NAME = f'sg_python_api-{_EXPECTED_VERSION}'
-_TREE_SOURCE_ROOTS = frozenset({'examples', 'scripts', 'src', 'tests'})
+_TREE_SOURCE_ROOTS = frozenset({'src'})
 _EXPECTED_CLASSIFIERS = {
     'Programming Language :: Python :: 3 :: Only',
     'Programming Language :: Python :: 3.11',
@@ -54,6 +57,7 @@ _EXPECTED_PACKAGE_FILES = {
     '_async_transport.py',
     '_capabilities.py',
     '_client.py',
+    '_connections.py',
     '_config.py',
     '_crud.py',
     '_driver.py',
@@ -64,13 +68,39 @@ _EXPECTED_PACKAGE_FILES = {
     '_protocol.py',
     '_sentinel.py',
     '_sg_timezone.py',
-    '_signatures.py',
     '_transport.py',
     '_version.py',
     'lib/__init__.py',
     'lib/mockgun/__init__.py',
-    'lib/mockgun/_async.py',
-    'lib/mockgun/_mockgun.py',
+    'lib/mockgun/_activity.py',
+    'lib/mockgun/_async_client.py',
+    'lib/mockgun/_dates.py',
+    'lib/mockgun/_errors.py',
+    'lib/mockgun/_events.py',
+    'lib/mockgun/_follows.py',
+    'lib/mockgun/_handlers.py',
+    'lib/mockgun/_links.py',
+    'lib/mockgun/_new_client.py',
+    'lib/mockgun/_presets.py',
+    'lib/mockgun/_query.py',
+    'lib/mockgun/_retirement.py',
+    'lib/mockgun/_schema.py',
+    'lib/mockgun/_schema_writes.py',
+    'lib/mockgun/_search.py',
+    'lib/mockgun/_server.py',
+    'lib/mockgun/_sessions.py',
+    'lib/mockgun/_site.py',
+    'lib/mockgun/_site_data.py',
+    'lib/mockgun/_storage.py',
+    'lib/mockgun/_store.py',
+    'lib/mockgun/_summaries.py',
+    'lib/mockgun/_sync_client.py',
+    'lib/mockgun/_thumbnails.py',
+    'lib/mockgun/_threads.py',
+    'lib/mockgun/_transport.py',
+    'lib/mockgun/_uploads.py',
+    'lib/mockgun/_wire.py',
+    'lib/mockgun/mockgun.py',
     'lib/sgtimezone.py',
     'py.typed',
     'shotgun.py',
@@ -100,12 +130,6 @@ def _is_expected_sdist_source(name: str) -> bool:
     path = PurePosixPath(name)
     if name in _ROOT_SOURCE_FILES:
         return True
-    if (
-        len(path.parts) == _DIRECT_DOC_PART_COUNT
-        and path.parts[0] == 'docs'
-        and path.suffix == '.md'
-    ):
-        return True
     return len(path.parts) > 1 and path.parts[0] in _TREE_SOURCE_ROOTS
 
 
@@ -119,11 +143,11 @@ def _assert_sdist_paths(names: set[str], label: str) -> None:
 
 
 def _metadata_signature(metadata: Message, label: str) -> tuple[object, ...]:
-    """Check metadata against independent release literals."""
+    """Check metadata against the package version and release contract."""
     expected_fields = {
-        'License-Expression': 'MIT',
-        'Name': 'sg-python-api',
-        'Requires-Python': '>=3.11',
+        'License-Expression': _EXPECTED_LICENSE,
+        'Name': _EXPECTED_NAME,
+        'Requires-Python': _EXPECTED_REQUIRES_PYTHON,
         'Version': _EXPECTED_VERSION,
     }
     for field, expected in expected_fields.items():

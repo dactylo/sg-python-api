@@ -8,13 +8,15 @@ import pytest
 from shotgun_api3 import ShotgunError
 from shotgun_api3.lib import mockgun
 
+from .conftest import FakeSiteCase
+
 _SCALAR_VALUE_CASES = [
     pytest.param('checkbox', True, 1, id='checkbox'),
-    pytest.param('date', '2026-07-18', datetime.date(2026, 7, 18), id='date'),
+    pytest.param('date', '2026-07-18', 42, id='date'),
     pytest.param(
         'date_time',
         datetime.datetime(2026, 7, 18, 12, 30, tzinfo=datetime.UTC),
-        '2026-07-18T12:30:00',
+        'not-a-datetime',
         id='date-time',
     ),
     pytest.param('duration', 120, 120.0, id='duration'),
@@ -30,8 +32,9 @@ _SCALAR_VALUE_CASES = [
 ]
 
 
-def _database(client: mockgun.Shotgun) -> dict[str, dict[int, dict[str, Any]]]:
-    return cast('dict[str, dict[int, dict[str, Any]]]', vars(client)['_db'])
+def _records(client: mockgun.Shotgun, entity_type: str) -> dict[object, dict[str, object]]:
+    fields = list(client.schema_field_read(entity_type))
+    return {row['id']: row for row in client.find(entity_type, [], fields)}
 
 
 def _user_link(entity_id: int, **extra: object) -> dict[str, object]:
@@ -83,7 +86,8 @@ def test_batch_forwards_options_and_preserves_order_shapes_and_inputs(
         True,
     ]
     assert requests == original
-    assert _database(mockgun_client)['Shot'][1]['__retired'] is True
+    assert mockgun_client.find('Shot', []) == []
+    assert mockgun_client.find('Shot', [], retired_only=True) == [{'type': 'Shot', 'id': 1}]
 
 
 def test_batch_has_exact_public_signature() -> None:
@@ -129,7 +133,7 @@ def test_batch_rejects_invalid_data_key_before_mutation(
     with pytest.raises(ShotgunError, match='field names must be nonempty strings'):
         mockgun_client.batch(requests)
 
-    assert _database(mockgun_client)['Shot'] == {}
+    assert _records(mockgun_client, 'Shot') == {}
 
 
 @pytest.mark.parametrize(
@@ -141,7 +145,7 @@ def test_batch_rejects_invalid_data_key_before_mutation(
         ([{'request_type': 'create'}], 'batch request 0.*entity_type'),
         (
             [{'request_type': 'revive', 'entity_type': 'Shot', 'entity_id': 1}],
-            'Invalid request type revive',
+            'batch request 0 has invalid request_type',
         ),
         (
             [{'request_type': 'create', 'entity_type': 'Shot'}],
@@ -200,21 +204,42 @@ def test_create_accepts_each_scalar_schema_type(
     }
 
 
+@pytest.mark.parametrize(
+    ('field', 'value', 'expected'),
+    [
+        ('date', datetime.date(2026, 7, 18), '2026-07-18'),
+        (
+            'date_time',
+            '2026-07-18T12:30:00',
+            datetime.datetime(2026, 7, 18, 12, 30, tzinfo=datetime.UTC),
+        ),
+    ],
+)
+def test_create_accepts_wire_equivalent_date_inputs(
+    mockgun_client: mockgun.Shotgun,
+    field: str,
+    value: object,
+    expected: object,
+) -> None:
+    created = mockgun_client.create('ScalarTypes', {field: value})
+    assert created[field] == expected
+    assert mockgun_client.find_one('ScalarTypes', [], [field]) == created
+
+
 def test_create_assigns_per_type_ids_and_applies_independent_defaults(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
+    event = mockgun_client.create('EventLogEntry', {'event_type': 'Test_Event'})
     first = mockgun_client.create('Shot', {'code': 'one'})
     second = mockgun_client.create('Shot', {'code': 'two'})
     project = mockgun_client.create('Project', {'name': 'main'})
-    event = mockgun_client.create('EventLogEntry', {'event_type': 'Test_Event'})
-    database = _database(mockgun_client)
+    rows = _records(mockgun_client, 'Shot')
 
     assert first == {'code': 'one', 'type': 'Shot', 'id': 1}
     assert second['id'] == 2
     assert project['id'] == 1
     assert event['id'] == 2
-    assert database['Shot'][1] == {
-        '__retired': False,
+    assert rows[1] == {
         'code': 'one',
         'id': 1,
         'project': None,
@@ -222,8 +247,9 @@ def test_create_assigns_per_type_ids_and_applies_independent_defaults(
         'sg_status_list': None,
         'type': 'Shot',
     }
-    assert database['Shot'][2]['reviewers'] == []
-    assert database['Shot'][1]['reviewers'] is not database['Shot'][2]['reviewers']
+    assert rows[2]['reviewers'] == []
+    mockgun_client.update('Shot', 1, {'reviewers': [_user_link(1)]})
+    assert _records(mockgun_client, 'Shot')[2]['reviewers'] == []
 
 
 def test_create_expands_local_paths_without_mutating_nested_input(
@@ -233,10 +259,10 @@ def test_create_expands_local_paths_without_mutating_nested_input(
         'local_path': '/work/example.mov',
         'local_path_linux': '/mnt/example.mov',
     }
-    data = {'metadata': metadata}
+    data = {'url': metadata}
     original = copy.deepcopy(data)
 
-    result = mockgun_client.create('EventLogEntry', data)
+    result = mockgun_client.create('ScalarTypes', data)
 
     expected_metadata = {
         'local_path': '/work/example.mov',
@@ -250,11 +276,11 @@ def test_create_expands_local_paths_without_mutating_nested_input(
         },
     }
     assert result == {
-        'id': 2,
-        'metadata': expected_metadata,
-        'type': 'EventLogEntry',
+        'id': 1,
+        'url': expected_metadata,
+        'type': 'ScalarTypes',
     }
-    assert _database(mockgun_client)['EventLogEntry'][2]['metadata'] == expected_metadata
+    assert _records(mockgun_client, 'ScalarTypes')[1]['url'] == expected_metadata
     assert data == original
 
 
@@ -292,6 +318,7 @@ def test_create_normalizes_links_without_mutating_or_aliasing_inputs(
     result = mockgun_client.create('Shot', data, return_fields)
 
     assert result == {
+        'code': 'linked',
         'id': 1,
         'project': {'type': 'HumanUser', 'id': 9},
         'reviewers': [
@@ -306,7 +333,7 @@ def test_create_normalizes_links_without_mutating_or_aliasing_inputs(
     cast('dict[str, object]', data['project'])['id'] = 99
     cast('list[dict[str, object]]', data['reviewers'])[0]['id'] = 99
 
-    row = _database(mockgun_client)['Shot'][1]
+    row = _records(mockgun_client, 'Shot')[1]
     assert row['project'] == {'type': 'HumanUser', 'id': 9}
     assert row['reviewers'] == [
         {'type': 'HumanUser', 'id': 1},
@@ -333,14 +360,13 @@ def test_create_rejects_invalid_value_for_each_scalar_schema_type(
     [
         ('NotAnEntity', {}, None, 'NotAnEntity.*valid entity'),
         ('Shot', {'missing': 'value'}, None, 'missing.*valid field.*Shot'),
-        ('Shot', {'code': 'value'}, ['missing'], 'missing.*valid field.*Shot'),
         ('Shot', {'id': 99}, None, 'id.*type.*create or update'),
         ('Shot', {'type': 'Asset'}, None, 'id.*type.*create or update'),
         ('Shot', {'__retired': True}, None, 'cannot be set'),
         ('Shot', {'_private': True}, None, 'cannot be set'),
     ],
 )
-def test_create_rejects_unknown_and_direct_fields(
+def test_create_rejects_unknown_data_and_direct_fields(
     mockgun_client: mockgun.Shotgun,
     entity_type: str,
     data: dict[str, object],
@@ -355,13 +381,13 @@ def test_create_rejects_unsupported_scalar_schema_type(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
     with pytest.raises(
-        ShotgunError,
+        mockgun.MockgunError,
         match=r'ScalarTypes\.unsupported.*schema type unsupported.*not implemented',
     ):
         mockgun_client.create('ScalarTypes', {'unsupported': 'value'})
 
 
-def test_create_returns_only_created_or_requested_fields(
+def test_create_returns_supplied_and_requested_fields(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
     created = mockgun_client.create(
@@ -384,6 +410,7 @@ def test_create_returns_only_created_or_requested_fields(
         'code': 'requested',
         'id': 2,
         'project': None,
+        'sg_status_list': 'fin',
         'type': 'Shot',
     }
 
@@ -409,23 +436,26 @@ def test_create_validates_relation_shapes(
         mockgun_client.create('Shot', {field: value})
 
 
-def test_delete_and_revive_report_state_transitions(
-    mockgun_client: mockgun.Shotgun,
-) -> None:
+def test_delete_and_revive_report_state_transitions(mockgun_client: mockgun.Shotgun) -> None:
     shot = mockgun_client.create('Shot', {'code': 'retirement'})
     assert isinstance(shot['id'], int)
-    row = _database(mockgun_client)['Shot'][shot['id']]
+    for method, changed, retired in (
+        ('revive', False, False),
+        ('delete', True, True),
+        ('delete', False, True),
+        ('revive', True, False),
+        ('revive', False, False),
+    ):
+        assert getattr(mockgun_client, method)('Shot', shot['id']) is changed
+        assert mockgun_client.find_one('Shot', [], ['code'], retired_only=retired) == shot
+        assert mockgun_client.find_one('Shot', [], retired_only=not retired) is None
 
-    assert mockgun_client.revive('Shot', shot['id']) is False
-    assert row['__retired'] is False
-    assert mockgun_client.delete('Shot', shot['id']) is True
-    assert row['__retired'] is True
-    assert mockgun_client.delete('Shot', shot['id']) is False
-    assert row['__retired'] is True
-    assert mockgun_client.revive('Shot', shot['id']) is True
-    assert row['__retired'] is False
-    assert mockgun_client.revive('Shot', shot['id']) is False
-    assert row['__retired'] is False
+
+def test_empty_update_returns_identity_without_server_validation(
+    mockgun_client: mockgun.Shotgun,
+) -> None:
+    assert mockgun_client.update('NotAnEntity', 999, {}) == {'type': 'NotAnEntity', 'id': 999}
+    assert mockgun_client.find('Shot', []) == []
 
 
 @pytest.mark.parametrize('invalid_first', [False, True])
@@ -441,15 +471,15 @@ def test_multi_entity_none_is_rejected_before_mutation(
 
     shot = mockgun_client.create('Shot', {'code': 'original', 'sg_status_list': 'ip'})
     assert isinstance(shot['id'], int)
-    before = copy.deepcopy(_database(mockgun_client)['Shot'][shot['id']])
+    before = copy.deepcopy(_records(mockgun_client, 'Shot')[shot['id']])
 
     with pytest.raises(ShotgunError, match=r'Shot\.reviewers.*multi_entity.*list'):
         mockgun_client.update('Shot', shot['id'], data)
-    assert _database(mockgun_client)['Shot'][shot['id']] == before
+    assert _records(mockgun_client, 'Shot')[shot['id']] == before
 
     with pytest.raises(ShotgunError, match=r'Shot\.reviewers.*multi_entity.*list'):
         mockgun_client.create('Shot', data)
-    assert _database(mockgun_client)['Shot'] == {shot['id']: before}
+    assert _records(mockgun_client, 'Shot') == {shot['id']: before}
 
 
 @pytest.mark.parametrize('invalid_key', [1, None, ''])
@@ -461,7 +491,7 @@ def test_data_keys_must_be_nonempty_strings_before_mutation(
 ) -> None:
     shot = mockgun_client.create('Shot', {'code': 'original', 'sg_status_list': 'ip'})
     assert isinstance(shot['id'], int)
-    before = copy.deepcopy(_database(mockgun_client)['Shot'][shot['id']])
+    before = copy.deepcopy(_records(mockgun_client, 'Shot')[shot['id']])
     data = cast(
         'dict[str, Any]',
         {'code': 'changed', invalid_key: 'invalid', 'sg_status_list': 'fin'},
@@ -474,7 +504,7 @@ def test_data_keys_must_be_nonempty_strings_before_mutation(
         with pytest.raises(ShotgunError, match='field names must be nonempty strings'):
             mockgun_client.update('Shot', shot['id'], data)
 
-    assert _database(mockgun_client)['Shot'] == {shot['id']: before}
+    assert _records(mockgun_client, 'Shot') == {shot['id']: before}
 
 
 def test_nullable_fields_and_empty_multi_entity_lists_remain_valid(
@@ -492,9 +522,13 @@ def test_nullable_fields_and_empty_multi_entity_lists_remain_valid(
         {'code': None, 'project': None, 'reviewers': []},
     )
 
-    assert result == [
-        {'code': None, 'id': shot['id'], 'project': None, 'reviewers': [], 'type': 'Shot'}
-    ]
+    assert result == {
+        'code': None,
+        'id': shot['id'],
+        'project': None,
+        'reviewers': [],
+        'type': 'Shot',
+    }
 
 
 @pytest.mark.parametrize('method_name', ['delete', 'revive'])
@@ -546,7 +580,7 @@ def test_update_has_exact_public_signature() -> None:
     )
 
 
-def test_update_multi_entity_remove_pins_observed_quirks(
+def test_update_multi_entity_remove_preserves_unselected_links(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
     links = [_user_link(1), _user_link(2), _user_link(3)]
@@ -559,7 +593,7 @@ def test_update_multi_entity_remove_pins_observed_quirks(
         {'reviewers': [_user_link(2)]},
         {'reviewers': 'remove'},
     )
-    assert removed_one[0]['reviewers'] == [_user_link(1), _user_link(3)]
+    assert removed_one['reviewers'] == [_user_link(1), _user_link(3)]
 
     mockgun_client.update('Shot', shot['id'], {'reviewers': links})
     removed_two = mockgun_client.update(
@@ -568,12 +602,7 @@ def test_update_multi_entity_remove_pins_observed_quirks(
         {'reviewers': [_user_link(2), _user_link(3)]},
         {'reviewers': 'remove'},
     )
-    assert removed_two[0]['reviewers'] == [
-        _user_link(1),
-        _user_link(1),
-        _user_link(2),
-        _user_link(3),
-    ]
+    assert removed_two['reviewers'] == [_user_link(1)]
 
     mockgun_client.update('Shot', shot['id'], {'reviewers': links})
     removed_empty = mockgun_client.update(
@@ -582,7 +611,7 @@ def test_update_multi_entity_remove_pins_observed_quirks(
         {'reviewers': []},
         {'reviewers': 'remove'},
     )
-    assert removed_empty[0]['reviewers'] == []
+    assert removed_empty['reviewers'] == links
 
 
 def test_update_multi_entity_replacement_and_add_preserve_observed_order(
@@ -594,13 +623,11 @@ def test_update_multi_entity_replacement_and_add_preserve_observed_order(
 
     replaced = mockgun_client.update('Shot', shot['id'], {'reviewers': replacement})
 
-    assert replaced == [
-        {
-            'id': shot['id'],
-            'reviewers': [_user_link(2), _user_link(2), _user_link(1)],
-            'type': 'Shot',
-        }
-    ]
+    assert replaced == {
+        'id': shot['id'],
+        'reviewers': [_user_link(2), _user_link(2), _user_link(1)],
+        'type': 'Shot',
+    }
 
     additions = [
         _user_link(2, name='existing'),
@@ -618,18 +645,16 @@ def test_update_multi_entity_replacement_and_add_preserve_observed_order(
         modes,
     )
 
-    assert added == [
-        {
-            'id': shot['id'],
-            'reviewers': [
-                _user_link(2),
-                _user_link(2),
-                _user_link(1),
-                _user_link(3),
-            ],
-            'type': 'Shot',
-        }
-    ]
+    assert added == {
+        'id': shot['id'],
+        'reviewers': [
+            _user_link(2),
+            _user_link(2),
+            _user_link(1),
+            _user_link(3),
+        ],
+        'type': 'Shot',
+    }
     assert additions == original_additions
     assert modes == original_modes
 
@@ -637,7 +662,7 @@ def test_update_multi_entity_replacement_and_add_preserve_observed_order(
 @pytest.mark.parametrize(
     ('entity_type', 'entity_id', 'data', 'message'),
     [
-        ('NotAnEntity', 1, {}, 'NotAnEntity.*valid entity'),
+        ('NotAnEntity', 1, {'code': 'value'}, 'NotAnEntity.*valid entity'),
         ('Shot', 999, {'code': 'missing'}, 'No entity.*Shot.*999'),
         ('Shot', 1, {'missing': 'value'}, 'missing.*valid field.*Shot'),
         ('Shot', 1, {'id': 2}, 'id.*type.*create or update'),
@@ -658,7 +683,7 @@ def test_update_rejects_unknown_missing_and_direct_fields(
         mockgun_client.update(entity_type, entity_id, data)
 
 
-def test_update_replaces_fields_and_returns_one_item_without_aliasing(
+def test_update_replaces_fields_and_returns_dictionary_without_aliasing(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
     shot = mockgun_client.create('Shot', {'code': 'before'})
@@ -671,19 +696,17 @@ def test_update_replaces_fields_and_returns_one_item_without_aliasing(
 
     result = mockgun_client.update('Shot', shot['id'], data)
 
-    assert result == [
-        {
-            'code': 'after',
-            'id': shot['id'],
-            'project': {'type': 'HumanUser', 'id': 8},
-            'type': 'Shot',
-        }
-    ]
+    assert result == {
+        'code': 'after',
+        'id': shot['id'],
+        'project': {'type': 'HumanUser', 'id': 8},
+        'type': 'Shot',
+    }
     assert data == original
 
     cast('dict[str, object]', data['project'])['id'] = 88
 
-    row = _database(mockgun_client)['Shot'][shot['id']]
+    row = _records(mockgun_client, 'Shot')[shot['id']]
     assert row['project'] == {'type': 'HumanUser', 'id': 8}
     assert row['sg_status_list'] is None
 
@@ -700,13 +723,11 @@ def test_update_unsupported_multi_entity_mode_is_a_silent_no_op(
 
     result = mockgun_client.update('Shot', shot['id'], data, modes)
 
-    assert result == [
-        {
-            'id': shot['id'],
-            'reviewers': [_user_link(1)],
-            'type': 'Shot',
-        }
-    ]
+    assert result == {
+        'id': shot['id'],
+        'reviewers': [_user_link(1)],
+        'type': 'Shot',
+    }
     assert data == original_data
     assert modes == original_modes
 
@@ -731,3 +752,19 @@ def test_update_validates_relation_values(
 
     with pytest.raises(ShotgunError, match=message):
         mockgun_client.update('Shot', shot['id'], data)
+
+
+@pytest.mark.anyio
+async def test_create_color_requires_emulation(effects_site: FakeSiteCase) -> None:
+    with pytest.raises(mockgun.MockgunError, match=r'color.*not implemented'):
+        await effects_site.call('create', 'Task', {'color': 'red'})
+    assert await effects_site.call('find', 'Task', []) == []
+
+
+@pytest.mark.anyio
+async def test_create_rejects_dotted_return_field_before_write(
+    query_site: FakeSiteCase,
+) -> None:
+    with pytest.raises(mockgun.MockgunError):
+        await query_site.call('create', 'Asset', {'code': 'A1'}, ['project.Project.name'])
+    assert await query_site.call('find', 'Asset', []) == []

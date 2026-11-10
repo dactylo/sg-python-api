@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sg-python-api"
-version = "0.1.2"
+version = "0.2.0"
 description = "Python client for Autodesk Flow Production Tracking"
 keywords = [ "api", "flow-production-tracking", "shotgrid", "shotgun", "shotgun-api3" ]
 license = "MIT"
@@ -50,6 +50,7 @@ dev = [
   "pyproject-fmt",
   "pyright",
   "ruff",
+  "zizmor",
   { include-group = "test" },
 ]
 test = [
@@ -67,13 +68,7 @@ metadata.hooks.fancy-pypi-readme.fragments = [ { path = "README.md" } ]
 build.targets.wheel.packages = [ "src/shotgun_api3" ]
 build.targets.sdist.include = [
   "/README.md",
-  "/COMPATIBILITY.md",
-  "/docs/*.md",
-  "/examples/**",
-  "/Makefile",
-  "/scripts/**",
-  "/src/**",
-  "/tests/**",
+  "/src",
 ]
 
 # Keep checkout links relative; package links target this release.
@@ -114,11 +109,11 @@ lint.ignore = [
 # Command-line scripts and examples intentionally print output.
 lint.per-file-ignores."examples/**/*.py" = [ "T201" ]
 lint.per-file-ignores."scripts/**/*.py" = [ "T201" ]
-# Repeated same-file collaboration follows module-boundary privacy.
-lint.per-file-ignores."scripts/benchmark.py" = [ "SLF001" ]
-lint.per-file-ignores."src/shotgun_api3/_async_client.py" = [ "SLF001" ]
-lint.per-file-ignores."src/shotgun_api3/_config.py" = [ "SLF001" ]
-lint.per-file-ignores."src/shotgun_api3/_transport.py" = [ "SLF001" ]
+# Public signatures mirror shotgun_api3
+lint.per-file-ignores."src/shotgun_api3/_async_client.py" = [ "PLR0913", "PLR0917" ]
+lint.per-file-ignores."src/shotgun_api3/_client.py" = [ "PLR0913", "PLR0917" ]
+lint.per-file-ignores."src/shotgun_api3/lib/mockgun/_async_client.py" = [ "PLR0913", "PLR0917" ]
+lint.per-file-ignores."src/shotgun_api3/lib/mockgun/_sync_client.py" = [ "PLR0913", "PLR0917" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
   "PLR2004", # Allow magic values in tests
@@ -137,6 +132,8 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
 exclude = [ "dist" ]
 extraPaths = [ ".", "src" ]

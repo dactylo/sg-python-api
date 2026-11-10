@@ -3,6 +3,8 @@
 import datetime
 import time
 
+__all__ = ['UTC', 'LocalTimezone', 'SgTimezone']
+
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
 _NAIVE_EPOCH = _EPOCH.replace(tzinfo=None)
 _ZERO = datetime.timedelta(0)
@@ -69,6 +71,11 @@ class LocalTimezone(datetime.tzinfo):
 
         Returns:
             The daylight-saving adjustment, or zero when DST is not active.
+
+        Raises:
+            OSError: If the platform cannot resolve a non-pre-epoch local time.
+            OverflowError: If that local time exceeds the platform's range.
+            ValueError: If the platform rejects that local time.
         """
         standard, daylight = self._offsets()
         return daylight - standard if self._isdst(dt) else _ZERO
@@ -85,7 +92,11 @@ class LocalTimezone(datetime.tzinfo):
             time.
 
         Raises:
-            ValueError: If `dt.tzinfo` is not this instance.
+            ValueError: If the platform rejects the conversion.
+            OSError: If platform conversion fails without an applicable
+                pre-epoch fallback.
+            OverflowError: If platform conversion or local datetime arithmetic
+                exceeds its supported range.
         """
         if dt.tzinfo is not self:
             raise ValueError('fromutc() requires dt.tzinfo to be self')
@@ -130,6 +141,11 @@ class LocalTimezone(datetime.tzinfo):
 
         Returns:
             The platform's standard or daylight timezone name.
+
+        Raises:
+            OSError: If the platform cannot resolve a non-pre-epoch local time.
+            OverflowError: If that local time exceeds the platform's range.
+            ValueError: If the platform rejects that local time.
         """
         return time.tzname[int(self._isdst(dt))]
 
@@ -142,6 +158,11 @@ class LocalTimezone(datetime.tzinfo):
 
         Returns:
             The current standard or daylight offset from UTC.
+
+        Raises:
+            OSError: If the platform cannot resolve a non-pre-epoch local time.
+            OverflowError: If that local time exceeds the platform's range.
+            ValueError: If the platform rejects that local time.
         """
         standard, daylight = self._offsets()
         return daylight if self._isdst(dt) else standard
@@ -193,6 +214,8 @@ class SgTimezone:
     Attributes:
         utc: UTC timezone instance.
         local: System-local timezone instance.
+        UTC: Constructor alias for the UTC timezone class.
+        LocalTimezone: Constructor alias for the system-local timezone class.
     """
 
     LocalTimezone = LocalTimezone

@@ -18,10 +18,11 @@ class ClientCapabilities:
     """Represent local platform details used by compatibility helpers.
 
     Attributes:
-        platform: Operating-system name.
-        py_version: Python version.
+        platform: `linux`, `mac`, or `windows`, or `None` on other platforms.
+        py_version: Python version as a `major.minor` string.
         ssl_version: SSL library version.
-        local_path_field: Platform-specific local-file field name.
+        local_path_field: `local_path_<platform>`, or `None` when the platform
+            has no supported local-file field.
     """
 
     def __init__(self) -> None:

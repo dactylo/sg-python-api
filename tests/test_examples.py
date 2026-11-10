@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import pytest
 
 import shotgun_api3
+from examples import async_client, sync_client
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
     from typing import Self
 
 _MODULE_NAMES = ('examples.async_client', 'examples.sync_client')
@@ -21,13 +21,22 @@ _SITE = 'https://example.shotgrid.autodesk.com'
 
 
 class _Arguments(Protocol):
-    credentials_file: Path
-    project: str
-    site: str
+    @property
+    def credentials_file(self) -> Path: ...
+
+    @property
+    def project(self) -> str: ...
+
+    @property
+    def site(self) -> str: ...
 
 
 class _ExampleModule(Protocol):
-    main: Callable[[Sequence[str] | None], int]
+    def _load_credentials(self, path: Path) -> tuple[str, str]: ...
+
+    def _main(self, argv: Sequence[str] | None = None) -> int: ...
+
+    def _parse_args(self, argv: Sequence[str] | None = None) -> _Arguments: ...
 
 
 class _LegacyTerminalClientError(Exception):
@@ -46,13 +55,15 @@ def _arguments(credentials_file: Path) -> list[str]:
 
 
 def _import_example(module_name: str) -> _ExampleModule:
-    return cast('_ExampleModule', importlib.import_module(module_name))
+    modules: dict[str, _ExampleModule] = {
+        'examples.async_client': async_client,
+        'examples.sync_client': sync_client,
+    }
+    return modules[module_name]
 
 
 def _load_credentials(module_name: str, path: Path) -> tuple[str, str]:
-    module = importlib.import_module(module_name)
-    loader = cast('Callable[[Path], tuple[str, str]]', vars(module)['_load_credentials'])
-    return loader(path)
+    return _import_example(module_name)._load_credentials(path)
 
 
 def _module_path() -> Path:
@@ -69,18 +80,16 @@ def _package_identity_lines() -> list[str]:
 
 
 def _parse_args(module_name: str, argv: Sequence[str]) -> _Arguments:
-    module = importlib.import_module(module_name)
-    parser = cast(
-        'Callable[[Sequence[str] | None], _Arguments]',
-        vars(module)['_parse_args'],
-    )
-    return parser(argv)
+    return _import_example(module_name)._parse_args(argv)
 
 
+@pytest.mark.parametrize('project_found', [True, False])
 def test_async_main_queries_project_and_prints_allowlisted_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    project_found: bool,
 ) -> None:
     module = _import_example('examples.async_client')
     credentials_file = tmp_path / 'credentials.txt'
@@ -103,8 +112,10 @@ def test_async_main_queries_project_and_prints_allowlisted_fields(
             entity_type: str,
             filters: list[list[object]],
             fields: list[str],
-        ) -> dict[str, object]:
+        ) -> dict[str, object] | None:
             calls.append(('find_one', entity_type, filters, fields))
+            if not project_found:
+                return None
             return {
                 'id': 41,
                 'name': _PROJECT_NAME,
@@ -122,10 +133,10 @@ def test_async_main_queries_project_and_prints_allowlisted_fields(
 
     monkeypatch.setattr(module, 'AsyncShotgun', FakeAsyncShotgun)
 
-    status = module.main(_arguments(credentials_file))
+    status = module._main(_arguments(credentials_file))
     captured = capsys.readouterr()
 
-    assert status == 0
+    assert status == (0 if project_found else 1)
     assert calls[:4] == [
         ('construct', (_SITE,), {'api_key': _SENTINEL, 'script_name': _SCRIPT_NAME}),
         ('enter',),
@@ -135,14 +146,20 @@ def test_async_main_queries_project_and_prints_allowlisted_fields(
     assert len(calls) == 5
     assert calls[-1][0] == 'exit'
     assert calls[-1][1:] == (None, None, None)
-    assert captured.out.splitlines() == [
+    expected_output = [
         f'shotgun_api3 version: {shotgun_api3.__version__}',
         f'shotgun_api3 module: {_module_path()}',
-        f'server version: {_SERVER_VERSION}',
-        'project id: 41',
-        f'project name: {_PROJECT_NAME}',
     ]
-    assert captured.err == ''
+    if project_found:
+        expected_output.extend(
+            [
+                f'server version: {_SERVER_VERSION}',
+                'project id: 41',
+                f'project name: {_PROJECT_NAME}',
+            ]
+        )
+    assert captured.out.splitlines() == expected_output
+    assert captured.err == ('' if project_found else f'Project not found: {_PROJECT_NAME}\n')
     assert _SENTINEL not in captured.out
     assert 'full_version' not in captured.out
     assert 'raw-' not in captured.out
@@ -177,7 +194,7 @@ def test_async_request_failure_from_legacy_terminal_exception_exits_once_and_is_
 
     monkeypatch.setattr(module, 'AsyncShotgun', FailingAsyncShotgun)
 
-    status = module.main(_arguments(credentials_file))
+    status = module._main(_arguments(credentials_file))
     captured = capsys.readouterr()
 
     assert status == 1
@@ -258,10 +275,13 @@ def test_parsers_require_all_options(module_name: str, missing_option: str) -> N
     assert raised.value.code == 2
 
 
+@pytest.mark.parametrize('project_found', [True, False])
 def test_sync_main_queries_project_and_prints_allowlisted_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    *,
+    project_found: bool,
 ) -> None:
     module = _import_example('examples.sync_client')
     credentials_file = tmp_path / 'credentials.txt'
@@ -280,8 +300,10 @@ def test_sync_main_queries_project_and_prints_allowlisted_fields(
             entity_type: str,
             filters: list[list[object]],
             fields: list[str],
-        ) -> dict[str, object]:
+        ) -> dict[str, object] | None:
             calls.append(('find_one', entity_type, filters, fields))
+            if not project_found:
+                return None
             return {
                 'id': 41,
                 'name': _PROJECT_NAME,
@@ -299,10 +321,10 @@ def test_sync_main_queries_project_and_prints_allowlisted_fields(
 
     monkeypatch.setattr(module, 'Shotgun', FakeShotgun)
 
-    status = module.main(_arguments(credentials_file))
+    status = module._main(_arguments(credentials_file))
     captured = capsys.readouterr()
 
-    assert status == 0
+    assert status == (0 if project_found else 1)
     assert calls == [
         (
             'construct',
@@ -313,14 +335,20 @@ def test_sync_main_queries_project_and_prints_allowlisted_fields(
         ('find_one', 'Project', [['name', 'is', _PROJECT_NAME]], ['name']),
         ('close',),
     ]
-    assert captured.out.splitlines() == [
+    expected_output = [
         f'shotgun_api3 version: {shotgun_api3.__version__}',
         f'shotgun_api3 module: {_module_path()}',
-        f'server version: {_SERVER_VERSION}',
-        'project id: 41',
-        f'project name: {_PROJECT_NAME}',
     ]
-    assert captured.err == ''
+    if project_found:
+        expected_output.extend(
+            [
+                f'server version: {_SERVER_VERSION}',
+                'project id: 41',
+                f'project name: {_PROJECT_NAME}',
+            ]
+        )
+    assert captured.out.splitlines() == expected_output
+    assert captured.err == ('' if project_found else f'Project not found: {_PROJECT_NAME}\n')
     assert _SENTINEL not in captured.out
     assert 'full_version' not in captured.out
     assert 'raw-' not in captured.out
@@ -351,7 +379,7 @@ def test_sync_request_failure_from_legacy_terminal_exception_closes_once_and_is_
 
     monkeypatch.setattr(module, 'Shotgun', FailingShotgun)
 
-    status = module.main(_arguments(credentials_file))
+    status = module._main(_arguments(credentials_file))
     captured = capsys.readouterr()
 
     assert status == 1

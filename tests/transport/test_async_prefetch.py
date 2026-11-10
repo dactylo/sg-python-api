@@ -1,7 +1,6 @@
 import asyncio
 import gc
 import json
-from collections.abc import AsyncGenerator
 from typing import cast
 
 import pytest
@@ -15,12 +14,12 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _AsyncFakeTransport
+from tests._transports import AsyncFakeTransport
 
 pytestmark = pytest.mark.async_required
 
 
-class _PagedAsyncTransport(_AsyncFakeTransport):
+class _PagedAsyncTransport(AsyncFakeTransport):
     def __init__(self, *, per_page: int = 1, total: int = 10) -> None:
         super().__init__([])
         self.active_attempts: set[tuple[int, int]] = set()
@@ -30,14 +29,14 @@ class _PagedAsyncTransport(_AsyncFakeTransport):
         self.failures: dict[tuple[int, int], BaseException] = {}
         self.finished_attempts: set[tuple[int, int]] = set()
         self.pages_requested: list[int] = []
-        self.per_page = per_page
-        self.releases: dict[int, asyncio.Event] = {}
+        self._per_page = per_page
+        self._releases: dict[int, asyncio.Event] = {}
         self.started: dict[int, asyncio.Event] = {}
-        self.total = total
+        self._total = total
         self.wait_for_started: dict[int, int] = {}
 
     def release(self, page: int) -> None:
-        self.releases.setdefault(page, asyncio.Event()).set()
+        self._releases.setdefault(page, asyncio.Event()).set()
 
     async def send(self, request: TransportRequest) -> TransportResponse:
         page = _request_page(request)
@@ -55,13 +54,13 @@ class _PagedAsyncTransport(_AsyncFakeTransport):
             if prerequisite is not None:
                 await self.started.setdefault(prerequisite, asyncio.Event()).wait()
             if page in self.blocked_pages:
-                await self.releases.setdefault(page, asyncio.Event()).wait()
+                await self._releases.setdefault(page, asyncio.Event()).wait()
             await asyncio.sleep(0)
             return TransportResponse(
                 status=200,
                 reason='OK',
                 headers={'content-type': 'application/json'},
-                content=_page_payload(page, self.total, self.per_page),
+                content=_page_payload(page, self._total, self._per_page),
             )
         except asyncio.CancelledError:
             self.cancelled_pages.add(page)
@@ -131,19 +130,6 @@ async def _sleepless(_delay: float) -> None:
 
 async def _wait_started(transport: _PagedAsyncTransport, page: int) -> None:
     await transport.started.setdefault(page, asyncio.Event()).wait()
-
-
-async def _raise_consumer_failure(
-    pages: AsyncGenerator[object, None],
-    transport: _PagedAsyncTransport,
-) -> None:
-    try:
-        await anext(pages)
-        await anext(pages)
-        await _wait_started(transport, 3)
-        raise RuntimeError('consumer failed')
-    finally:
-        await pages.aclose()
 
 
 @pytest.mark.anyio
@@ -296,23 +282,6 @@ async def test_call_pages_zero_prefetch_is_strictly_serial() -> None:
     assert transport.pages_requested == [1, 2]
     assert transport.leases == transport.checkins == 2
     await pages.aclose()
-
-
-@pytest.mark.anyio
-async def test_consumer_failure_close_waits_for_speculative_page_cleanup() -> None:
-    transport = _PagedAsyncTransport()
-    transport.blocked_pages.add(3)
-    pages = AsyncDriver(transport).call_pages(
-        _build, 1, 'read', config_module.snapshot(_config(2))
-    )
-
-    with pytest.raises(RuntimeError, match=r'^consumer failed$'):
-        await _raise_consumer_failure(pages, transport)
-
-    assert transport.cancelled_pages == {3}
-    assert transport.active_attempts == set()
-    assert transport.leases == transport.checkins == 3
-    assert transport.reservations == transport.reservation_releases
 
 
 @pytest.mark.anyio

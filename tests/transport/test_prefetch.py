@@ -20,8 +20,8 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _FakeTransport
-from tests.conftest import _make_response
+from tests._transports import FakeTransport
+from tests.conftest import make_response
 
 
 class _CountingResponse(TransportResponse):
@@ -47,22 +47,19 @@ class _CountingResponse(TransportResponse):
 class _PageTransport:
     def __init__(
         self,
-        pages: Mapping[int, TransportResponse],
+        pages: Mapping[int, _CountingResponse],
         on_page: Callable[[int], None] | None = None,
         *,
         page_limit: int = 500,
     ) -> None:
         self.closed = False
-        self.page_limit = page_limit
+        self._page_limit = page_limit
         self.pages = dict(pages)
         self.read_pages: list[int] = []
         self.requests: list[TransportRequest] = []
-        self.returned_responses: list[TransportResponse] = []
+        self.returned_responses: list[_CountingResponse] = []
         self._lock = threading.Lock()
         self._on_page = on_page
-
-    def abort(self, token: str) -> None:
-        del token
 
     def close(self) -> None:
         self.closed = True
@@ -74,7 +71,7 @@ class _PageTransport:
             response = _CountingResponse(
                 {
                     'version': [9, 0, 0],
-                    'api_max_entities_per_page': self.page_limit,
+                    'api_max_entities_per_page': self._page_limit,
                 }
             )
             with self._lock:
@@ -144,7 +141,7 @@ class _TransportFactoryClient(Shotgun):
 
 def _client(transport: _PageTransport, prefetch: int) -> Shotgun:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    sg._transport = transport
+    sg.transport = transport
     sg.config.page_prefetch = prefetch
     return sg
 
@@ -170,8 +167,8 @@ def _counting_page(ids: list[int], count: int) -> _CountingResponse:
     )
 
 
-def _page(ids: list[int], count: int) -> TransportResponse:
-    return _make_response(
+def _page(ids: list[int], count: int) -> _CountingResponse:
+    return _CountingResponse(
         {
             'entities': [{'type': 'Shot', 'id': entity_id} for entity_id in ids],
             'paging_info': {'entity_count': count},
@@ -179,14 +176,13 @@ def _page(ids: list[int], count: int) -> TransportResponse:
     )
 
 
-def _request(token: str) -> TransportRequest:
+def _request() -> TransportRequest:
     return TransportRequest(
         method='POST',
         url='https://x.example/api',
         headers={},
         body=b'{}',
-        timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0),
-        token=token,
+        timeout=TimeoutConfig(connect=1.0, read=1.0),
     )
 
 
@@ -279,19 +275,20 @@ def test_client_consumer_failure_waits_for_speculative_cleanup(
         _CountingResponse(
             {
                 'entities': 'invalid',
-                'paging_info': {'entity_count': 1001},
+                'paging_info': {'entity_count': 7},
             }
         )
         if failure_mode == 'validation'
-        else _counting_page(list(range(501, 1001)), 1001)
+        else _counting_page(list(range(4, 7)), 7)
     )
     transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 1001),
+            1: _counting_page(list(range(1, 4)), 7),
             2: second_response,
-            3: _counting_page([1001], 1001),
+            3: _counting_page([7], 7),
         },
         coordinate,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
     if failure_mode == 'verdict':
@@ -304,7 +301,7 @@ def test_client_consumer_failure_waits_for_speculative_cleanup(
             per_page: int,
             limit: int,
         ) -> str:
-            if records_count == 1000:
+            if records_count == 6:
                 raise RuntimeError('verdict-failed')
             return original_page_verdict(
                 paging_info,
@@ -341,10 +338,7 @@ def test_client_consumer_failure_waits_for_speculative_cleanup(
     else:
         assert isinstance(errors[0], RuntimeError)
         assert str(errors[0]) == 'verdict-failed'
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert sg._lease_counts == {}
     assert not any(
         thread.name.startswith('shotgun-api3-pages') for thread in threading.enumerate()
@@ -365,7 +359,7 @@ def test_executor_submit_failure_waits_for_submitted_page_cleanup(
                 max_workers=max_workers,
                 thread_name_prefix=thread_name_prefix,
             )
-            self.submit_calls = 0
+            self._submit_calls = 0
 
         def shutdown(
             self,
@@ -383,8 +377,8 @@ def test_executor_submit_failure_waits_for_submitted_page_cleanup(
             *args: object,
             **kwargs: object,
         ) -> driver_module.concurrent.futures.Future[object]:
-            self.submit_calls += 1
-            if self.submit_calls == 3:
+            self._submit_calls += 1
+            if self._submit_calls == 3:
                 assert second_started.wait(5), 'submitted page did not start'
                 raise RuntimeError('submit-failed')
             return self._executor.submit(fn, *args, **kwargs)
@@ -438,33 +432,33 @@ def test_executor_submit_failure_waits_for_submitted_page_cleanup(
     assert not worker.is_alive()
     assert len(errors) == 1
     assert str(errors[0]) == 'submit-failed'
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
-    assert cast('_CountingResponse', transport.pages[3]).close_calls == 0
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
+    assert transport.pages[3].close_calls == 0
     assert shutdown_calls == [(True, True)]
 
 
 def test_fake_transport_atomically_pairs_concurrent_requests_and_responses() -> None:
     responses: list[TransportResponse | TransportError] = [
-        _make_response({'slot': 1}),
-        _make_response({'slot': 2}),
+        make_response({'slot': 1}),
+        make_response({'slot': 2}),
     ]
-    transport = _FakeTransport(responses)
+    transport = FakeTransport(responses)
     tracking_lock = _TrackingLock()
     object.__setattr__(transport, '_lock', tracking_lock)
     barrier = threading.Barrier(3)
-    results: dict[str, TransportResponse] = {}
+    results: dict[int, TransportResponse] = {}
+    request_names: dict[int, str] = {}
     errors: list[Exception] = []
     result_lock = threading.Lock()
 
     def send(token: str) -> None:
         try:
             barrier.wait(5)
-            result = transport.send(_request(token))
+            request = _request()
+            result = transport.send(request)
             with result_lock:
-                results[token] = result
+                results[id(request)] = result
+                request_names[id(request)] = token
         except (AssertionError, threading.BrokenBarrierError) as exc:
             with result_lock:
                 errors.append(exc)
@@ -481,9 +475,11 @@ def test_fake_transport_atomically_pairs_concurrent_requests_and_responses() -> 
 
     assert not errors
     assert all(not worker.is_alive() for worker in workers)
-    assert [request.token for request in transport.requests] == tracking_lock.acquisitions
+    assert [
+        request_names[id(request)] for request in transport.requests
+    ] == tracking_lock.acquisitions
     assert len(tracking_lock.acquisitions) == 2
-    assert [results[request.token] for request in transport.requests] == responses
+    assert [results[id(request)] for request in transport.requests] == responses
 
 
 def test_first_find_prefetch_uses_readiness_page_limit() -> None:
@@ -602,10 +598,7 @@ def test_generator_close_cancels_queued_page_before_waiting_for_running_page(
 
     assert not closer.is_alive()
     assert transport.read_pages == [1, 2, 3]
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert responses[4].close_calls == 0
     assert shutdown_calls == [(True, True)]
 
@@ -667,10 +660,7 @@ def test_generator_close_waits_for_running_page_cleanup_and_executor_shutdown() 
 
     assert not closer.is_alive()
     assert close_done.is_set()
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert not any(
         thread.name.startswith('shotgun-api3-pages') for thread in threading.enumerate()
     )
@@ -754,10 +744,7 @@ def test_later_page_builder_failure_waits_for_pending_cleanup() -> None:
     assert not worker.is_alive()
     assert len(errors) == 1
     assert str(errors[0]) == 'later-builder-failed'
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert not any(
         thread.name.startswith('shotgun-api3-pages') for thread in threading.enumerate()
     )
@@ -774,13 +761,14 @@ def test_origin_change_retires_transport_only_after_prefetched_lease_finishes() 
 
     old_transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 1001),
-            2: _counting_page(list(range(501, 1001)), 1001),
-            3: _counting_page([1001], 1001),
+            1: _counting_page(list(range(1, 4)), 7),
+            2: _counting_page(list(range(4, 7)), 7),
+            3: _counting_page([7], 7),
         },
         coordinate_old,
+        page_limit=3,
     )
-    new_transport = _PageTransport({1: _counting_page([99], 1)})
+    new_transport = _PageTransport({1: _counting_page([99], 1)}, page_limit=3)
     sg = _TransportFactoryClient([old_transport, new_transport])
     sg.config.page_prefetch = 2
     first_result: list[dict[str, object]] = []
@@ -813,12 +801,9 @@ def test_origin_change_retires_transport_only_after_prefetched_lease_finishes() 
 
     assert not first_worker.is_alive()
     assert not errors
-    assert len(first_result) == 1001
+    assert len(first_result) == 7
     assert old_transport.closed
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in old_transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in old_transport.returned_responses)
     sg.close()
     assert new_transport.closed
 
@@ -857,10 +842,11 @@ def test_prefetch_finishes_observers_and_response_cleanup_before_return() -> Non
 
     transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 501),
-            2: _counting_page([501], 501),
+            1: _counting_page(list(range(1, 4)), 4),
+            2: _counting_page([4], 4),
             3: _counting_page([], 0),
-        }
+        },
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
     sg.config.on_response = observe
@@ -869,11 +855,8 @@ def test_prefetch_finishes_observers_and_response_cleanup_before_return() -> Non
     with observer_lock:
         observed_pages = response_events
 
-    assert len(result) == 501
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert len(result) == 4
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert observed_pages == len(transport.read_pages) + 1
     assert sg._lease_counts == {}
     assert not any(
@@ -897,17 +880,18 @@ def test_prefetch_never_requests_more_than_prefetch_minus_one_pages_past_final()
 
     transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 1002),
-            2: _page(list(range(501, 1001)), 1002),
-            3: _page([1001, 1002], 1002),
+            1: _page(list(range(1, 4)), 8),
+            2: _page(list(range(4, 7)), 8),
+            3: _page([7, 8], 8),
         },
         coordinate,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=3)
 
     result = sg.find('Shot', [])
 
-    assert len(result) == 1002
+    assert len(result) == 8
     assert set(transport.read_pages).issuperset({1, 2, 3, 4})
     assert max(transport.read_pages) <= 5
 
@@ -915,19 +899,17 @@ def test_prefetch_never_requests_more_than_prefetch_minus_one_pages_past_final()
 def test_prefetch_one_has_no_request_beyond_final_page() -> None:
     transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 501),
-            2: _counting_page([501], 501),
-        }
+            1: _counting_page(list(range(1, 4)), 4),
+            2: _counting_page([4], 4),
+        },
+        page_limit=3,
     )
     sg = _client(transport, prefetch=1)
 
-    assert len(sg.find('Shot', [])) == 501
+    assert len(sg.find('Shot', [])) == 4
 
     assert transport.read_pages == [1, 2]
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
 
 
 def test_prefetch_propagates_worker_failure_after_prior_page_is_processed(
@@ -944,7 +926,7 @@ def test_prefetch_propagates_worker_failure_after_prior_page_is_processed(
         per_page: int,
         limit: int,
     ) -> str:
-        if records_count == 1000:
+        if records_count == 6:
             assert third_failed.is_set()
         verdict_record_counts.append(records_count)
         return original_page_verdict(
@@ -964,10 +946,11 @@ def test_prefetch_propagates_worker_failure_after_prior_page_is_processed(
 
     transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 1001),
-            2: _counting_page(list(range(501, 1001)), 1001),
+            1: _counting_page(list(range(1, 4)), 7),
+            2: _counting_page(list(range(4, 7)), 7),
         },
         fail_third_first,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
     monkeypatch.setattr(_protocol, 'page_verdict', record_page_verdict)
@@ -976,11 +959,8 @@ def test_prefetch_propagates_worker_failure_after_prior_page_is_processed(
         sg.find('Shot', [])
 
     assert set(transport.read_pages[:3]) == {1, 2, 3}
-    assert verdict_record_counts == [500, 1000]
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert verdict_record_counts == [3, 6]
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
     assert sg._lease_counts == {}
     assert not any(
         thread.name.startswith('shotgun-api3-pages') for thread in threading.enumerate()
@@ -1002,18 +982,19 @@ def test_prefetch_returns_pages_in_order_after_out_of_order_completion() -> None
 
     transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 1002),
-            2: _page(list(range(501, 1001)), 1002),
-            3: _page([1001, 1002], 1002),
+            1: _page(list(range(1, 4)), 8),
+            2: _page(list(range(4, 7)), 8),
+            3: _page([7, 8], 8),
             4: _page([], 0),
         },
         complete_out_of_order,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
 
     result = sg.find('Shot', [])
 
-    assert [record['id'] for record in result] == list(range(1, 1003))
+    assert [record['id'] for record in result] == list(range(1, 9))
     assert completion_order.index(3) < completion_order.index(2)
 
 
@@ -1028,21 +1009,19 @@ def test_prefetch_two_has_exactly_one_request_beyond_final_page() -> None:
 
     transport = _PageTransport(
         {
-            1: _counting_page(list(range(1, 501)), 501),
-            2: _counting_page([501], 501),
+            1: _counting_page(list(range(1, 4)), 4),
+            2: _counting_page([4], 4),
             3: _counting_page([], 0),
         },
         coordinate,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
 
-    assert len(sg.find('Shot', [])) == 501
+    assert len(sg.find('Shot', [])) == 4
 
     assert sorted(transport.read_pages) == [1, 2, 3]
-    assert all(
-        cast('_CountingResponse', response).close_calls == 1
-        for response in transport.returned_responses
-    )
+    assert all(response.close_calls == 1 for response in transport.returned_responses)
 
 
 def test_prefetch_uses_one_snapshot_during_concurrent_config_write() -> None:
@@ -1056,10 +1035,11 @@ def test_prefetch_uses_one_snapshot_during_concurrent_config_write() -> None:
 
     transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 501),
-            2: _page([501], 501),
+            1: _page(list(range(1, 4)), 4),
+            2: _page([4], 4),
         },
         coordinate,
+        page_limit=3,
     )
     sg = _client(transport, prefetch=2)
 
@@ -1075,7 +1055,7 @@ def test_prefetch_uses_one_snapshot_during_concurrent_config_write() -> None:
     writer.join(5)
 
     assert not writer.is_alive()
-    assert len(result) == 501
+    assert len(result) == 4
     assert {1, 2}.issubset(transport.read_pages)
     assert all(request.url == 'https://x.example:443/api3/json' for request in transport.requests)
 
@@ -1083,15 +1063,16 @@ def test_prefetch_uses_one_snapshot_during_concurrent_config_write() -> None:
 def test_prefetch_zero_preserves_serial_page_order() -> None:
     transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 501),
-            2: _page([501], 501),
-        }
+            1: _page(list(range(1, 4)), 4),
+            2: _page([4], 4),
+        },
+        page_limit=3,
     )
     sg = _client(transport, prefetch=0)
 
     result = sg.find('Shot', [])
 
-    assert [record['id'] for record in result] == list(range(1, 502))
+    assert [record['id'] for record in result] == list(range(1, 5))
     assert transport.read_pages == [1, 2]
 
 
@@ -1117,19 +1098,20 @@ def test_serial_and_prefetch_match_no_count_paging_modes(
                 1: _CountingResponse(
                     {
                         'entities': [
-                            {'type': 'Shot', 'id': entity_id} for entity_id in range(1, 501)
+                            {'type': 'Shot', 'id': entity_id} for entity_id in range(1, 4)
                         ],
                         'paging_info': paging_info[0],
                     }
                 ),
                 2: _CountingResponse(
                     {
-                        'entities': [{'type': 'Shot', 'id': 501}],
+                        'entities': [{'type': 'Shot', 'id': 4}],
                         'paging_info': paging_info[1],
                     }
                 ),
                 3: _CountingResponse({'entities': [], 'paging_info': paging_info[1]}),
-            }
+            },
+            page_limit=3,
         )
 
     serial_transport = transport()
@@ -1141,7 +1123,7 @@ def test_serial_and_prefetch_match_no_count_paging_modes(
     prefetch_result = prefetch_sg.find('Shot', [], fields=['code'])
 
     assert prefetch_result == serial_result
-    assert [record['id'] for record in prefetch_result] == list(range(1, 502))
+    assert [record['id'] for record in prefetch_result] == list(range(1, 5))
     assert serial_transport.read_pages == [1, 2]
     assert {1, 2}.issubset(prefetch_transport.read_pages)
     assert set(prefetch_transport.read_pages).issubset({1, 2, 3})
@@ -1151,7 +1133,7 @@ def test_serial_and_prefetch_match_no_count_paging_modes(
     assert {page: prefetch_bodies[page] for page in serial_bodies} == serial_bodies
     assert all(len(bodies) == 1 for bodies in prefetch_bodies.values())
     assert all(
-        cast('_CountingResponse', response).close_calls == 1
+        response.close_calls == 1
         for page_transport in (serial_transport, prefetch_transport)
         for response in page_transport.returned_responses
     )
@@ -1177,19 +1159,21 @@ def test_serial_and_prefetch_use_exact_per_page_request_transcripts() -> None:
 
     serial_transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 1001),
-            2: _page(list(range(501, 1001)), 1001),
-            3: _page([1001], 1001),
-        }
+            1: _page(list(range(1, 4)), 7),
+            2: _page(list(range(4, 7)), 7),
+            3: _page([7], 7),
+        },
+        page_limit=3,
     )
     prefetch_transport = _PageTransport(
         {
-            1: _page(list(range(1, 501)), 1001),
-            2: _page(list(range(501, 1001)), 1001),
-            3: _page([1001], 1001),
+            1: _page(list(range(1, 4)), 7),
+            2: _page(list(range(4, 7)), 7),
+            3: _page([7], 7),
             4: _page([], 0),
         },
         coordinate_prefetch,
+        page_limit=3,
     )
 
     serial_result = _client(serial_transport, prefetch=0).find(

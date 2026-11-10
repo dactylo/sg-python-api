@@ -3,16 +3,16 @@
 import copy
 import dataclasses
 import datetime as _dt_module
-import inspect
 import os
 import threading
 import urllib.request
-import uuid
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
+    ClassVar,
     Literal,
     Never,
     TypeAlias,
@@ -48,7 +48,6 @@ from ._execution import (
     release_lease,
     retire_transport,
 )
-from ._signatures import bind_arguments, expose_signature
 from ._transport import (
     SendError,
     StreamingResponse,
@@ -58,152 +57,12 @@ from ._transport import (
     TransportResponse,
     Urllib3Transport,
 )
-from ._version import PACKAGE_VERSION
+from ._version import COMPATIBILITY_VERSION
 
 _ReadinessKey: TypeAlias = tuple[str, int]
 _UploadResult = TypeVar('_UploadResult')
 
-__version__ = PACKAGE_VERSION
-
-_CONSTRUCTOR_PARAMETERS = (
-    inspect.Parameter('base_url', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter(
-        'script_name',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'api_key',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'convert_datetimes_to_utc',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=True,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'http_proxy',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'connect',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=True,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'ca_certs',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'login',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'password',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'sudo_as_login',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'session_token',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'auth_token',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-)
-_UPLOAD_DOCSTRING = """Upload a file or thumbnail and return its Attachment ID.
-
-A server requiring legacy form uploads raises `ShotgunError` before
-any upload request is sent. Server capability reads may occur.
-
-Args:
-    entity_type: Entity type receiving the upload.
-    entity_id: Numeric identifier of the receiving entity.
-    path: Existing non-empty file path as text or filesystem-encoded bytes.
-    field_name: Optional file field receiving an Attachment.
-    display_name: Optional Attachment display name.
-    tag_list: Optional comma-delimited Attachment tags.
-    created_at: Optional Attachment creation timestamp.
-
-Returns:
-    Created Attachment ID.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If the file or an upload response is invalid, an RPC
-        fault or terminal transport failure occurs, or the server
-        requires legacy form uploads.
-    ProtocolError: If an upload endpoint returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_UPLOAD_PARAMETERS = (
-    inspect.Parameter('entity_type', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter('entity_id', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=int),
-    inspect.Parameter('path', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str | bytes),
-    inspect.Parameter(
-        'field_name',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'display_name',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'tag_list',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'created_at',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=_dt_module.datetime | None,
-    ),
-)
-CONSTRUCTOR_SIGNATURE = inspect.Signature(_CONSTRUCTOR_PARAMETERS, return_annotation=None)
-_METHOD_CONSTRUCTOR_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_CONSTRUCTOR_PARAMETERS,
-    ),
-    return_annotation=None,
-)
-_METHOD_UPLOAD_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_UPLOAD_PARAMETERS,
-    ),
-    return_annotation=int,
-)
-_UPLOAD_SIGNATURE = inspect.Signature(_UPLOAD_PARAMETERS, return_annotation=int)
+__version__ = COMPATIBILITY_VERSION
 
 
 @dataclasses.dataclass(frozen=True)
@@ -272,13 +131,16 @@ class _DownloadExchange:
         transfer = ExceptionCapture()
         try:
             with transfer:
-                handle = stack.enter_context(_files.download_temporary(destination))
+                with _files.download_destination_io(destination):
+                    handle = stack.enter_context(_files.download_temporary(destination))
                 temporary = Path(handle.name)
                 control.consume_into(
                     chunks,
-                    handle.write,
+                    partial(_files.write_download_chunk, destination, handle),
                     total_bytes=total_bytes,
                 )
+                with _files.download_destination_io(destination):
+                    handle.flush()
                 opened_stack = stack
                 stack = None
                 opened_cleanup = SuppressedExceptionCapture()
@@ -288,7 +150,8 @@ class _DownloadExchange:
                     raise _DownloadCleanupError from None
                 if opened_cleanup.exception is not None:
                     raise opened_cleanup.exception
-                temporary.replace(destination)
+                with _files.download_destination_io(destination):
+                    temporary.replace(destination)
         finally:
             close_cleanup = SuppressedExceptionCapture()
             unlink_cleanup = SuppressedExceptionCapture()
@@ -317,12 +180,23 @@ class _DownloadExchange:
             return control.consume(chunks, total_bytes=total_bytes)
         return self._write_file(chunks, control, total_bytes)
 
-    def _execute(
+    def execute(
         self,
         driver: Driver,
         operation: _protocol.OperationDescriptor,
     ) -> bytes | str:
-        """Execute the workflow through the common streaming attempt loop."""
+        """Execute the workflow through the common streaming attempt loop.
+
+        Returns:
+            Downloaded bytes, or the destination path for a file download.
+
+        Raises:
+            SendError: If required download cleanup fails.
+            TransportError: If the attempt loop cannot complete the transfer.
+            ShotgunFileDownloadError: If the response or redirect is invalid,
+                or creating, writing, flushing, or publishing the destination
+                file fails.
+        """
         try:
             return driver.execute(
                 operation,
@@ -349,16 +223,6 @@ class _InvocationOptions:
     auth_spec: _protocol.AuthSpec | None = None
 
 
-def _bind_upload(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-) -> _files.UploadArguments:
-    """Bind runtime arguments with upload-specific errors."""
-    bound = bind_arguments(_UPLOAD_SIGNATURE, args, kwargs, 'Shotgun.upload()')
-    arguments = cast('Callable[..., _files.UploadArguments]', _files.UploadArguments)
-    return arguments(**bound.arguments)
-
-
 def _execute_upload_exchange(
     driver: Driver,
     context: RequestContext,
@@ -374,7 +238,6 @@ def _execute_upload_exchange(
             headers=dict(exchange.headers),
             body=exchange.body_factory(),
             timeout=context.timeout,
-            token=uuid.uuid4().hex,
         )
 
     def consume(
@@ -400,43 +263,23 @@ def _execute_upload_exchange(
     )
 
 
-def _expose_upload_signature(function: Callable[..., object]) -> Callable[..., object]:
-    """Expose the observed upload signature on its variadic implementation."""
-    return expose_signature(function, _METHOD_UPLOAD_SIGNATURE, _UPLOAD_DOCSTRING)
-
-
-def bind_constructor(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    client_name: str,
-) -> ConstructorOptions:
-    """Bind constructor arguments with client-specific errors.
+def build_config(options: ConstructorOptions, *, in_process: bool = False) -> Config:
+    """Initialize and validate network-free configuration, auth, and proxy fields.
 
     Args:
-        args: Positional public arguments.
-        kwargs: Keyword public arguments.
-        client_name: Public client class name for error attribution.
+        options: Constructor values for the site, authentication, and proxy.
+        in_process: Whether requests stay inside this process, allowing
+            authentication without the network HTTP origin restriction.
 
     Returns:
-        Bound immutable constructor options.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(CONSTRUCTOR_SIGNATURE, args, kwargs, f'{client_name}.__init__()')
-    constructor = cast('Callable[..., ConstructorOptions]', ConstructorOptions)
-    return constructor(**bound.arguments)
-
-
-def build_config(options: ConstructorOptions) -> Config:
-    """Initialize and validate network-free configuration, auth, and proxy fields.
+        A new configuration containing the validated constructor settings.
 
     Raises:
         TypeError: If a configuration or proxy value has an unsupported type.
         ValueError: If authentication, site or proxy values, or
             `SHOTGUN_API_RETRY_INTERVAL` are invalid.
     """
-    config = Config()
+    config = Config(_in_process=in_process)
     config.set_server_params(options.base_url)
     config.update_fields(
         api_key=options.api_key,
@@ -455,26 +298,6 @@ def build_config(options: ConstructorOptions) -> Config:
     return config
 
 
-def expose_constructor_signature(function: Callable[..., object]) -> Callable[..., object]:
-    """Expose the documented constructor signature.
-
-    Args:
-        function: Variadic constructor implementation.
-
-    Returns:
-        The same function with its public runtime signature attached.
-    """
-    expose_signature(function, _METHOD_CONSTRUCTOR_SIGNATURE, None)
-    annotations = {
-        name: parameter.annotation
-        for name, parameter in CONSTRUCTOR_SIGNATURE.parameters.items()
-        if parameter.annotation is not inspect.Parameter.empty
-    }
-    annotations['return'] = CONSTRUCTOR_SIGNATURE.return_annotation
-    object.__setattr__(function, '__annotations__', annotations)
-    return function
-
-
 class Shotgun:
     """Provide the synchronous Flow Production Tracking API client surface.
 
@@ -488,14 +311,12 @@ class Shotgun:
         config: The writable client configuration.
         server_caps: Validated capabilities for the configured origin.
         server_info: Raw validated server metadata.
+        transport: Current transport backend, or `None` before connection or
+            after retirement.
     """
 
-    __signature__ = CONSTRUCTOR_SIGNATURE
+    _in_process: ClassVar[bool] = False
 
-    @overload
-    def __init__(self, base_url: Never) -> None: ...
-
-    @overload
     def __init__(
         self,
         base_url: str,
@@ -510,10 +331,7 @@ class Shotgun:
         sudo_as_login: str | None = None,
         session_token: str | None = None,
         auth_token: str | None = None,
-    ) -> None: ...
-
-    @expose_constructor_signature
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    ) -> None:
         """Initialize a client for one site and authentication mode.
 
         Supply exactly one authentication mode: `script_name` with `api_key`,
@@ -525,30 +343,60 @@ class Shotgun:
         `http_proxy` accepts `[user:pass@]host[:port]`, with port 8080 when
         omitted. A truthy `ca_certs` selects a CA bundle; otherwise
         `SHOTGUN_API_CACERTS` is consulted before using system trust roots.
+        `SHOTGUN_API_RETRY_INTERVAL` supplies a nonnegative integer retry
+        interval in milliseconds, defaulting to 3000.
 
         Construction performs server-readiness I/O by default. Supplying
         `auth_token` also performs a session-token exchange during
         construction, even when `connect` is `False`.
 
         Args:
-            *args: Positional values from the documented constructor signature.
-            **kwargs: Keyword values from the documented constructor signature.
+            base_url: Flow Production Tracking site URL.
+            script_name: Script name for script authentication.
+            api_key: API key for script authentication.
+            convert_datetimes_to_utc: Whether to convert datetime values to
+                UTC.
+            http_proxy: Optional proxy authority in `[user:pass@]host[:port]`
+                form.
+            connect: Whether to perform eager readiness during construction.
+            ca_certs: Optional certificate-authority bundle path.
+            login: Login for human-user authentication.
+            password: Password for human-user authentication.
+            sudo_as_login: Optional user login for sudo impersonation.
+            session_token: Existing session token for authentication.
+            auth_token: Optional two-factor authentication token.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
-            ValueError: If authentication, URL, or proxy values are invalid.
+            ValueError: If authentication, URL, or proxy values are invalid,
+                the configured CA bundle is not a readable file, or
+                `SHOTGUN_API_RETRY_INTERVAL` is not a nonnegative integer.
             ShotgunError: If authentication, server metadata, or an RPC result
                 is invalid, or a transport attempt fails.
             ProtocolError: If eager readiness or token exchange receives an
                 HTTP error.
         """
-        self._initialize(bind_constructor(args, kwargs, 'Shotgun'))
+        self._initialize(
+            ConstructorOptions(
+                base_url,
+                script_name,
+                api_key,
+                convert_datetimes_to_utc,
+                http_proxy,
+                connect,
+                ca_certs,
+                login,
+                password,
+                sudo_as_login,
+                session_token,
+                auth_token,
+            )
+        )
 
     @property
     def _connection(self) -> Transport | None:
         """Return the current private connection compatibility view."""
         with self._transport_lock:
-            return self._transport
+            return self.transport
 
     def _invoke(
         self,
@@ -571,12 +419,16 @@ class Shotgun:
         return _protocol.transform_inbound(result, context.convert_datetimes_to_utc)
 
     def _new_transport(self, context: RequestContext) -> Transport:
-        """Create a transport for one captured generation."""
+        """Create a transport for one generation; mockgun overrides this package-internal hook."""
+        if context.in_process:
+            raise RuntimeError('an in-process client must supply its own transport')
         return Urllib3Transport(
             ca_certs=self._ca_certs,
             proxy_headers=dict(context.proxy_headers) or None,
             proxy_url=context.proxy_url,
             pool_maxsize=context.pool_maxsize,
+            max_connection_idle_secs=context.max_connection_idle_secs,
+            tcp_keepalive_timeout_secs=context.tcp_keepalive_timeout_secs,
         )
 
     def _publish_capabilities(
@@ -614,34 +466,39 @@ class Shotgun:
         """Lease the driver and transport for one complete logical operation."""
         close_after_unlock: list[Transport] = []
         with self._transport_lock:
-            if self._known_transport is not self._transport:
+            decision = _files.choose_driver_lease(
+                self._known_transport,
+                self.transport,
+                self._driver_generation,
+                context.transport_generation,
+                self._transport_owned,
+            )
+            if decision.known_changed:
                 if self._known_transport is not None:
                     retired = retire_transport(
                         self._lease_counts, self._retired_transports, self._known_transport
                     )
                     if retired is not None:
                         close_after_unlock.append(retired)
-                self._known_transport = self._transport
+                self._known_transport = self.transport
                 self._driver = None
                 self._driver_generation = None
                 self._transport_owned = False
 
-            transport = self._transport
+            transport = self.transport
             if transport is None:
                 transport = self._new_transport(context)
-                self._transport = transport
+                self.transport = transport
                 self._known_transport = transport
                 self._transport_owned = True
-            elif self._driver_generation not in {None, context.transport_generation}:
-                if self._transport_owned:
-                    retired = retire_transport(
-                        self._lease_counts, self._retired_transports, transport
-                    )
-                    if retired is not None:
-                        close_after_unlock.append(retired)
-                    transport = self._new_transport(context)
-                    self._transport = transport
-                    self._known_transport = transport
+            elif decision.replace_owned_transport:
+                retired = retire_transport(self._lease_counts, self._retired_transports, transport)
+                if retired is not None:
+                    close_after_unlock.append(retired)
+                transport = self._new_transport(context)
+                self.transport = transport
+                self._known_transport = transport
+            if decision.reset_driver:
                 self._driver = None
 
             if self._driver is None:
@@ -799,7 +656,9 @@ class Shotgun:
                 _files.SHARE_THUMBNAIL,
                 fields,
             ),
-            lambda text, _headers: _files.parse_link_completion(text),
+            lambda text, _headers: _files.parse_link_completion(
+                text, operation='share_thumbnail', entities=entities
+            ),
         )
 
     def _thumbnail_source_ready(
@@ -873,7 +732,7 @@ class Shotgun:
                 _files.StorageRange(
                     length=prepared.file_size,
                     offset=0,
-                    path=prepared.options.arguments.path,
+                    path=prepared.path,
                 ),
             ),
             lambda _text, _headers: None,
@@ -904,7 +763,16 @@ class Shotgun:
                 _files.LINK_FILE,
                 fields,
             ),
-            lambda text, _headers: _files.parse_link_completion(text),
+            lambda text, _headers: _files.parse_link_completion(
+                text,
+                operation='upload link',
+                entities=[
+                    {
+                        'type': prepared.options.arguments.entity_type,
+                        'id': prepared.options.arguments.entity_id,
+                    }
+                ],
+            ),
         )
 
     @staticmethod
@@ -973,16 +841,8 @@ class Shotgun:
         prepared: _files.PreparedUpload,
     ) -> int:
         """Execute one prepared upload through a captured driver lease."""
-        arguments = prepared.options.arguments
         capabilities = self._ensure_readiness(context, driver)
-        upload_path = _files.require_supported_upload_path(
-            _files.choose_upload_path(
-                capabilities.server_info,
-                arguments.entity_type,
-                arguments.field_name,
-                prepared.file_size,
-            )
-        )
+        upload_path = _files.choose_prepared_upload_path(capabilities.server_info, prepared)
         multipart = upload_path == 'multipart'
         upload_info = self._upload_allocation(driver, context, prepared, multipart)
         if multipart:
@@ -1007,14 +867,8 @@ class Shotgun:
     ) -> int:
         """Execute the exact direct-storage thumbnail workflow."""
         capabilities = self._ensure_readiness(context, driver)
-        arguments = prepared.options.arguments
-        _files.require_supported_upload_path(
-            _files.choose_upload_path(
-                capabilities.server_info,
-                arguments.entity_type,
-                arguments.field_name,
-                prepared.file_size,
-            )
+        _files.choose_prepared_upload_path(
+            capabilities.server_info, prepared, sharing_thumbnail=True
         )
         upload_info = self._upload_allocation(driver, context, prepared, multipart=False)
         self._upload_direct(driver, context, prepared, upload_info)
@@ -1042,10 +896,6 @@ class Shotgun:
             result.update({field_name: current.get(field_name) for field_name in thumbnails})
         return result
 
-    @overload
-    def activity_stream_read(self, entity_type: Never) -> dict[str, object]: ...
-
-    @overload
     def activity_stream_read(
         self,
         entity_type: str,
@@ -1054,30 +904,30 @@ class Shotgun:
         min_id: int | None = None,
         max_id: int | None = None,
         limit: int | None = None,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_activity_stream_read_signature
-    def activity_stream_read(self, *args: object, **kwargs: object) -> dict[str, object]:
+    ) -> dict[str, object]:
         """Read the activity stream for one entity.
 
         Args:
-            *args: Positional arguments from the documented activity-stream
-                signature.
-            **kwargs: Keyword arguments from the documented activity-stream
-                signature.
+            entity_type: Entity type whose activity stream to read.
+            entity_id: Numeric identifier of the entity.
+            entity_fields: Optional fields to return for linked entity types.
+            min_id: Optional minimum activity identifier.
+            max_id: Optional maximum activity identifier.
+            limit: Optional maximum number of activity records.
 
         Returns:
             Activity stream data returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
                 or if the server result has the wrong type.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_activity_stream_read(args, kwargs, 'Shotgun')
+        options = _methods.ActivityStreamReadOptions(
+            entity_type, entity_id, entity_fields, min_id, max_id, limit
+        )
         return _crud.require_dictionary_result(
             self._call(
                 'activity_stream',
@@ -1163,7 +1013,10 @@ class Shotgun:
                 type, or if the server result is not a list.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         calls = _crud.build_batch_calls(requests)
         if not calls:
@@ -1236,21 +1089,29 @@ class Shotgun:
         )
 
     def close(self) -> None:
-        """Retire known and current transports after in-flight work releases them."""
+        """Retire known and current transports after in-flight work releases them.
+
+        Attempt the remaining immediately eligible closes if one fails, then
+        propagate the first failure.
+
+        Raises:
+            Exception: If a transport eligible for immediate cleanup fails to
+                close.
+        """
         close_after_unlock: list[Transport] = []
         with self._transport_lock:
             advance_transport_generation(self._config)
-            if self._known_transport is not None and self._known_transport is not self._transport:
+            if self._known_transport is not None and self._known_transport is not self.transport:
                 retired = retire_transport(
                     self._lease_counts, self._retired_transports, self._known_transport
                 )
                 if retired is not None:
                     close_after_unlock.append(retired)
-            transport = self._transport
+            transport = self.transport
             self._driver = None
             self._driver_generation = None
             self._known_transport = None
-            self._transport = None
+            self.transport = None
             self._transport_owned = False
             if transport is not None:
                 retired = retire_transport(self._lease_counts, self._retired_transports, transport)
@@ -1321,7 +1182,10 @@ class Shotgun:
                 file. A thumbnail failure occurs after the entity is created.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=False)
         params = _crud.build_create_params(entity_type, field_data, return_fields)
@@ -1389,13 +1253,13 @@ class Shotgun:
 
         Raises:
             TypeError: If no attachment is given or the reference is a string.
-            ValueError: If an entity dictionary references a different type.
+            ValueError: If an entity dictionary references a different type,
+                server settings are incomplete, or authenticated HTTP violates
+                the configured origin security policy.
             ShotgunError: If another attachment reference is unsupported or a
                 setup RPC reports a fault; the fault keeps its specific type.
             ShotgunFileDownloadError: If the resolved URL is invalid or setup,
                 transfer, or destination I/O fails.
-            ValueError: If server settings are incomplete or authenticated HTTP
-                violates the configured origin security policy.
         """
         if attachment is False:
             if attachment_id is None:
@@ -1430,7 +1294,7 @@ class Shotgun:
                     headers=headers,
                     url=url,
                 )
-                return exchange._execute(driver, operation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                return exchange.execute(driver, operation)
         except _errors.ShotgunFileDownloadError:
             raise
         except (TransportError, _errors.ProtocolError, OSError):
@@ -1445,54 +1309,36 @@ class Shotgun:
         """
         raise _methods.entity_types_alias_error()
 
-    @overload
     def export_page(
         self,
         page_id: int,
-        page_format: str,
-        /,
+        format: str,  # noqa: A002
         layout_name: str | None = None,
-    ) -> str: ...
-
-    @overload
-    def export_page(
-        self,
-        page_id: int,
-        **kwargs: Unpack[_methods.ExportPageKeywordArguments],
-    ) -> str: ...
-
-    @_methods.expose_export_page_signature
-    def export_page(self, *args: object, **kwargs: object) -> str:
+    ) -> str:
         """Export a page using the documented arguments.
 
         The Page or its layout must be marked API Exportable in the web UI, or
         the server rejects the export.
 
         Args:
-            *args: Positional values from the documented `export_page`
-                signature.
-            **kwargs: Keyword values from the documented `export_page`
-                signature.
+            page_id: Numeric page identifier.
+            format: Required nonempty export format name.
+            layout_name: Optional layout name, including an empty name.
 
         Returns:
             Exported page text returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if an argument or the server result has the wrong type.
+                or if `page_id`, `format`, or the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_export_page(args, kwargs, 'Shotgun')
+        options = _methods.ExportPageOptions(page_id, format, layout_name)
         params = _methods.build_export_page_params(options)
         return _methods.require_string_result(self._call('export_page', params), 'export_page')
 
-    @overload
-    def find(self, entity_type: Never) -> list[dict[str, object]]: ...
-
-    @overload
     def find(
         self,
         entity_type: str,
@@ -1505,33 +1351,50 @@ class Shotgun:
         page: int = 0,
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
-    ) -> list[dict[str, object]]: ...
-
-    @_crud.expose_find_signature
-    def find(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+    ) -> list[dict[str, object]]:
         """Find entities matching the supplied filters.
 
         Args:
-            *args: Positional values from the documented `find` signature.
-            **kwargs: Keyword values from the documented `find` signature.
+            entity_type: Entity type to find.
+            filters: Filters in list or dict syntax.
+            fields: Optional fields to return; defaults to `id`.
+            order: Optional field and direction sort specifications.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            limit: Maximum entities to return, or `0` for no limit.
+            retired_only: Return retired entities instead of active entities.
+            page: Specific page to return, or `0` to read all pages.
+            include_archived_projects: Include entities from archived projects.
+            additional_filter_presets: Optional server-side filter presets.
 
         Returns:
             Matching entities in server order.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if filters, paging, ordering, or a server result is invalid.
+                or if filters, fields, paging, ordering, or a server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        return self._find(_crud.bind_find(args, kwargs, 'Shotgun'))
+        return self._find(
+            _crud.FindOptions(
+                entity_type,
+                filters,
+                fields,
+                order,
+                filter_operator,
+                limit,
+                retired_only,
+                page,
+                include_archived_projects,
+                additional_filter_presets,
+            )
+        )
 
-    @overload
-    def find_one(self, entity_type: Never) -> dict[str, object] | None: ...
-
-    @overload
     def find_one(
         self,
         entity_type: str,
@@ -1542,28 +1405,43 @@ class Shotgun:
         retired_only: bool = False,
         include_archived_projects: bool = True,
         additional_filter_presets: object = None,
-    ) -> dict[str, object] | None: ...
-
-    @_crud.expose_find_one_signature
-    def find_one(self, *args: object, **kwargs: object) -> dict[str, object] | None:
+    ) -> dict[str, object] | None:
         """Return the first entity matching the supplied filters.
 
         Args:
-            *args: Positional values from the documented `find_one` signature.
-            **kwargs: Keyword values from the documented `find_one` signature.
+            entity_type: Entity type to find.
+            filters: Filters in list or dict syntax.
+            fields: Optional fields to return; defaults to `id`.
+            order: Optional field and direction sort specifications.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            retired_only: Return a retired entity instead of an active entity.
+            include_archived_projects: Include entities from archived projects.
+            additional_filter_presets: Optional server-side filter presets.
 
         Returns:
             The first matching entity, or `None` when no entity matches.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if filters, paging, ordering, or a server result is invalid.
+                or if filters, fields, paging, ordering, or a server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        options = _crud.bind_find_one(args, kwargs, 'Shotgun')
+        options = _crud.FindOneOptions(
+            entity_type,
+            filters,
+            fields,
+            order,
+            filter_operator,
+            retired_only,
+            include_archived_projects,
+            additional_filter_presets,
+        )
         return _crud.first_result(self._find(_crud.find_options_from_one(options)))
 
     def follow(self, user: dict[str, Any], entity: dict[str, Any]) -> dict[str, object]:
@@ -1713,16 +1591,20 @@ class Shotgun:
     def _initialize(self, options: ConstructorOptions) -> None:
         """Initialize client state from validated constructor options."""
         self._base_url = options.base_url.rstrip('/')
-        self._ca_certs = options.ca_certs or os.environ.get('SHOTGUN_API_CACERTS') or None
+        self._ca_certs = (
+            options.ca_certs or os.environ.get('SHOTGUN_API_CACERTS') or None
+            if self._in_process
+            else config_module.constructor_ca_certs(options.ca_certs)
+        )
         self._client_caps = ClientCapabilities()
-        self._config = build_config(options)
+        self._config = build_config(options, in_process=self._in_process)
 
         self._driver: Driver | None = None
         self._driver_generation: int | None = None
         self._known_transport: Transport | None = None
         self._lease_counts: dict[int, int] = {}
         self._retired_transports: dict[int, Transport] = {}
-        self._transport: Transport | None = None
+        self.transport: Transport | None = None
         self._transport_lock = threading.Lock()
         self._transport_owned = False
 
@@ -2000,7 +1882,10 @@ class Shotgun:
                 or if the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         result = self._call(
             'schema_field_create',
@@ -2096,7 +1981,10 @@ class Shotgun:
                 or if the server result is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         return _crud.require_boolean_result(
             self._call(
@@ -2216,30 +2104,23 @@ class Shotgun:
             source_entity,
             filmstrip_thumbnail,
         )
-        if share.thumbnail_path is not None and 'field_name' in kwargs:
-            raise TypeError("Shotgun.upload() got multiple values for argument 'field_name'")
         prepared: _files.PreparedUpload | None = None
         if share.thumbnail_path is not None:
-            arguments = _bind_upload(
-                (
-                    share.source_entity_type,
-                    share.source_entity_id,
-                    share.thumbnail_path,
-                ),
-                {
-                    **kwargs,
-                    'field_name': (
-                        'filmstrip_thumb_image' if filmstrip_thumbnail else 'thumb_image'
-                    ),
-                },
+            for keyword in kwargs:
+                if keyword not in ('display_name', 'tag_list', 'created_at'):
+                    raise TypeError(
+                        f"Shotgun.share_thumbnail() got an unexpected keyword argument '{keyword}'"
+                    )
+            arguments = _files.UploadArguments(
+                entity_type=share.source_entity_type,
+                entity_id=share.source_entity_id,
+                path=share.thumbnail_path,
+                field_name=_files.thumbnail_fields(filmstrip_thumbnail)[0],
+                display_name=cast('str | None', kwargs.get('display_name')),
+                tag_list=cast('str | None', kwargs.get('tag_list')),
+                created_at=cast('_dt_module.datetime | None', kwargs.get('created_at')),
             )
-            prepared = _files.prepare_upload(
-                _files.UploadOptions(
-                    arguments=arguments,
-                    upload_type='Thumbnail',
-                    filmstrip=filmstrip_thumbnail,
-                )
-            )
+            prepared = _files.prepare_upload(_files.upload_options(arguments))
         context = config_module.snapshot(self._config)
         require_secure_rpc(context, include_auth=True)
         with self._driver_lease(context) as driver:
@@ -2247,9 +2128,7 @@ class Shotgun:
                 attachment_id = self._upload_thumbnail_for(driver, context, prepared)
                 if len(share.entities) == 1:
                     return attachment_id
-                field_name: Literal['filmstrip_image', 'image'] = (
-                    'filmstrip_image' if filmstrip_thumbnail else 'image'
-                )
+                field_name = _files.thumbnail_fields(filmstrip_thumbnail)[1]
                 ready = driver.poll(
                     lambda: self._thumbnail_source_ready(
                         driver,
@@ -2279,10 +2158,6 @@ class Shotgun:
                 filmstrip_thumbnail,
             )
 
-    @overload
-    def summarize(self, entity_type: Never) -> dict[str, object]: ...
-
-    @overload
     def summarize(
         self,
         entity_type: str,
@@ -2291,29 +2166,39 @@ class Shotgun:
         filter_operator: str | None = None,
         grouping: list[dict[str, Any]] | None = None,
         include_archived_projects: bool = True,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_summarize_signature
-    def summarize(self, *args: object, **kwargs: object) -> dict[str, object]:
+    ) -> dict[str, object]:
         """Summarize field data returned by a query.
 
         Args:
-            *args: Positional values from the documented `summarize` signature.
-            **kwargs: Keyword values from the documented `summarize` signature.
+            entity_type: Entity type to summarize.
+            filters: Filters in list or dict syntax.
+            summary_fields: List of `{'field': ..., 'type': ...}` summaries.
+            filter_operator: `'all'` or `'any'` for list-syntax filters.
+            grouping: Optional grouping specs.
+            include_archived_projects: Include archived projects when `True`.
 
         Returns:
             Dict with `summaries` and (when grouped) `groups`.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
                 or if `filters`, `summary_fields`, or the server result has the
                 wrong type.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
-        options = _methods.bind_summarize(args, kwargs, 'Shotgun')
+        options = _methods.SummarizeOptions(
+            entity_type,
+            filters,
+            summary_fields,
+            filter_operator,
+            grouping,
+            include_archived_projects,
+        )
         params = _methods.build_summarize_params(options)
         return _crud.require_dictionary_result(self._call('summarize', params), 'summarize')
 
@@ -2324,7 +2209,7 @@ class Shotgun:
         project_ids: list[int] | None = None,
         limit: int | None = None,
     ) -> dict[str, object]:
-        """Search entity display names matching `text` (min 3 chars server-side).
+        """Search entity display names matching `text`.
 
         Args:
             text: Text to match.
@@ -2338,10 +2223,14 @@ class Shotgun:
 
         Raises:
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if `entity_types` or the server result is not a dictionary.
+                if `entity_types` or the server result is not a dictionary, or
+                if an entity filter is invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         params = _methods.build_text_search_params(
             text,
@@ -2409,7 +2298,10 @@ class Shotgun:
                 nonempty file. A thumbnail failure occurs after the update.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
-                policy.
+                policy, or a naive datetime cannot be converted to UTC.
+            OverflowError: If converting an aware datetime to UTC exceeds the
+                supported datetime range.
+            OSError: If the platform cannot resolve a local datetime.
         """
         field_data, thumbnails = _files.split_thumbnail_uploads(data, keep_image_none=True)
         params = _crud.build_update_params(
@@ -2438,7 +2330,8 @@ class Shotgun:
             user: Optional user entity to attribute the access to.
 
         Raises:
-            ShotgunError: If an RPC fault or terminal transport failure occurs.
+            ShotgunError: If a project or user ID is invalid, or an RPC fault
+                or terminal transport failure occurs.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
@@ -2451,10 +2344,6 @@ class Shotgun:
             ),
         )
 
-    @overload
-    def upload(self, entity_type: Never) -> int: ...
-
-    @overload
     def upload(
         self,
         entity_type: str,
@@ -2464,25 +2353,26 @@ class Shotgun:
         display_name: str | None = None,
         tag_list: str | None = None,
         created_at: _dt_module.datetime | None = None,
-    ) -> int: ...
-
-    @_expose_upload_signature
-    def upload(self, *args: object, **kwargs: object) -> int:
+    ) -> int:
         """Upload a file or thumbnail and return its Attachment ID.
 
         A server requiring legacy form uploads raises `ShotgunError` before any
         upload request is sent. Server capability reads may occur.
 
         Args:
-            *args: Positional arguments from the documented upload signature;
-                the path may be text or filesystem-encoded bytes.
-            **kwargs: Keyword arguments from the documented upload signature.
+            entity_type: Entity type receiving the upload.
+            entity_id: Numeric identifier of the receiving entity.
+            path: Existing non-empty file path as text or filesystem-encoded
+                bytes.
+            field_name: Optional file field receiving an Attachment.
+            display_name: Optional Attachment display name.
+            tag_list: Optional comma-delimited Attachment tags.
+            created_at: Optional Attachment creation timestamp.
 
         Returns:
             Created Attachment ID.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If the file or an upload response is invalid, an RPC
                 fault or terminal transport failure occurs, or the server
                 requires legacy form uploads.
@@ -2490,23 +2380,10 @@ class Shotgun:
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        arguments = _bind_upload(args, kwargs)
-        thumbnail_fields = {
-            'filmstrip_image',
-            'filmstrip_thumb_image',
-            'image',
-            'thumb_image',
-        }
-        upload_type: Literal['Attachment', 'Thumbnail'] = (
-            'Thumbnail' if arguments.field_name in thumbnail_fields else 'Attachment'
+        arguments = _files.UploadArguments(
+            entity_type, entity_id, path, field_name, display_name, tag_list, created_at
         )
-        return self._upload(
-            _files.UploadOptions(
-                arguments=arguments,
-                upload_type=upload_type,
-                filmstrip=arguments.field_name in {'filmstrip_image', 'filmstrip_thumb_image'},
-            )
-        )
+        return self._upload(_files.upload_options(arguments))
 
     def upload_filmstrip_thumbnail(
         self,
@@ -2672,10 +2549,6 @@ class Shotgun:
             'work_schedule_read',
         )
 
-    @overload
-    def work_schedule_update(self, date: Never) -> dict[str, object]: ...
-
-    @overload
     def work_schedule_update(
         self,
         date: _dt_module.date | str,
@@ -2684,30 +2557,31 @@ class Shotgun:
         project: dict[str, Any] | None = None,
         user: dict[str, Any] | None = None,
         recalculate_field: str | None = None,
-    ) -> dict[str, object]: ...
-
-    @_methods.expose_work_schedule_update_signature
-    def work_schedule_update(self, *args: object, **kwargs: object) -> dict[str, object]:
-        """Update a work schedule using the documented arguments.
+    ) -> dict[str, object]:
+        """Update a work schedule.
 
         Args:
-            *args: Positional values from the documented `work_schedule_update`
-                signature.
-            **kwargs: Keyword values from the documented `work_schedule_update`
-                signature.
+            date: Date or exact `YYYY-MM-DD` string to update.
+            working: Whether the date is a working day.
+            description: Optional schedule description.
+            project: Optional project entity restriction.
+            user: Optional user entity restriction.
+            recalculate_field: Optional field to recalculate.
 
         Returns:
             Updated work schedule data returned by the server.
 
         Raises:
-            TypeError: If arguments do not match the documented signature.
             ShotgunError: If an RPC fault or terminal transport failure occurs,
-                or if dates, exclusivity, or the server result is invalid.
+                or if the date, project/user exclusivity, or server result is
+                invalid.
             ProtocolError: If a server request returns an HTTP error.
             ValueError: If authenticated HTTP violates the configured origin
                 policy.
         """
-        options = _methods.bind_work_schedule_update(args, kwargs, 'Shotgun')
+        options = _methods.WorkScheduleUpdateOptions(
+            date, working, description, project, user, recalculate_field
+        )
         params = _methods.build_work_schedule_update_params(options)
         return _crud.require_dictionary_result(
             self._call('work_schedule_update', params),

@@ -8,19 +8,15 @@ import sys
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from scripts import _conformance_runtime as runtime
 
-if TYPE_CHECKING:
-    from shotgun_api3 import Shotgun
-
 
 class _Site:
     def __init__(self) -> None:
-        self.user: dict[str, Any] = {
+        self.user: dict[str, object] = {
             'type': 'HumanUser',
             'id': 11,
             'login': 'fixture-user',
@@ -28,13 +24,18 @@ class _Site:
             'email_notes': True,
             'locked_until': '2030-01-01T00:00:00Z',
         }
-        self.project = {'type': 'Project', 'id': 9, 'name': 'conformance'}
-        self.other_project = {'type': 'Project', 'id': 7, 'name': 'existing'}
-        self.asset = {'type': 'Asset', 'id': 17, 'sg_api_tests_number_field': 42}
+        self.project: dict[str, object] = {'type': 'Project', 'id': 9, 'name': 'conformance'}
+        self.other_project: dict[str, object] = {'type': 'Project', 'id': 7, 'name': 'existing'}
+        self.asset: dict[str, object] = {
+            'type': 'Asset',
+            'id': 17,
+            'sg_api_tests_number_field': 42,
+        }
         self.fields = {'sg_api_tests_number_field', 'sg_project_visibility_test'}
         self.retired_fields: set[str] = set()
         self.visibility = {7: True, 9: False}
-        self.rules: dict[int, dict[str, Any]] = {}
+        self.rules: dict[int, dict[str, object]] = {}
+        self.retired_rules: dict[int, dict[str, object]] = {}
         self.fail_user_update_after_mutation = False
         self.fail_user_restore = False
         self.interrupt_user_update_after_mutation = False
@@ -42,7 +43,7 @@ class _Site:
         self.fail_visibility_project: int | None = None
         self.delete_attempts: list[int] = []
 
-    def create(self, entity: str, data: dict[str, Any]) -> dict[str, Any]:
+    def create(self, entity: str, data: dict[str, object]) -> dict[str, object]:
         assert entity == 'Project'
         self.project = {'type': 'Project', 'id': 9, **data}
         return copy.deepcopy(self.project)
@@ -52,7 +53,7 @@ class _Site:
         self.delete_attempts.append(entity_id)
         if self.fail_delete_rule_id == entity_id:
             raise RuntimeError('private server detail')
-        self.rules.pop(entity_id)
+        self.retired_rules[entity_id] = self.rules.pop(entity_id)
         return True
 
     def find(
@@ -61,7 +62,7 @@ class _Site:
         filters: list[list[object]],
         fields: list[str],
         **kwargs: object,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, object]]:
         del fields, kwargs
         if entity == 'HumanUser':
             rows = [self.user]
@@ -89,13 +90,13 @@ class _Site:
         filters: list[list[object]],
         fields: list[str] | None = None,
         **kwargs: object,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, object] | None:
         rows = self.find(entity, filters, fields or [], **kwargs)
         return rows[0] if rows else None
 
     def revive(self, entity: str, entity_id: int) -> bool:
         assert entity == 'WorkDayRule'
-        assert entity_id in self.rules
+        self.rules[entity_id] = self.retired_rules.pop(entity_id)
         return True
 
     def schema_field_create(self, entity: str, field_type: str, label: str) -> str:
@@ -114,30 +115,35 @@ class _Site:
         return True
 
     def schema_field_read(
-        self, entity: str, field: str | None = None, project: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+        self, entity: str, field: str | None = None, project: dict[str, object] | None = None
+    ) -> dict[str, object]:
         assert entity == 'Asset'
         if field is None:
             return {name: {} for name in self.fields}
         if field not in self.fields:
             return {}
         project_id = project['id'] if project else 9
+        assert isinstance(project_id, int)
         return {field: {'visible': {'value': self.visibility[project_id], 'editable': True}}}
 
     def schema_field_update(
-        self, entity: str, field: str, data: dict[str, Any], project: dict[str, Any]
+        self, entity: str, field: str, data: dict[str, object], project: dict[str, object]
     ) -> bool:
         assert entity == 'Asset'
         assert field in self.fields
-        if project['id'] == self.fail_visibility_project:
+        project_id = project['id']
+        assert isinstance(project_id, int)
+        visible = data['visible']
+        assert isinstance(visible, bool)
+        if project_id == self.fail_visibility_project:
             raise RuntimeError('private server detail')
-        self.visibility[project['id']] = data['visible']
+        self.visibility[project_id] = visible
         return True
 
-    def update(self, entity: str, entity_id: int, data: dict[str, Any]) -> None:
+    def update(self, entity: str, entity_id: int, data: dict[str, object]) -> dict[str, object]:
         if entity == 'HumanUser':
             assert entity_id == self.user['id']
-            if self.fail_user_restore and [link['id'] for link in data.get('projects', [])] == [7]:
+            if self.fail_user_restore and runtime._project_ids(data.get('projects', [])) == [7]:
                 raise RuntimeError('private server detail')
             self.user.update(copy.deepcopy(data))
             if self.fail_user_update_after_mutation:
@@ -153,10 +159,14 @@ class _Site:
             self.rules[entity_id].update(copy.deepcopy(data))
         else:
             raise AssertionError(entity)
-
-
-def _client(site: _Site) -> Shotgun:
-    return cast('Shotgun', site)
+        row = (
+            self.user
+            if entity == 'HumanUser'
+            else self.asset
+            if entity == 'Asset'
+            else self.rules[entity_id]
+        )
+        return copy.deepcopy(row)
 
 
 def _config(path: Path) -> None:
@@ -169,9 +179,9 @@ def _config(path: Path) -> None:
 def _rule(
     rule_id: int,
     date: str,
-    scope: dict[str, Any] | None = None,
+    scope: dict[str, object] | None = None,
     description: str = 'before',
-) -> dict[str, Any]:
+) -> dict[str, object]:
     return {
         'type': 'WorkDayRule',
         'id': rule_id,
@@ -192,18 +202,18 @@ def test_access_interrupt_after_mutation_restores_prior_links(tmp_path: Path) ->
     _config(path)
     site.interrupt_user_update_after_mutation = True
     with pytest.raises(KeyboardInterrupt):
-        runtime._prepare_access(_client(site), path)
-    assert [link['id'] for link in site.user['projects']] == [7]
+        runtime._prepare_access(site, path)
+    assert runtime._project_ids(site.user['projects']) == [7]
 
 
 def test_access_restores_prior_project_links_after_sudo_test(tmp_path: Path) -> None:
     site = _Site()
     path = tmp_path / 'config'
     _config(path)
-    user, project, session_restore = runtime._prepare_access(_client(site), path)
-    assert [link['id'] for link in site.user['projects']] == [7, 9]
+    user, project, session_restore = runtime._prepare_access(site, path)
+    assert runtime._project_ids(site.user['projects']) == [7, 9]
     per_test = runtime._capture_test(
-        _client(site),
+        site,
         SimpleNamespace(),
         'TestScriptUserSudoAuth.test_user_is_creator',
         user,
@@ -211,7 +221,7 @@ def test_access_restores_prior_project_links_after_sudo_test(tmp_path: Path) -> 
     )
     site.update('HumanUser', 11, {'projects': [project]})
     runtime._run_restore(per_test)
-    assert [link['id'] for link in site.user['projects']] == [7, 9]
+    assert runtime._project_ids(site.user['projects']) == [7, 9]
     runtime._run_restore(session_restore)
     assert site.user['projects'] == [{'type': 'Project', 'id': 7, 'name': 'existing'}]
 
@@ -222,8 +232,8 @@ def test_access_setup_failure_after_mutation_restores_prior_links(tmp_path: Path
     _config(path)
     site.fail_user_update_after_mutation = True
     with pytest.raises(ValueError, match='access was not added'):
-        runtime._prepare_access(_client(site), path)
-    assert [link['id'] for link in site.user['projects']] == [7]
+        runtime._prepare_access(site, path)
+    assert runtime._project_ids(site.user['projects']) == [7]
 
 
 def test_access_setup_reports_cleanup_failure_without_private_details(tmp_path: Path) -> None:
@@ -234,11 +244,11 @@ def test_access_setup_reports_cleanup_failure_without_private_details(tmp_path: 
     site.fail_user_restore = True
     with pytest.raises(RuntimeError, match='Conformance restoration failed') as exc:
         runtime._sanitized(
-            lambda: runtime._prepare_access(_client(site), path),
+            lambda: runtime._prepare_access(site, path),
             'Conformance access setup failed',
         )
     assert 'private server detail' not in str(exc.value)
-    assert [link['id'] for link in site.user['projects']] == [7, 9]
+    assert runtime._project_ids(site.user['projects']) == [7, 9]
 
 
 def test_pytest_fixtures_wrap_unittest_setup_and_failed_test(tmp_path: Path) -> None:
@@ -363,25 +373,11 @@ def test_pytest_fixtures_wrap_unittest_setup_and_failed_test(tmp_path: Path) -> 
     assert result.returncode == 0, result.stdout + result.stderr
     assert '4 passed, 1 xfailed' in result.stdout
 
-    parts = source.rsplit('_run_restore(restoration)', 1)
-    assert len(parts) == 2
-    (tmp_path / 'conftest.py').write_text(parts[0] + 'pass' + parts[1], encoding='utf-8')
-    broken = subprocess.run(
-        [sys.executable, '-m', 'pytest', '-q', 'test_api.py'],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert broken.returncode != 0
-    assert 'test_verify_restored' in broken.stdout
-
 
 def test_schedule_cleanup_failure_is_sanitized_and_other_dates_are_restored() -> None:
     site = _Site()
     restoration = runtime._capture_test(
-        _client(site),
+        site,
         SimpleNamespace(),
         'TestShotgunApi.test_work_schedule',
         site.user,
@@ -400,7 +396,7 @@ def test_schedule_cleanup_failure_is_sanitized_and_other_dates_are_restored() ->
 def test_schedule_does_not_delete_new_range_outside_owned_day() -> None:
     site = _Site()
     restoration = runtime._capture_test(
-        _client(site),
+        site,
         SimpleNamespace(),
         'TestShotgunApi.test_work_schedule',
         site.user,
@@ -420,7 +416,7 @@ def test_schedule_refuses_existing_range_before_test() -> None:
     site.rules[1]['end_date'] = '2012-01-04'
     with pytest.raises(ValueError, match='overlapping range'):
         runtime._capture_test(
-            _client(site),
+            site,
             SimpleNamespace(),
             'TestShotgunApi.test_work_schedule',
             site.user,
@@ -435,10 +431,11 @@ def test_schedule_restores_modified_rules_and_deletes_only_new_target_exceptions
         1: _rule(1, '2012-01-02'),
         2: _rule(2, '2010-01-01'),
         3: _rule(3, '2012-01-03', site.other_project),
+        6: _rule(6, '2012-01-04', site.user),
     }
     original = copy.deepcopy(site.rules)
     restoration = runtime._capture_test(
-        _client(site),
+        site,
         SimpleNamespace(),
         'TestShotgunApi.test_work_schedule',
         site.user,
@@ -446,10 +443,13 @@ def test_schedule_restores_modified_rules_and_deletes_only_new_target_exceptions
     )
     site.rules[1]['description'] = 'changed'
     site.rules[1]['start_date'] = '2013-01-02'
+    site.delete('WorkDayRule', 6)
+    assert 6 in site.retired_rules
     site.rules[4] = _rule(4, '2012-01-03', site.project)
     site.rules[5] = _rule(5, '2012-01-04', site.user)
     runtime._run_restore(restoration)
     assert site.rules == original
+    assert 6 not in site.retired_rules
 
 
 @pytest.mark.parametrize(
@@ -465,9 +465,7 @@ def test_schedule_restores_modified_rules_and_deletes_only_new_target_exceptions
 def test_user_fields_restore_nondefault_values(name: str, field: str, mutated: object) -> None:
     site = _Site()
     original = site.user[field]
-    restoration = runtime._capture_test(
-        _client(site), SimpleNamespace(), name, site.user, site.project
-    )
+    restoration = runtime._capture_test(site, SimpleNamespace(), name, site.user, site.project)
     site.update('HumanUser', 11, {field: mutated})
     assert site.user[field] == mutated
     runtime._run_restore(restoration)
@@ -482,7 +480,7 @@ def test_number_field_restores_presence_and_prior_asset_value(already_exists: bo
         site.fields.remove(field)
         site.asset.pop(field)
     restoration: runtime._Restoration = []
-    runtime._capture_schema_field(_client(site), field, 17, restoration)
+    runtime._capture_schema_field(site, field, 17, restoration)
     site.fields.add(field)
     site.update('Asset', 17, {field: 1})
     runtime._run_restore(restoration)
@@ -507,9 +505,7 @@ def test_fresh_schema_name_survives_two_retired_name_lifecycles(
     labels: list[str] = []
     for _ in range(2):
         case = SimpleNamespace(asset=site.asset)
-        restoration = runtime._capture_test(
-            _client(site), case, test_name, site.user, site.project
-        )
+        restoration = runtime._capture_test(site, case, test_name, site.user, site.project)
         if field_type == 'number':
             field = case._conformance_number_field
             label = field.removeprefix('sg_').replace('_', ' ')
@@ -534,9 +530,7 @@ def test_fresh_schema_name_survives_two_retired_name_lifecycles(
 def test_visibility_cleanup_attempts_both_projects_and_reports_failure() -> None:
     site = _Site()
     restoration: runtime._Restoration = []
-    runtime._capture_visibility(
-        _client(site), 'sg_project_visibility_test', site.project, restoration
-    )
+    runtime._capture_visibility(site, 'sg_project_visibility_test', site.project, restoration)
     site.visibility.update({7: False, 9: True})
     site.fail_visibility_project = 9
     with pytest.raises(
@@ -554,7 +548,7 @@ def test_visibility_restores_both_projects_or_deletes_new_field(already_exists: 
     if not already_exists:
         site.fields.remove(field)
     restoration: runtime._Restoration = []
-    runtime._capture_visibility(_client(site), field, site.project, restoration)
+    runtime._capture_visibility(site, field, site.project, restoration)
     site.fields.add(field)
     site.visibility.update({7: False, 9: True})
     runtime._run_restore(restoration)

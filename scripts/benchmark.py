@@ -16,15 +16,13 @@ Successful validation and cleanup precede writing the raw report to
 `dist/benchmarks/benchmark-results.md`.
 """
 
-# Same-file collaboration follows module-boundary privacy.
-# pyright: reportPrivateUsage=false
-
 from __future__ import annotations
 
 import argparse
 import datetime
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import math
@@ -60,32 +58,11 @@ _COLD_WARM_INVOCATION_COUNT = 2
 _DEFAULT_SAMPLE_COUNT = 2
 _DIRECT_PAYLOAD_BYTES = 1_000_000
 _DIRECT_ROUTE_OPERATIONS = frozenset({'upload_direct'})
+_DISTRIBUTION_NAME = 'sg-python-api'
 _DOWNLOAD_ROUTE_OPERATIONS = frozenset({'download', 'rss_download'})
 _ENTITY_COUNT = 30
 _GENERIC_PAYLOAD_BYTES = 4096
 _GENERIC_ROUTE_OPERATIONS = frozenset({'upload_generic'})
-_LATENCY_OPERATIONS = (
-    'auth_first_request',
-    'batch',
-    'create',
-    'delete',
-    'download',
-    'find_medium',
-    'find_one',
-    'find_paged',
-    'find_small',
-    'parallel_read',
-    'payload_decode',
-    'payload_encode',
-    'schema_entity_read',
-    'schema_field_read',
-    'session_first_request',
-    'summarize',
-    'update',
-    'upload_direct',
-    'upload_generic',
-    'upload_multipart',
-)
 _MAX_ENTITY_CODE_LENGTH = 100
 _MAX_RESOURCE_JOURNAL_ENTRIES = 64
 _MAX_SAMPLE_COUNT = 20
@@ -120,6 +97,15 @@ _OPERATION_CATEGORIES = {
     'upload_generic': 'upload',
     'upload_multipart': 'upload',
 }
+_LATENCY_OPERATIONS = tuple(_OPERATION_CATEGORIES)
+_LATENCY_RESOURCE_OPERATIONS = (
+    'create',
+    'delete',
+    'upload_direct',
+    'upload_generic',
+    'upload_multipart',
+)
+_LATENCY_SETUP_RESOURCE_COUNT = 2
 _PARALLEL_CALLS = 4
 _PAYLOAD_BATCH_SIZE = 20
 _PAYLOAD_BLOCK_SIZE = 1 << 20
@@ -135,6 +121,8 @@ _REQUIRED_ENV = (
 _RESOURCE_ENTITY_TYPES = frozenset({'Attachment', 'Shot', 'Version'})
 _RESOURCE_JOURNAL_NAME = 'resource-journal.json'
 _RSS_OPERATIONS = ('rss_download', 'rss_upload')
+_RSS_RESOURCES_PER_OPERATION = 2
+_WORKER_RECOVERY_ALLOWANCE = 1
 _T = TypeVar('_T')
 _TAIL_PERCENTILE = 0.95
 _VERIFIER_OPERATION_KEYS = frozenset(_LATENCY_OPERATIONS)
@@ -203,6 +191,10 @@ class _CleanupClient(Protocol):
     def delete(self, entity_type: str, entity_id: int) -> object:
         """Delete one entity.
 
+        Args:
+            entity_type: Type of entity to delete.
+            entity_id: Numeric identifier of the entity.
+
         Returns:
             The client-specific deletion result.
         """
@@ -236,6 +228,11 @@ class _CleanupClient(Protocol):
     ) -> object:
         """Find the first matching entity.
 
+        Args:
+            entity_type: Type of entity to query.
+            filters: Query filters expressed as field, relation, and values.
+            fields: Fields to return, or `None` for client defaults.
+
         Returns:
             The client-specific first-match result.
         """
@@ -265,6 +262,10 @@ class _SetupClient(_CleanupClient, Protocol):
 
     def create(self, entity_type: str, data: dict[str, object]) -> object:
         """Create one entity.
+
+        Args:
+            entity_type: Type of entity to create.
+            data: Field names and values for the new entity.
 
         Returns:
             The client-specific creation result.
@@ -361,6 +362,9 @@ class _MeasuredClient(_SetupClient, Protocol):
     def schema_field_read(self, entity_type: str) -> dict[str, object]:
         """Return field schema metadata.
 
+        Args:
+            entity_type: Type of entity whose field schema is requested.
+
         Returns:
             Field schema metadata keyed by field name.
         """
@@ -450,21 +454,21 @@ class _LiveState:
 
     def __init__(self, module: ModuleType, config: Mapping[str, Any]) -> None:
         """Initialize live resources and client state."""
-        self.config = config
+        self._config = config
         self.module = module
         self.namespace = cast('str', config['namespace'])
         self.resources: list[tuple[str, int]] = []
         self.verified_deleted_shot_ids: set[int] = set()
         self.work_root = Path(cast('str', config['work_root']))
-        self.journal = _ResourceJournal._load(self.work_root)
-        self.resources.extend(self.journal._resources)
+        self._journal = _ResourceJournal.load(self.work_root)
+        self.resources.extend(self._journal.resources)
         self.clients: list[_MeasuredClient] = []
-        self.project: dict[str, Any] = {}
-        self.entities: list[dict[str, Any]] = []
+        self.project: dict[str, object] = {}
+        self.entities: list[dict[str, object]] = []
         self.expected_descriptions: dict[int, str | None] = {}
-        self.version: dict[str, Any] = {}
+        self.version: dict[str, object] = {}
         self.download_attachment_id = 0
-        self.server_info: dict[str, Any] = {}
+        self.server_info: dict[str, object] = {}
         self.generic_payload = self.work_root / f'{self.namespace}-generic.bin'
         self.direct_payload = self.work_root / f'{self.namespace}-direct.bin'
         self.multipart_payload = self.work_root / f'{self.namespace}-multipart.bin'
@@ -481,32 +485,6 @@ class _LiveState:
             if process_control is None:
                 process_control = _process_control(capture.error)
         return failures, process_control
-
-    def _cleanup_clients(self) -> None:
-        """Close clients without claiming ownership of borrowed live resources."""
-        failures, process_control = self._close_clients()
-        if process_control is not None:
-            raise process_control
-        if failures:
-            raise _CleanupError(f'benchmark client cleanup failed for {failures} client(s)')
-
-    def _make_client(self, session_token: str | None = None) -> _MeasuredClient:
-        """Create one disconnected client without tracking its ownership."""
-        kwargs: dict[str, object] = {'connect': False}
-        if session_token is None:
-            kwargs.update(
-                script_name=self.config['script_name'],
-                api_key=self.config['api_key'],
-            )
-        else:
-            kwargs['session_token'] = session_token
-        return cast('_MeasuredClient', self.module.Shotgun(self.config['site'], **kwargs))
-
-    def _client(self, *, session_token: str | None = None) -> _MeasuredClient:
-        """Create and track one disconnected main-thread client."""
-        client = self._make_client(session_token=session_token)
-        self.clients.append(client)
-        return client
 
     def _namespaced_resources(
         self,
@@ -577,8 +555,16 @@ class _LiveState:
         if failures:
             raise _CleanupError('benchmark namespaced cleanup failed')
 
-    def _cleanup(self) -> None:
-        """Delete tracked resources, verify no residue, and close operation clients."""
+    def cleanup(self) -> None:
+        """Delete tracked resources, verify no residue, and close operation clients.
+
+        Attempt the remaining cleanup after ordinary failures. Clear the
+        resource journal only after resource and client cleanup succeeds.
+
+        Raises:
+            RuntimeError: If deletion, residue verification, client cleanup, or
+                clearing the journal fails.
+        """
         failures = 0
         process_control: BaseException | None = None
         control = self.clients[0] if self.clients else None
@@ -613,7 +599,7 @@ class _LiveState:
             raise _CleanupError(f'benchmark cleanup failed for {failures} check(s)')
         clear_capture = _FailureCapture()
         with clear_capture:
-            self.journal._clear()
+            self._journal.clear()
         clear_process_control = _process_control(clear_capture.error)
         if clear_process_control is not None:
             raise clear_process_control
@@ -621,8 +607,66 @@ class _LiveState:
             raise _CleanupError('benchmark cleanup failed for 1 check(s)') from None
         self.resources.clear()
 
-    def _record_resource(self, entity_type: str, entity_id: int) -> None:
-        """Validate and persist one benchmark-owned resource identity."""
+    def cleanup_clients(self) -> None:
+        """Close clients without claiming ownership of borrowed live resources.
+
+        Raises:
+            RuntimeError: If one or more clients cannot be closed.
+        """
+        failures, process_control = self._close_clients()
+        if process_control is not None:
+            raise process_control
+        if failures:
+            raise _CleanupError(f'benchmark client cleanup failed for {failures} client(s)')
+
+    def make_client(self, session_token: str | None = None) -> _MeasuredClient:
+        """Create one disconnected client without tracking its ownership.
+
+        Args:
+            session_token: Use this token instead of configured script
+                credentials.
+
+        Raises:
+            Exception: If the selected client's constructor rejects its
+                configuration or cannot initialize.
+        """
+        kwargs: dict[str, object] = {'connect': False}
+        if session_token is None:
+            kwargs.update(
+                script_name=self._config['script_name'],
+                api_key=self._config['api_key'],
+            )
+        else:
+            kwargs['session_token'] = session_token
+        return cast('_MeasuredClient', self.module.Shotgun(self._config['site'], **kwargs))
+
+    def client(self, *, session_token: str | None = None) -> _MeasuredClient:
+        """Create and track one disconnected main-thread client.
+
+        Args:
+            session_token: Use this token instead of configured script
+                credentials.
+
+        Raises:
+            Exception: If the selected client's constructor rejects its
+                configuration or cannot initialize.
+        """
+        client = self.make_client(session_token=session_token)
+        self.clients.append(client)
+        return client
+
+    def record_resource(self, entity_type: str, entity_id: int) -> None:
+        """Validate and persist one benchmark-owned resource identity.
+
+        Args:
+            entity_type: `Attachment`, `Shot`, or `Version`.
+            entity_id: Positive integer identifier, excluding booleans.
+
+        Raises:
+            RuntimeError: If the identity is invalid or journal publication
+                fails.
+                An identity remains tracked in memory if publication fails.
+        """
         if (
             entity_type not in _RESOURCE_ENTITY_TYPES
             or isinstance(entity_id, bool)
@@ -630,34 +674,42 @@ class _LiveState:
         ):
             raise _CorrectnessError('benchmark resource identity is invalid')
         self.resources.append((entity_type, entity_id))
-        self.journal._record(entity_type, entity_id)
+        self._journal.record(entity_type, entity_id)
 
-    def _create(
+    def create(
         self,
         client: _SetupClient,
         entity_type: str,
         data: dict[str, object],
-    ) -> dict[str, Any]:
-        """Create and track one live entity after validating its identity."""
+    ) -> dict[str, object]:
+        """Create and track one live entity after validating its identity.
+
+        Args:
+            client: Client that creates the entity.
+            entity_type: Type to create and record.
+            data: Fields sent to the client.
+
+        Returns:
+            The created entity with a validated integer ID.
+
+        Raises:
+            RuntimeError: If the result has no valid ID or journal publication
+                fails.
+            Exception: If the supplied client's create operation fails.
+        """
         entity = client.create(entity_type, data)
         if not isinstance(entity, dict):
             raise _CorrectnessError(f'benchmark {entity_type} creation failed')
-        typed = cast('dict[str, Any]', entity)
+        typed = cast('dict[str, object]', entity)
         if not isinstance(typed.get('id'), int) or isinstance(typed.get('id'), bool):
             raise _CorrectnessError(f'benchmark {entity_type} creation failed')
-        self._record_resource(entity_type, cast('int', typed['id']))
+        self.record_resource(entity_type, cast('int', typed['id']))
         return typed
 
     def _prepare_project_and_version(self, control: _SetupClient) -> None:
         """Resolve the project and create the minimal transfer owner."""
-        project = control.find_one('Project', [['name', 'is', self.config['project']]], ['name'])
-        if not isinstance(project, dict):
-            raise _CorrectnessError('benchmark project lookup failed')
-        typed_project = cast('dict[str, object]', project)
-        if not isinstance(typed_project.get('id'), int):
-            raise _CorrectnessError('benchmark project lookup failed')
-        self.project = cast('dict[str, Any]', project)
-        self.version = self._create(
+        self.project = _project_by_name(control, self._config['project'])
+        self.version = self.create(
             control,
             'Version',
             {'code': _entity_code(self.namespace, 'version'), 'project': self.project},
@@ -665,18 +717,29 @@ class _LiveState:
         info = control.info()
         if not isinstance(info, dict):
             raise _CorrectnessError('benchmark site-info lookup failed')
-        self.server_info = cast('dict[str, Any]', info)
+        self.server_info = cast('dict[str, object]', info)
 
-    def _prepare(self) -> None:
-        """Create generated payloads and uniquely named live fixtures."""
+    def prepare(self) -> None:
+        """Create generated payloads and uniquely named live fixtures.
+
+        Successfully recorded resources remain tracked for cleanup if a later
+        preparation step fails.
+
+        Raises:
+            OSError: If writing a generated payload fails.
+            RuntimeError: If a fixture result is invalid or resource journal
+                publication fails.
+            Exception: If client initialization or a live client operation
+                fails.
+        """
         _write_payload(self.generic_payload, _GENERIC_PAYLOAD_BYTES)
         _write_payload(self.direct_payload, _DIRECT_PAYLOAD_BYTES)
         _write_payload(self.multipart_payload, _LARGE_PAYLOAD_BYTES)
-        control = self._client()
+        control = self.client()
         self._prepare_project_and_version(control)
         for index in range(_ENTITY_COUNT):
             self.entities.append(
-                self._create(
+                self.create(
                     control,
                     'Shot',
                     {
@@ -696,12 +759,27 @@ class _LiveState:
         if not isinstance(attachment, int) or isinstance(attachment, bool):
             raise _CorrectnessError('benchmark download fixture upload failed')
         self.download_attachment_id = attachment
-        self._record_resource('Attachment', attachment)
+        self.record_resource('Attachment', attachment)
 
-    def _prepare_rss(self, name: str) -> None:
-        """Create only fixtures required by one isolated transfer RSS sample."""
+    def prepare_rss(self, name: str) -> None:
+        """Create only fixtures required by one isolated transfer RSS sample.
+
+        Successfully recorded resources remain tracked for cleanup if a later
+        preparation step fails.
+
+        Args:
+            name: Transfer operation; `rss_download` also creates a source
+                attachment.
+
+        Raises:
+            OSError: If writing the generated payload fails.
+            RuntimeError: If a fixture result is invalid or resource journal
+                publication fails.
+            Exception: If client initialization or a live client operation
+                fails.
+        """
         _write_payload(self.multipart_payload, _LARGE_PAYLOAD_BYTES)
-        control = self._client()
+        control = self.client()
         self._prepare_project_and_version(control)
         if name != 'rss_download':
             return
@@ -715,7 +793,7 @@ class _LiveState:
         if not isinstance(attachment, int) or isinstance(attachment, bool):
             raise _CorrectnessError('benchmark RSS download fixture upload failed')
         self.download_attachment_id = attachment
-        self._record_resource('Attachment', attachment)
+        self.record_resource('Attachment', attachment)
 
 
 class _ResourceJournal:
@@ -723,7 +801,7 @@ class _ResourceJournal:
 
     def __init__(self, path: Path, resources: tuple[tuple[str, int], ...]) -> None:
         """Bind a journal path and validated resource snapshot."""
-        self.path = path
+        self._path = path
         self._entries = resources
 
     @staticmethod
@@ -754,15 +832,10 @@ class _ResourceJournal:
         }
         encoded = (json.dumps(payload, separators=(',', ':')) + '\n').encode('ascii')
         _write_atomic_snapshot(
-            self.path,
+            self._path,
             encoded,
             'Could not atomically write benchmark resource journal',
         )
-
-    def _clear(self) -> None:
-        """Atomically publish an empty resource snapshot."""
-        self._publish(())
-        self._entries = ()
 
     @staticmethod
     def _validate_resources(payload: object) -> tuple[tuple[str, int], ...]:
@@ -803,16 +876,44 @@ class _ResourceJournal:
             seen.add(identity)
         return tuple(resources)
 
+    def clear(self) -> None:
+        """Atomically publish an empty resource snapshot.
+
+        Raises:
+            RuntimeError: If the empty snapshot cannot be published.
+        """
+        self._publish(())
+        self._entries = ()
+
     @classmethod
-    def _create(cls, worker_root: Path) -> _ResourceJournal:
-        """Create and return an empty journal below one worker root."""
+    def create(cls, worker_root: Path) -> _ResourceJournal:
+        """Create and return an empty journal below one worker root.
+
+        Args:
+            worker_root: Existing directory that will contain the journal.
+
+        Raises:
+            RuntimeError: If the path is invalid or empty-journal publication
+                fails.
+        """
         journal = cls(cls._journal_path(worker_root, must_exist=False), ())
         journal._publish(())
         return journal
 
     @classmethod
-    def _load(cls, worker_root: Path) -> _ResourceJournal:
-        """Load and validate a journal below one worker root."""
+    def load(cls, worker_root: Path) -> _ResourceJournal:
+        """Load and validate a journal below one worker root.
+
+        Args:
+            worker_root: Existing directory containing the journal.
+
+        Returns:
+            The journal with its validated, ordered resource snapshot.
+
+        Raises:
+            RuntimeError: If the path escapes the root or the journal is
+                missing, unreadable, or malformed.
+        """
         path = cls._journal_path(worker_root, must_exist=True)
         try:
             payload: object = json.loads(path.read_bytes().decode('ascii'))
@@ -820,8 +921,17 @@ class _ResourceJournal:
             raise _BenchmarkError('Benchmark resource journal is invalid') from None
         return cls(path, cls._validate_resources(payload))
 
-    def _record(self, entity_type: str, entity_id: int) -> None:
-        """Atomically append one validated resource identity."""
+    def record(self, entity_type: str, entity_id: int) -> None:
+        """Atomically append one validated resource identity.
+
+        Args:
+            entity_type: `Attachment`, `Shot`, or `Version`.
+            entity_id: Positive integer identifier, excluding booleans.
+
+        Raises:
+            RuntimeError: If the identity is invalid or duplicated, the
+                snapshot would exceed 64 entries, or publication fails.
+        """
         resources = self._validate_resources(
             {
                 'resources': [
@@ -837,7 +947,7 @@ class _ResourceJournal:
         self._entries = resources
 
     @property
-    def _resources(self) -> tuple[tuple[str, int], ...]:
+    def resources(self) -> tuple[tuple[str, int], ...]:
         """Return the immutable ordered resource identities."""
         return self._entries
 
@@ -857,8 +967,8 @@ class _ParallelReadRunner:
 
     def __init__(self, state: _LiveState, shared_client: _MeasuredClient | None) -> None:
         """Initialize an isolated parallel-read runner."""
-        self.state = state
-        self.shared_client: _MeasuredClient | None = shared_client
+        self._state = state
+        self._shared_client: _MeasuredClient | None = shared_client
         self._closed = False
         self._close_errors: list[BaseException | None] = [None] * _PARALLEL_CALLS
         self._queues: list[queue.Queue[_ParallelReadTask | None]] = [
@@ -886,13 +996,13 @@ class _ParallelReadRunner:
                 start_error = start_capture.error
                 break
         if start_error is not None:
-            self._close()
+            self.close()
             raise start_error
         for ready in self._ready:
             ready.wait()
         setup_error = self._first_error(self._setup_errors)
         if setup_error is not None:
-            self._close()
+            self.close()
             raise setup_error
 
     @staticmethod
@@ -904,44 +1014,13 @@ class _ParallelReadRunner:
                 return process_control
         return next((error for error in errors if error is not None), None)
 
-    def _close(self) -> None:
-        """Stop every worker and finish thread-owned client cleanup."""
-        if self._closed:
-            return
-        self._closed = True
-        for index in self._started_indexes:
-            self._queues[index].put(None)
-        join_errors: list[BaseException | None] = []
-        for index in self._started_indexes:
-            capture = _FailureCapture()
-            with capture:
-                self._threads[index].join()
-            join_errors.append(capture.error)
-        error = self._first_error([*self._close_errors, *join_errors])
-        if error is not None:
-            raise error
-
-    def _read(self, entity_ids: Sequence[int]) -> list[object]:
-        """Read four identities concurrently and preserve their input order."""
-        if len(entity_ids) != _PARALLEL_CALLS:
-            raise _BenchmarkError('benchmark parallel read requires four entity IDs')
-        tasks = [_ParallelReadTask(entity_id, threading.Event()) for entity_id in entity_ids]
-        for work_queue, task in zip(self._queues, tasks, strict=True):
-            work_queue.put(task)
-        for task in tasks:
-            task.complete.wait()
-        error = self._first_error([task.error for task in tasks])
-        if error is not None:
-            raise error
-        return [task.result for task in tasks]
-
     def _worker(self, index: int) -> None:
         """Run one persistent worker with its selected client ownership."""
-        client = self.shared_client
+        client = self._shared_client
         if client is None:
             setup_capture = _FailureCapture()
             with setup_capture:
-                client = self.state._make_client()
+                client = self._state.make_client()
             self._setup_errors[index] = setup_capture.error
         self._ready[index].set()
         if self._setup_errors[index] is not None:
@@ -959,11 +1038,56 @@ class _ParallelReadRunner:
                 task.error = request_capture.error
                 task.complete.set()
         finally:
-            if self.shared_client is None:
+            if self._shared_client is None:
                 close_capture = _FailureCapture()
                 with close_capture:
                     client.close()
                 self._close_errors[index] = close_capture.error
+
+    def close(self) -> None:
+        """Stop every worker and finish thread-owned client cleanup.
+
+        Attempt every started worker's join before reporting a cleanup failure.
+        Repeated calls do not repeat cleanup.
+
+        Raises:
+            Exception: If joining a worker or closing its client fails.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for index in self._started_indexes:
+            self._queues[index].put(None)
+        join_errors: list[BaseException | None] = []
+        for index in self._started_indexes:
+            capture = _FailureCapture()
+            with capture:
+                self._threads[index].join()
+            join_errors.append(capture.error)
+        error = self._first_error([*self._close_errors, *join_errors])
+        if error is not None:
+            raise error
+
+    def read(self, entity_ids: Sequence[int]) -> list[object]:
+        """Read four identities concurrently and preserve their input order.
+
+        Args:
+            entity_ids: Exactly four entity IDs to read.
+
+        Raises:
+            Exception: If a worker's client query fails.
+        """
+        if len(entity_ids) != _PARALLEL_CALLS:
+            raise _BenchmarkError('benchmark parallel read requires four entity IDs')
+        tasks = [_ParallelReadTask(entity_id, threading.Event()) for entity_id in entity_ids]
+        for work_queue, task in zip(self._queues, tasks, strict=True):
+            work_queue.put(task)
+        for task in tasks:
+            task.complete.wait()
+        error = self._first_error([task.error for task in tasks])
+        if error is not None:
+            raise error
+        return [task.result for task in tasks]
 
 
 class _Operations:
@@ -976,9 +1100,9 @@ class _Operations:
         route_capture: _RouteCapture | None = None,
     ) -> None:
         """Initialize benchmark operation dispatch tables."""
-        self.client = client
-        self.state = state
-        self.route_capture = route_capture
+        self._client = client
+        self._state = state
+        self._route_capture = route_capture
         self._delete_ids: list[int] = []
         self._auth_client: _MeasuredClient | None = None
         self._parallel_runner: _ParallelReadRunner | None = None
@@ -988,29 +1112,18 @@ class _Operations:
 
     def _attach_route_capture(self, client: _MeasuredClient) -> None:
         """Attach the measured operation's observer to one request client."""
-        if self.route_capture is not None:
-            client.config.on_request = self.route_capture
-
-    def _call(self, name: str, invocation: int) -> object:
-        """Dispatch one complete public inventory operation."""
-        return _Operations._callbacks()[name](self, invocation)
-
-    def _close(self) -> None:
-        """Close the prepared parallel-read runner when present."""
-        runner = self._parallel_runner
-        self._parallel_runner = None
-        if runner is not None:
-            runner._close()
+        if self._route_capture is not None:
+            client.config.on_request = self._route_capture
 
     def _create(self, invocation: int) -> object:
         """Create and track one uniquely named entity."""
-        expected = _entity_code(self.state.namespace, f'created-{invocation}')
-        entity = self.state._create(
-            self.client,
+        expected = _entity_code(self._state.namespace, f'created-{invocation}')
+        entity = self._state.create(
+            self._client,
             'Shot',
             {
                 'code': expected,
-                'project': self.state.project,
+                'project': self._state.project,
             },
         )
         return entity, expected
@@ -1018,27 +1131,27 @@ class _Operations:
     def _delete(self, invocation: int) -> object:
         """Delete one prepared unique entity and return its identity for verification."""
         entity_id = self._delete_ids[invocation]
-        deleted = self.client.delete('Shot', entity_id)
+        deleted = self._client.delete('Shot', entity_id)
         return deleted, entity_id
 
     def _download(self, invocation: int) -> object:
         """Download a known generated attachment to an atomic destination."""
-        destination = self.state.work_root / f'download-{invocation}.bin'
-        return self.client.download_attachment(
-            self.state.download_attachment_id,
+        destination = self._state.work_root / f'download-{invocation}.bin'
+        return self._client.download_attachment(
+            self._state.download_attachment_id,
             file_path=str(destination),
         )
 
     def _entity_ids(self) -> list[int]:
         """Return prepared entity identifiers."""
-        return [cast('int', entity['id']) for entity in self.state.entities]
+        return [cast('int', entity['id']) for entity in self._state.entities]
 
-    def _batch(self, invocation: int) -> object:
-        """Update two entities in one batch."""
+    def _batch_update(self, invocation: int, label: str, count: int) -> object:
+        """Update a measured group and track its expected descriptions."""
         expected = [
-            f'{self.state.namespace}-batch-{invocation}-{index}' for index in range(_BATCH_SIZE)
+            f'{self._state.namespace}-{label}-{invocation}-{index}' for index in range(count)
         ]
-        result = self.client.batch(
+        result = self._client.batch(
             [
                 {
                     'request_type': 'update',
@@ -1046,22 +1159,26 @@ class _Operations:
                     'entity_id': self._entity_ids()[index],
                     'data': {'description': expected[index]},
                 }
-                for index in range(_BATCH_SIZE)
+                for index in range(count)
             ]
         )
         for entity_id, value in zip(
-            self._entity_ids()[:_BATCH_SIZE],
+            self._entity_ids()[:count],
             expected,
             strict=True,
         ):
-            self.state.expected_descriptions[entity_id] = value
+            self._state.expected_descriptions[entity_id] = value
         return result, expected
+
+    def _batch(self, invocation: int) -> object:
+        """Update two entities in one batch."""
+        return self._batch_update(invocation, 'batch', _BATCH_SIZE)
 
     def _filters(self) -> list[list[object]]:
         """Return filters restricted to this worker's unique namespace."""
         return [
-            ['project', 'is', self.state.project],
-            ['code', 'starts_with', self.state.namespace],
+            ['project', 'is', self._state.project],
+            ['code', 'starts_with', self._state.namespace],
         ]
 
     def _find_known_on(self, client: _MeasuredClient) -> object:
@@ -1071,17 +1188,17 @@ class _Operations:
     def _auth_first_request(self, invocation: int) -> object:
         """Construct a script-auth client cold, then distinguish its warm request."""
         if invocation == 0:
-            self._auth_client = self.state._client()
+            self._auth_client = self._state.client()
             self._attach_route_capture(self._auth_client)
         return self._find_known_on(cast('_MeasuredClient', self._auth_client))
 
     def _find_known(self) -> object:
         """Read one known prepared entity."""
-        return self._find_known_on(self.client)
+        return self._find_known_on(self._client)
 
     def _find_medium(self, _invocation: int) -> object:
         """Read the medium result set."""
-        return self.client.find(
+        return self._client.find(
             'Shot',
             self._filters(),
             ['code'],
@@ -1096,13 +1213,15 @@ class _Operations:
     def _find_paged(self, _invocation: int) -> object:
         """Read two explicit result pages."""
         order = [{'field_name': 'id', 'direction': 'asc'}]
-        first = self.client.find('Shot', self._filters(), ['code'], order=order, limit=15, page=1)
-        second = self.client.find('Shot', self._filters(), ['code'], order=order, limit=15, page=2)
+        first = self._client.find('Shot', self._filters(), ['code'], order=order, limit=15, page=1)
+        second = self._client.find(
+            'Shot', self._filters(), ['code'], order=order, limit=15, page=2
+        )
         return [*first, *second]
 
     def _find_small(self, _invocation: int) -> object:
         """Read the small result set."""
-        return self.client.find(
+        return self._client.find(
             'Shot',
             self._filters(),
             ['code'],
@@ -1113,19 +1232,19 @@ class _Operations:
     def _matching_shot_count(self) -> int:
         """Return the tracked matching Shot count after measured deletions."""
         return sum(
-            entity_type == 'Shot' and entity_id not in self.state.verified_deleted_shot_ids
-            for entity_type, entity_id in self.state.resources
+            entity_type == 'Shot' and entity_id not in self._state.verified_deleted_shot_ids
+            for entity_type, entity_id in self._state.resources
         )
 
     def _parallel_read(self, _invocation: int) -> object:
         """Read four known entities through the prepared persistent runner."""
         if self._parallel_runner is None:
             raise _BenchmarkError('benchmark parallel read was not prepared')
-        return self._parallel_runner._read(self._entity_ids()[:_PARALLEL_CALLS])
+        return self._parallel_runner.read(self._entity_ids()[:_PARALLEL_CALLS])
 
     def _payload_decode(self, _invocation: int) -> object:
         """Exercise the large public response-decoding path."""
-        return self.client.find(
+        return self._client.find(
             'Shot',
             self._filters(),
             ['code', 'description', 'created_at'],
@@ -1135,63 +1254,23 @@ class _Operations:
 
     def _payload_encode(self, invocation: int) -> object:
         """Exercise the large public request-encoding path."""
-        expected = [
-            f'{self.state.namespace}-payload-{invocation}-{index}'
-            for index in range(_PAYLOAD_BATCH_SIZE)
-        ]
-        result = self.client.batch(
-            [
-                {
-                    'request_type': 'update',
-                    'entity_type': 'Shot',
-                    'entity_id': self._entity_ids()[index],
-                    'data': {'description': expected[index]},
-                }
-                for index in range(_PAYLOAD_BATCH_SIZE)
-            ]
-        )
-        for entity_id, value in zip(
-            self._entity_ids()[:_PAYLOAD_BATCH_SIZE],
-            expected,
-            strict=True,
-        ):
-            self.state.expected_descriptions[entity_id] = value
-        return result, expected
-
-    def _prepare(self, name: str) -> None:
-        """Prepare untimed per-operation resources."""
-        if name == 'parallel_read':
-            shared_client = self.client if self.route_capture is not None else None
-            self._parallel_runner = _ParallelReadRunner(self.state, shared_client)
-            return
-        if name != 'delete':
-            return
-        for invocation in range(_COLD_WARM_INVOCATION_COUNT):
-            target = self.state._create(
-                self.state.clients[0],
-                'Shot',
-                {
-                    'code': _entity_code(self.state.namespace, f'delete-{invocation}'),
-                    'project': self.state.project,
-                },
-            )
-            self._delete_ids.append(cast('int', target['id']))
+        return self._batch_update(invocation, 'payload', _PAYLOAD_BATCH_SIZE)
 
     def _schema_entity_read(self, _invocation: int) -> object:
         """Read the entity schema."""
-        return self.client.schema_entity_read()
+        return self._client.schema_entity_read()
 
     def _schema_field_read(self, _invocation: int) -> object:
         """Read the Shot field schema."""
-        return self.client.schema_field_read('Shot')
+        return self._client.schema_field_read('Shot')
 
     def _session_first_request(self, invocation: int) -> object:
         """Acquire a session, configure a client, and make its first request."""
         if invocation == 0:
-            control = self.state.clients[0]
+            control = self._state.clients[0]
             self._attach_route_capture(control)
             session_token = control.get_session_token()
-            self._session_client = self.state._client(session_token=session_token)
+            self._session_client = self._state.client(session_token=session_token)
             self._attach_route_capture(self._session_client)
         return cast('_MeasuredClient', self._session_client).find_one(
             'Shot',
@@ -1201,7 +1280,7 @@ class _Operations:
 
     def _summarize(self, _invocation: int) -> object:
         """Summarize the unique prepared result set."""
-        return self.client.summarize(
+        return self._client.summarize(
             'Shot',
             self._filters(),
             [{'field': 'id', 'type': 'count'}],
@@ -1210,50 +1289,50 @@ class _Operations:
     def _track_upload(self, attachment: object) -> object:
         """Track one validated attachment identity."""
         if isinstance(attachment, int) and not isinstance(attachment, bool) and attachment > 0:
-            self.state._record_resource('Attachment', attachment)
+            self._state.record_resource('Attachment', attachment)
         return attachment
 
     def _update(self, invocation: int) -> object:
         """Update and return one entity plus its expected value."""
-        expected = f'{self.state.namespace}-updated-{invocation}'
-        result = self.client.update(
+        expected = f'{self._state.namespace}-updated-{invocation}'
+        result = self._client.update(
             'Shot',
             self._entity_ids()[0],
             {'description': expected},
         )
-        self.state.expected_descriptions[self._entity_ids()[0]] = expected
+        self._state.expected_descriptions[self._entity_ids()[0]] = expected
         return result, expected
 
     def _upload_generic(self, invocation: int) -> object:
         """Upload a generic generated file."""
         return self._track_upload(
-            self.client.upload(
+            self._client.upload(
                 'Shot',
                 self._entity_ids()[0],
-                str(self.state.generic_payload),
-                display_name=f'{self.state.namespace}-generic-{invocation}.bin',
+                str(self._state.generic_payload),
+                display_name=f'{self._state.namespace}-generic-{invocation}.bin',
             )
         )
 
     def _upload_version(self, path: Path, label: str, invocation: int) -> object:
         """Upload one generated Version movie and track its attachment."""
         return self._track_upload(
-            self.client.upload(
+            self._client.upload(
                 'Version',
-                cast('int', self.state.version['id']),
+                cast('int', self._state.version['id']),
                 str(path),
                 field_name='sg_uploaded_movie',
-                display_name=f'{self.state.namespace}-{label}-{invocation}.bin',
+                display_name=f'{self._state.namespace}-{label}-{invocation}.bin',
             )
         )
 
     def _upload_direct(self, invocation: int) -> object:
         """Upload a direct-route generated payload."""
-        return self._upload_version(self.state.direct_payload, 'direct', invocation)
+        return self._upload_version(self._state.direct_payload, 'direct', invocation)
 
     def _upload_multipart(self, invocation: int) -> object:
         """Upload a multipart-route generated payload."""
-        return self._upload_version(self.state.multipart_payload, 'multipart', invocation)
+        return self._upload_version(self._state.multipart_payload, 'multipart', invocation)
 
     @staticmethod
     def _verify_batch_result(result: object, expected_size: int) -> bool:
@@ -1274,35 +1353,9 @@ class _Operations:
             return False
         return all(
             isinstance(response, dict)
-            and cast('dict[str, Any]', response).get('description') == value
+            and cast('dict[str, object]', response).get('description') == value
             for response, value in zip(typed_responses, typed_expected, strict=True)
         )
-
-    @staticmethod
-    def _callbacks() -> dict[str, Callable[[_Operations, int], object]]:
-        """Return the explicit latency-operation callback mapping."""
-        return {
-            'auth_first_request': _Operations._auth_first_request,
-            'batch': _Operations._batch,
-            'create': _Operations._create,
-            'delete': _Operations._delete,
-            'download': _Operations._download,
-            'find_medium': _Operations._find_medium,
-            'find_one': _Operations._find_one,
-            'find_paged': _Operations._find_paged,
-            'find_small': _Operations._find_small,
-            'parallel_read': _Operations._parallel_read,
-            'payload_decode': _Operations._payload_decode,
-            'payload_encode': _Operations._payload_encode,
-            'schema_entity_read': _Operations._schema_entity_read,
-            'schema_field_read': _Operations._schema_field_read,
-            'session_first_request': _Operations._session_first_request,
-            'summarize': _Operations._summarize,
-            'update': _Operations._update,
-            'upload_direct': _Operations._upload_direct,
-            'upload_generic': _Operations._upload_generic,
-            'upload_multipart': _Operations._upload_multipart,
-        }
 
     def _verify_created(self, result: object) -> bool:
         """Prove one create result contains its exact requested code."""
@@ -1331,9 +1384,9 @@ class _Operations:
                 return False
         if deleted is not True or not isinstance(entity_id, int) or isinstance(entity_id, bool):
             return False
-        if self.state.clients[0].find_one('Shot', [['id', 'is', entity_id]]) is not None:
+        if self._state.clients[0].find_one('Shot', [['id', 'is', entity_id]]) is not None:
             return False
-        self.state.verified_deleted_shot_ids.add(entity_id)
+        self._state.verified_deleted_shot_ids.add(entity_id)
         return True
 
     def _verify_download(self, result: object) -> bool:
@@ -1341,7 +1394,7 @@ class _Operations:
         if not isinstance(result, str):
             return False
         try:
-            return _file_digest(Path(result)) == _file_digest(self.state.direct_payload)
+            return _file_digest(Path(result)) == _file_digest(self._state.direct_payload)
         except OSError:
             return False
 
@@ -1358,7 +1411,10 @@ class _Operations:
             return False
         expected = {(entity.get('id'), entity.get('code')) for entity in expected_entities}
         actual = {
-            (cast('dict[str, Any]', item).get('id'), cast('dict[str, Any]', item).get('code'))
+            (
+                cast('dict[str, object]', item).get('id'),
+                cast('dict[str, object]', item).get('code'),
+            )
             for item in typed_result
             if isinstance(item, dict)
         }
@@ -1369,7 +1425,7 @@ class _Operations:
         if not isinstance(result, dict):
             return False
         typed_result = cast('dict[str, object]', result)
-        expected = self.state.entities[0]
+        expected = self._state.entities[0]
         return (
             typed_result.get('id') == expected['id']
             and typed_result.get('code') == expected['code']
@@ -1377,11 +1433,11 @@ class _Operations:
 
     def _verify_payload_decode(self, result: object) -> bool:
         """Prove decoded fields preserve exact values and datetime behavior."""
-        if not self._verify_entities(result, self.state.entities):
+        if not self._verify_entities(result, self._state.entities):
             return False
-        typed = cast('list[dict[str, Any]]', result)
+        typed = cast('list[dict[str, object]]', result)
         by_id = {item.get('id'): item for item in typed}
-        for entity in self.state.entities:
+        for entity in self._state.entities:
             entity_id = cast('int', entity['id'])
             item = by_id.get(entity_id)
             if item is None:
@@ -1389,10 +1445,10 @@ class _Operations:
             created_at = item.get('created_at')
             if (
                 not isinstance(created_at, datetime.datetime)
-                or created_at.tzinfo is not self.state.module.sg_timezone.local
+                or created_at.tzinfo is not self._state.module.sg_timezone.local
             ):
                 return False
-            if item.get('description') != self.state.expected_descriptions[entity_id]:
+            if item.get('description') != self._state.expected_descriptions[entity_id]:
                 return False
         return True
 
@@ -1400,10 +1456,10 @@ class _Operations:
         """Prove one summary response contains the exact matching Shot count."""
         if not isinstance(result, dict):
             return False
-        summaries = cast('dict[str, Any]', result).get('summaries')
+        summaries = cast('dict[str, object]', result).get('summaries')
         if not isinstance(summaries, dict):
             return False
-        count = cast('dict[str, Any]', summaries).get('id')
+        count = cast('dict[str, object]', summaries).get('id')
         return (
             isinstance(count, (int, float))
             and not isinstance(count, bool)
@@ -1422,9 +1478,90 @@ class _Operations:
                 return False
         if not isinstance(entity, dict):
             return False
-        return cast('dict[str, Any]', entity).get('description') == expected
+        return cast('dict[str, object]', entity).get('description') == expected
 
-    def _verifiers(self) -> dict[str, Callable[[object], bool]]:
+    def call(self, name: str, invocation: int) -> object:
+        """Dispatch one complete public inventory operation.
+
+        Args:
+            name: Key in the operation callback mapping.
+            invocation: Cold or warm sample index for this operation.
+
+        Returns:
+            The raw operation result for later verification.
+
+        Raises:
+            Exception: If the selected operation fails.
+        """
+        return _Operations.callbacks()[name](self, invocation)
+
+    @staticmethod
+    def callbacks() -> dict[str, Callable[[_Operations, int], object]]:
+        """Return the explicit latency-operation callback mapping."""
+        return {
+            'auth_first_request': _Operations._auth_first_request,
+            'batch': _Operations._batch,
+            'create': _Operations._create,
+            'delete': _Operations._delete,
+            'download': _Operations._download,
+            'find_medium': _Operations._find_medium,
+            'find_one': _Operations._find_one,
+            'find_paged': _Operations._find_paged,
+            'find_small': _Operations._find_small,
+            'parallel_read': _Operations._parallel_read,
+            'payload_decode': _Operations._payload_decode,
+            'payload_encode': _Operations._payload_encode,
+            'schema_entity_read': _Operations._schema_entity_read,
+            'schema_field_read': _Operations._schema_field_read,
+            'session_first_request': _Operations._session_first_request,
+            'summarize': _Operations._summarize,
+            'update': _Operations._update,
+            'upload_direct': _Operations._upload_direct,
+            'upload_generic': _Operations._upload_generic,
+            'upload_multipart': _Operations._upload_multipart,
+        }
+
+    def close(self) -> None:
+        """Close the prepared parallel-read runner when present.
+
+        Raises:
+            Exception: If joining a worker or closing its client fails.
+        """
+        runner = self._parallel_runner
+        self._parallel_runner = None
+        if runner is not None:
+            runner.close()
+
+    def prepare(self, name: str) -> None:
+        """Prepare untimed per-operation resources.
+
+        Args:
+            name: `parallel_read` or `delete`; other operations need no setup.
+
+        Raises:
+            RuntimeError: If a created fixture has an invalid identity or
+                resource journal publication fails.
+            Exception: If worker startup, client initialization, or fixture
+                creation fails.
+        """
+        if name == 'parallel_read':
+            shared_client = self._client if self._route_capture is not None else None
+            self._parallel_runner = _ParallelReadRunner(self._state, shared_client)
+            return
+        if name != 'delete':
+            return
+        for invocation in range(_COLD_WARM_INVOCATION_COUNT):
+            target = self._state.create(
+                self._state.clients[0],
+                'Shot',
+                {
+                    'code': _entity_code(self._state.namespace, f'delete-{invocation}'),
+                    'project': self._state.project,
+                },
+            )
+            self._delete_ids.append(cast('int', target['id']))
+
+    def verifiers(self) -> dict[str, Callable[[object], bool]]:
         """Return the explicit latency-operation verifier mapping."""
         return {
             'auth_first_request': self._verify_known_entity,
@@ -1432,12 +1569,12 @@ class _Operations:
             'create': self._verify_created,
             'delete': self._verify_deleted,
             'download': self._verify_download,
-            'find_medium': lambda value: self._verify_entities(value, self.state.entities[:20]),
+            'find_medium': lambda value: self._verify_entities(value, self._state.entities[:20]),
             'find_one': self._verify_known_entity,
-            'find_paged': lambda value: self._verify_entities(value, self.state.entities),
-            'find_small': lambda value: self._verify_entities(value, self.state.entities[:3]),
+            'find_paged': lambda value: self._verify_entities(value, self._state.entities),
+            'find_small': lambda value: self._verify_entities(value, self._state.entities[:3]),
             'parallel_read': lambda value: self._verify_entities(
-                value, self.state.entities[:_PARALLEL_CALLS]
+                value, self._state.entities[:_PARALLEL_CALLS]
             ),
             'payload_decode': self._verify_payload_decode,
             'payload_encode': lambda value: self._verify_batch_result(value, _PAYLOAD_BATCH_SIZE),
@@ -1447,40 +1584,51 @@ class _Operations:
             'summarize': self._verify_summarize,
             'update': self._verify_update,
             'upload_direct': lambda value: _verify_attachment(
-                self.state,
+                self._state,
                 value,
                 _AttachmentExpectation(
                     'sg_uploaded_movie',
-                    cast('int', self.state.version['id']),
+                    cast('int', self._state.version['id']),
                     'Version',
-                    self.state.direct_payload,
+                    self._state.direct_payload,
                 ),
             ),
             'upload_generic': lambda value: _verify_attachment(
-                self.state,
+                self._state,
                 value,
                 _AttachmentExpectation(
                     None,
                     self._entity_ids()[0],
                     'Shot',
-                    self.state.generic_payload,
+                    self._state.generic_payload,
                 ),
             ),
             'upload_multipart': lambda value: _verify_attachment(
-                self.state,
+                self._state,
                 value,
                 _AttachmentExpectation(
                     'sg_uploaded_movie',
-                    cast('int', self.state.version['id']),
+                    cast('int', self._state.version['id']),
                     'Version',
-                    self.state.multipart_payload,
+                    self._state.multipart_payload,
                 ),
             ),
         }
 
-    def _verify_result(self, name: str, result: object) -> bool:
-        """Dispatch one operation's correctness proof."""
-        return self._verifiers()[name](result)
+    def verify_result(self, name: str, result: object) -> bool:
+        """Dispatch one operation's correctness proof.
+
+        Args:
+            name: Key in the operation verifier mapping.
+            result: Raw result returned by the selected operation.
+
+        Returns:
+            Whether the result satisfies the selected operation's contract.
+
+        Raises:
+            Exception: If a verification query or file operation fails.
+        """
+        return self.verifiers()[name](result)
 
 
 class _WorkerFailureError(_BenchmarkError):
@@ -1697,6 +1845,17 @@ def _cleanup_resources(
         if unverifiable:
             parts.append(f'{unverifiable} unverifiable identity')
         raise _CleanupError('benchmark cleanup failed: ' + ', '.join(parts))
+
+
+def _project_by_name(client: _CleanupClient, name: object) -> dict[str, object]:
+    """Resolve one project by name and require an integer identity."""
+    project = client.find_one('Project', [['name', 'is', name]], ['name'])
+    if not isinstance(project, dict):
+        raise _CorrectnessError('benchmark project lookup failed')
+    typed_project = cast('dict[str, object]', project)
+    if not isinstance(typed_project.get('id'), int):
+        raise _CorrectnessError('benchmark project lookup failed')
+    return typed_project
 
 
 def _raise_operation_errors(
@@ -2016,7 +2175,7 @@ def _validate_operation_metadata() -> None:
     """Require every operation metadata class to match the benchmark inventory."""
     latency_operations = set(_LATENCY_OPERATIONS)
     for metadata_class, operation_keys in (
-        ('callbacks', set(_Operations._callbacks())),
+        ('callbacks', set(_Operations.callbacks())),
         ('categories', set(_OPERATION_CATEGORIES)),
     ):
         mismatch = sorted(latency_operations ^ operation_keys)
@@ -2040,7 +2199,7 @@ def _validate_operation_metadata() -> None:
 
 def _validate_operation_verifiers(operations: _Operations) -> None:
     """Check bound verifier keys against the independent operation inventory."""
-    mismatch = sorted(_VERIFIER_OPERATION_KEYS ^ set(operations._verifiers()))
+    mismatch = sorted(_VERIFIER_OPERATION_KEYS ^ set(operations.verifiers()))
     if mismatch:
         raise _BenchmarkError(f'Benchmark operation metadata mismatch: verifiers: {mismatch[0]}')
 
@@ -2275,8 +2434,17 @@ def _verify_loaded_client(module: object, expected_root: Path, expected_version:
     origin = getattr(module, '__file__', None)
     if not isinstance(origin, str):
         raise _BenchmarkError('Loaded client module has no filesystem origin')
-    _validate_module_origin(Path(origin), expected_root)
-    if getattr(module, '__version__', None) != expected_version:
+    resolved = _validate_module_origin(Path(origin), expected_root)
+    # An installed client's __version__ reports its compatibility target, so its
+    # distribution names the release. A source checkout has no distribution record.
+    installed = [
+        distribution.version
+        for distribution in importlib.metadata.distributions(
+            name=_DISTRIBUTION_NAME, path=[str(resolved.parents[1])]
+        )
+    ]
+    version = installed[0] if len(installed) == 1 else getattr(module, '__version__', None)
+    if version != expected_version:
         raise _BenchmarkError('Loaded client version does not match the required version')
 
 
@@ -2546,21 +2714,11 @@ def _cleanup_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, 
     state = _LiveState(module, config)
 
     def work() -> dict[str, str]:
-        control = state._client()
-        project = control.find_one(
-            'Project',
-            [['name', 'is', config['project']]],
-            ['name'],
-        )
-        if not isinstance(project, dict):
-            raise _CorrectnessError('benchmark project lookup failed')
-        typed_project = cast('dict[str, object]', project)
-        if not isinstance(typed_project.get('id'), int):
-            raise _CorrectnessError('benchmark project lookup failed')
-        state.project = cast('dict[str, Any]', project)
+        control = state.client()
+        state.project = _project_by_name(control, config['project'])
         return {'cleanup': 'PASS'}
 
-    return _run_with_cleanup(work, state._cleanup)
+    return _run_with_cleanup(work, state.cleanup)
 
 
 def _latency_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -2568,31 +2726,31 @@ def _latency_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, 
     state = _LiveState(module, config)
 
     def work() -> dict[str, Any]:
-        state._prepare()
+        state.prepare()
         operations: dict[str, Any] = {}
         for name in _LATENCY_OPERATIONS:
-            client = state._client()
+            client = state.client()
             capture = _RouteCapture()
             ours = config['client'] == 'ours'
             runner = _Operations(client, state, capture) if ours else _Operations(client, state)
             samples: list[float] = []
             measurement_capture = _FailureCapture()
             with measurement_capture:
-                runner._prepare(name)
+                runner.prepare(name)
                 for invocation in range(_COLD_WARM_INVOCATION_COUNT):
                     _measure_verified(
                         name,
-                        lambda invocation=invocation, runner=runner, name=name: runner._call(
+                        lambda invocation=invocation, runner=runner, name=name: runner.call(
                             name, invocation
                         ),
-                        lambda result, runner=runner, name=name: runner._verify_result(
+                        lambda result, runner=runner, name=name: runner.verify_result(
                             name, result
                         ),
                         samples,
                     )
             runner_close_capture = _FailureCapture()
             with runner_close_capture:
-                runner._close()
+                runner.close()
             client_close_capture = _FailureCapture()
             with client_close_capture:
                 client.close()
@@ -2619,7 +2777,7 @@ def _latency_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, 
             }
         return {'client': config['client'], 'operations': operations, 'rss': {}}
 
-    return _run_with_cleanup(work, state._cleanup)
+    return _run_with_cleanup(work, state.cleanup)
 
 
 def _rss_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -2631,8 +2789,8 @@ def _rss_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, Any]
 
     def work() -> dict[str, Any]:
         if name == 'rss_upload':
-            state._prepare_rss(name)
-        client = state._client()
+            state.prepare_rss(name)
+        client = state.client()
         capture = _RouteCapture()
         if config['client'] == 'ours':
             client.config.on_request = capture
@@ -2648,7 +2806,7 @@ def _rss_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, Any]
             )
             peak_raw = resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss
             if isinstance(result, int) and not isinstance(result, bool):
-                state._record_resource('Attachment', result)
+                state.record_resource('Attachment', result)
             correct = _verify_attachment(
                 state,
                 result,
@@ -2699,7 +2857,7 @@ def _rss_worker(module: ModuleType, config: Mapping[str, Any]) -> dict[str, Any]
             },
         }
 
-    cleanup = state._cleanup if name == 'rss_upload' else state._cleanup_clients
+    cleanup = state.cleanup if name == 'rss_upload' else state.cleanup_clients
     return _run_with_cleanup(work, cleanup)
 
 
@@ -2710,17 +2868,23 @@ def _workload_budget(sample_count: int) -> dict[str, int]:
             f'Benchmark workload budget exceeds {_MAX_SAMPLE_COUNT} paired rounds'
         )
     client_rounds = sample_count * len(_CLIENTS)
-    latency_resources = _ENTITY_COUNT + 1 + 1 + 2 + 2 + (3 * 2)
-    rss_resources = 4
+    latency_resources = (
+        _ENTITY_COUNT
+        + _LATENCY_SETUP_RESOURCE_COUNT
+        + len(_LATENCY_RESOURCE_OPERATIONS) * _COLD_WARM_INVOCATION_COUNT
+    )
+    rss_resources = len(_RSS_OPERATIONS) * _RSS_RESOURCES_PER_OPERATION
     upload_bytes = (
         _DIRECT_PAYLOAD_BYTES
-        + 2 * (_GENERIC_PAYLOAD_BYTES + _DIRECT_PAYLOAD_BYTES + _LARGE_PAYLOAD_BYTES)
-        + 2 * _LARGE_PAYLOAD_BYTES
+        + _COLD_WARM_INVOCATION_COUNT
+        * (_GENERIC_PAYLOAD_BYTES + _DIRECT_PAYLOAD_BYTES + _LARGE_PAYLOAD_BYTES)
+        + len(_RSS_OPERATIONS) * _LARGE_PAYLOAD_BYTES
     )
     return {
         'created_entities': client_rounds * (latency_resources + rss_resources),
         'upload_bytes': client_rounds * upload_bytes,
-        'workers': len(_CLIENTS) + client_rounds * (2 + len(_RSS_OPERATIONS)),
+        'workers': len(_CLIENTS)
+        + client_rounds * (1 + len(_RSS_OPERATIONS) + _WORKER_RECOVERY_ALLOWANCE),
     }
 
 
@@ -2847,6 +3011,8 @@ def _report_header_lines(
     seed: int,
 ) -> list[str]:
     """Return benchmark report evidence and methodology lines."""
+    default_budget = _workload_budget(_DEFAULT_SAMPLE_COUNT)
+    ceiling_budget = _workload_budget(_MAX_SAMPLE_COUNT)
     return [
         '# Benchmarks',
         '',
@@ -2890,10 +3056,21 @@ def _report_header_lines(
                 'After any live worker failure, a fresh serial worker recovers',
                 'journaled resources and verifies the benchmark namespace.',
                 'Cleanup failure or timeout blocks report',
-                'publication. At the default 2 paired rounds, the workload budget is 18 worker',
-                'processes, 184 server entities, and 332,032,784 uploaded bytes. At the',
-                '`BENCH_N=20` hard ceiling, the budget is 162 worker processes, 1,840 server',
-                'entities, and 3,320,327,840 uploaded bytes.',
+                (
+                    'publication. At the default '
+                    f'{_DEFAULT_SAMPLE_COUNT} paired rounds, the workload budget is '
+                    f'{default_budget["workers"]} worker'
+                ),
+                (
+                    f'processes, {default_budget["created_entities"]:,} server entities, and '
+                    f'{default_budget["upload_bytes"]:,} uploaded bytes. At the'
+                ),
+                (
+                    f'`BENCH_N={_MAX_SAMPLE_COUNT}` hard ceiling, the budget is '
+                    f'{ceiling_budget["workers"]} worker processes, '
+                    f'{ceiling_budget["created_entities"]:,} server'
+                ),
+                f'entities, and {ceiling_budget["upload_bytes"]:,} uploaded bytes.',
                 'RSS download uses a fresh download-only',
                 'process after setup. A larger even `BENCH_N` up to 20 remains an explicit',
                 'publication choice.',
@@ -3050,14 +3227,14 @@ def _recover_worker(
     config_path = root / f'cleanup-{sequence}.json'
     recovery_capture = _FailureCapture()
     with recovery_capture:
-        _ResourceJournal._load(root)
+        _ResourceJournal.load(root)
         cleanup_config = {field: config[field] for field in _WORKER_BASE_FIELDS}
         cleanup_config['mode'] = 'cleanup'
         _write_worker_config(config_path, cleanup_config)
         result = _launch_worker(config_path, root)
         if result != {'cleanup': 'PASS'}:
             raise _CleanupError('benchmark worker recovery failed')
-        if _ResourceJournal._load(root)._resources:
+        if _ResourceJournal.load(root).resources:
             raise _CleanupError('benchmark worker recovery failed')
     removal_capture = _FailureCapture()
     with removal_capture:
@@ -3081,7 +3258,7 @@ def _launch_configured_worker(
     config_path = root / f'worker-{sequence}.json'
     live_worker = config.get('mode') in _WORKER_MODES - {'cleanup', 'preflight'}
     if live_worker:
-        _ResourceJournal._create(root)
+        _ResourceJournal.create(root)
     _write_worker_config(config_path, config)
 
     def work() -> dict[str, Any]:
@@ -3096,8 +3273,8 @@ def _launch_configured_worker(
         journal_capture = _FailureCapture()
         journal: _ResourceJournal | None = None
         with journal_capture:
-            journal = _ResourceJournal._load(root)
-        journal_nonempty = journal is not None and bool(journal._resources)
+            journal = _ResourceJournal.load(root)
+        journal_nonempty = journal is not None and bool(journal.resources)
         recovery_capture = _FailureCapture()
         with recovery_capture:
             if (
@@ -3145,60 +3322,60 @@ def _controller(repo_root: Path) -> int:
         }
         rounds: dict[str, list[dict[str, Any]]] = {'official': [], 'ours': []}
         sequence = 0
+
+        def launch_worker_for(
+            location: _ClientLocation,
+            directory_name: str,
+            namespace: str,
+            round_number: int,
+            overrides: dict[str, object],
+        ) -> dict[str, Any]:
+            nonlocal sequence
+            worker_root = root / directory_name
+            worker_root.mkdir()
+            config = _worker_base_config(
+                location=location,
+                namespace=namespace,
+                round_number=round_number,
+                work_root=worker_root,
+            )
+            config.update(overrides)
+            result = _launch_configured_worker(config, worker_root, sequence)
+            sequence += 1
+            return result
+
         for client_name in _CLIENTS:
             location = client_configs[client_name]
-            preflight_root = root / f'preflight-{client_name}'
-            preflight_root.mkdir()
-            base = _worker_base_config(
-                location=location,
-                namespace=f'preflight-{client_name}',
-                round_number=0,
-                work_root=preflight_root,
+            preflight = launch_worker_for(
+                location,
+                f'preflight-{client_name}',
+                f'preflight-{client_name}',
+                0,
+                {'mode': 'preflight'},
             )
-            preflight = _launch_configured_worker(
-                {**base, 'mode': 'preflight'},
-                preflight_root,
-                sequence,
-            )
-            sequence += 1
             _validate_preflight_result(preflight, location)
         for round_number, order in enumerate(orders):
             for client_name in order:
                 location = client_configs[client_name]
-                worker_root = root / f'{round_number}-{client_name}'
-                worker_root.mkdir()
-                base = _worker_base_config(
-                    location=location,
-                    namespace=_new_namespace(client_name, round_number),
-                    round_number=round_number,
-                    work_root=worker_root,
+                latency = launch_worker_for(
+                    location,
+                    f'{round_number}-{client_name}',
+                    _new_namespace(client_name, round_number),
+                    round_number,
+                    {'mode': 'latency'},
                 )
-                latency = _launch_configured_worker(
-                    {**base, 'mode': 'latency'}, worker_root, sequence
-                )
-                sequence += 1
                 combined = latency
                 for rss_name in _RSS_OPERATIONS:
-                    rss_root = root / f'{round_number}-{client_name}-{rss_name}'
-                    rss_root.mkdir()
-                    rss_base = _worker_base_config(
-                        location=location,
-                        namespace=_new_namespace(client_name, round_number),
-                        round_number=round_number,
-                        work_root=rss_root,
-                    )
-                    rss_result = _launch_configured_worker(
+                    rss_result = launch_worker_for(
+                        location,
+                        f'{round_number}-{client_name}-{rss_name}',
+                        _new_namespace(client_name, round_number),
+                        round_number,
                         {
-                            **rss_base,
-                            'mode': (
-                                'rss_download_setup' if rss_name == 'rss_download' else 'rss'
-                            ),
+                            'mode': 'rss_download_setup' if rss_name == 'rss_download' else 'rss',
                             'rss_operation': rss_name,
                         },
-                        rss_root,
-                        sequence,
                     )
-                    sequence += 1
                     combined['rss'].update(rss_result['rss'])
                 _validate_round_result(combined)
                 rounds[client_name].append(combined)
@@ -3216,7 +3393,7 @@ def _rss_download_setup_worker(
     state = _LiveState(module, config)
 
     def work() -> dict[str, Any]:
-        state._prepare_rss('rss_download')
+        state.prepare_rss('rss_download')
         measured_root = state.work_root / 'rss-download-worker'
         measured_root.mkdir()
         measured_config: dict[str, object] = {
@@ -3229,7 +3406,7 @@ def _rss_download_setup_worker(
         }
         return _launch_configured_worker(measured_config, measured_root, 0)
 
-    return _run_with_cleanup(work, state._cleanup)
+    return _run_with_cleanup(work, state.cleanup)
 
 
 def _worker_result(config_path: Path) -> dict[str, Any]:
@@ -3273,15 +3450,8 @@ def _worker(config_path: Path) -> NoReturn:
     raise SystemExit(0)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the benchmark harness.
-
-    Args:
-        argv: Optional command arguments.
-
-    Returns:
-        Process exit status.
-    """
+def _main(argv: Sequence[str] | None = None) -> int:
+    """Run the benchmark harness."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--worker', type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
@@ -3296,7 +3466,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == '__main__':
     try:
-        raise SystemExit(main())
+        raise SystemExit(_main())
     except _BenchmarkError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1) from None

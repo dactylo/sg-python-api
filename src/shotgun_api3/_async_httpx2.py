@@ -3,14 +3,15 @@
 import asyncio
 import dataclasses
 import ssl
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import suppress
 from http.cookiejar import CookieJar, DefaultCookiePolicy
-from typing import Self, cast
+from typing import Self, TypedDict, cast
 
 import httpx2
 
-from ._async_transport import AsyncStreamingResponse
+from ._async_transport import AsyncStreamingResponse, AsyncUploadObserver
+from ._connections import SocketOption, keepalive_socket_options, tune_socket
 from ._transport import (
     CaseInsensitiveHeaders,
     ConnectError,
@@ -37,12 +38,15 @@ class Httpx2Transport:
     closes the transport.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         ca_certs: str | None = None,
         proxy_url: str | None = None,
         proxy_headers: dict[str, str] | None = None,
         pool_maxsize: int = 10,
+        *,
+        max_connection_idle_secs: float | None = 60.0,
+        tcp_keepalive_timeout_secs: int | None = 60,
     ) -> None:
         """Initialize one shared async HTTP transport.
 
@@ -51,6 +55,14 @@ class Httpx2Transport:
             proxy_url: Optional proxy URL.
             proxy_headers: Optional headers sent to the proxy.
             pool_maxsize: Maximum concurrent and keep-alive connections.
+            max_connection_idle_secs: Validated idle limit in seconds, or
+                `None` to disable expiry.
+            tcp_keepalive_timeout_secs: Validated nominal keepalive target in
+                seconds, or `None` to leave sockets untuned.
+
+        Raises:
+            OSError: If the certificate-authority bundle cannot be read or
+                loaded into the SSL context.
         """
         verify: ssl.SSLContext | bool = True
         if ca_certs is not None:
@@ -66,9 +78,14 @@ class Httpx2Transport:
             limits=httpx2.Limits(
                 max_connections=pool_maxsize,
                 max_keepalive_connections=pool_maxsize,
+                keepalive_expiry=max_connection_idle_secs,
             ),
             timeout=None,
         )
+        self._request_options: _TraceRequestOptions = {}
+        if tcp_keepalive_timeout_secs is not None:
+            options = keepalive_socket_options(tcp_keepalive_timeout_secs)
+            self._request_options['extensions'] = {'trace': _keepalive_trace(options)}
         self._active = 0
         self._body_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -121,18 +138,12 @@ class Httpx2Transport:
     async def _open_stream(
         self,
         request: httpx2.Request,
-        deadline: float | None,
     ) -> httpx2.Response:
-        """Send through the response-header phase under the total deadline."""
+        """Send through the response-header phase and map backend errors."""
         try:
-            if deadline is None:
-                return await self._client.send(request, stream=True)
-            async with asyncio.timeout_at(deadline):
-                return await self._client.send(request, stream=True)
+            return await self._client.send(request, stream=True)
         except TimeoutError as error:
-            if deadline is None:
-                raise SendError(str(error)) from error
-            raise ReadTimeoutError('total timeout exceeded before response body') from error
+            raise SendError(str(error)) from error
         except (httpx2.HTTPError, httpx2.StreamError) as error:
             raise _map_httpx2_error(error) from error
 
@@ -219,6 +230,7 @@ class Httpx2Transport:
                 headers=request.headers,
                 content=body,
                 timeout=_to_httpx2_timeout(request.timeout),
+                **self._request_options,
             )
         except BaseException:
             self._retain_body_cleanup(body)
@@ -258,7 +270,8 @@ class Httpx2Transport:
 
         Raises:
             TransportError: If the current task owns a lease whose release
-                would depend on this call returning.
+                would depend on this call returning, or backend pool cleanup
+                fails.
         """
         owner = _current_task()
         if self._has_lease(owner) or self._stream_owners.get(owner, 0) > 0:
@@ -295,22 +308,13 @@ class Httpx2Transport:
             TransportError: If httpx2 cannot complete the request.
         """
         self._require_send_available(_current_task())
-        total = request.timeout.total
-        if total is None:
-            try:
-                return await self._send_once(request)
-            except (httpx2.HTTPError, httpx2.StreamError) as error:
-                raise _map_httpx2_error(error) from error
         try:
-            async with asyncio.timeout(request.timeout.total):
-                return await self._send_once(request)
-        except TimeoutError as error:
-            raise ReadTimeoutError('total timeout exceeded') from error
+            return await self._send_once(request)
         except (httpx2.HTTPError, httpx2.StreamError) as error:
             raise _map_httpx2_error(error) from error
 
     async def send_streaming(self, request: TransportRequest) -> AsyncStreamingResponse:
-        """Send one request and stream its body under one total deadline.
+        """Send one request and stream its body.
 
         Args:
             request: Request expressed in shared transport types.
@@ -319,13 +323,10 @@ class Httpx2Transport:
             A single-use streaming response in shared transport types.
 
         Raises:
-            TransportError: If the request, response, or total deadline fails.
+            TransportError: If the request or response fails.
         """
         current_task = _current_task()
         self._require_send_available(current_task)
-        deadline = None
-        if request.timeout.total is not None:
-            deadline = asyncio.get_running_loop().time() + request.timeout.total
         body = _adapt_body(request.body)
         try:
             outgoing = self._client.build_request(
@@ -334,6 +335,7 @@ class Httpx2Transport:
                 headers=request.headers,
                 content=body,
                 timeout=_to_httpx2_timeout(request.timeout),
+                **self._request_options,
             )
         except (httpx2.HTTPError, httpx2.StreamError) as error:
             self._retain_body_cleanup(body)
@@ -344,7 +346,7 @@ class Httpx2Transport:
 
         owner = self._begin_stream()
         try:
-            response = await self._open_stream(outgoing, deadline)
+            response = await self._open_stream(outgoing)
         except BaseException:
             self._retain_body_cleanup(body)
             self._release_stream(owner)
@@ -359,7 +361,6 @@ class Httpx2Transport:
 
         body_owner = _ResponseBody(
             response,
-            deadline,
             lambda: self._release_stream(owner),
             lambda task: self._reserve_stream_task(task, owner),
         )
@@ -387,12 +388,10 @@ class _ResponseBody:
     def __init__(
         self,
         response: httpx2.Response,
-        deadline: float | None,
         release: Callable[[], None],
         reserve: Callable[[asyncio.Task[object]], None],
     ) -> None:
-        """Initialize one deadline-aware async response body."""
-        self._deadline = deadline
+        """Initialize one async response body."""
         self._pending: asyncio.Task[bytes] | None = None
         self._release = release
         self._reserve = reserve
@@ -429,7 +428,7 @@ class _ResponseBody:
         """Run one retained response pull behind a shielded consumer wait."""
         if self._pending is not None:
             raise TransportError('async response already has an active pull')
-        pull = asyncio.create_task(_next_response_chunk(iterator, self._deadline))
+        pull = asyncio.create_task(_next_response_chunk(iterator))
         self._pending = pull
         try:
             self._reserve(pull)
@@ -452,7 +451,14 @@ class _ResponseBody:
                 self._pending = None
 
     async def close(self) -> None:
-        """Wait for cleanup unless the calling task is cancelling."""
+        """Wait for cleanup unless the calling task is cancelling.
+
+        An already-cancelling caller leaves the retained cleanup task running
+        without waiting for it.
+
+        Raises:
+            TransportError: If awaited backend response cleanup fails.
+        """
         cleanup = self._start()
         current = asyncio.current_task()
         if current is not None and current.cancelling():
@@ -460,7 +466,7 @@ class _ResponseBody:
         await asyncio.shield(cleanup)
 
     async def stream(self, size: int) -> AsyncIterator[bytes]:
-        """Yield mapped, deadline-aware response chunks.
+        """Yield response chunks with mapped backend errors.
 
         Args:
             size: Maximum preferred chunk size in bytes.
@@ -469,7 +475,7 @@ class _ResponseBody:
             Response body chunks.
 
         Raises:
-            TransportError: If reading the response stream fails.
+            TransportError: If reading or closing the response stream fails.
         """
         try:
             iterator = self._response.aiter_bytes(size)
@@ -505,7 +511,7 @@ class _ThreadedBody(AsyncIterator[bytes]):
             try:
                 pulled = await asyncio.shield(pull)
             except asyncio.CancelledError:
-                self._start_close()
+                self.start_close()
                 raise
             except Exception as error:
                 raise SendError(str(error)) from error
@@ -528,7 +534,7 @@ class _ThreadedBody(AsyncIterator[bytes]):
                 await asyncio.shield(pending)
         await _close_body(self._chunks)
 
-    def _start_close(self) -> asyncio.Task[None]:
+    def start_close(self) -> asyncio.Task[None]:
         """Start idempotent cleanup and retain its task."""
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._finish_close())
@@ -536,12 +542,25 @@ class _ThreadedBody(AsyncIterator[bytes]):
         return self._close_task
 
     async def aclose(self) -> None:
-        """Close the underlying iterator exactly once and off-loop."""
-        close_task = self._start_close()
+        """Close the underlying iterator exactly once and off-loop.
+
+        An already-cancelling caller leaves the retained cleanup task running
+        without waiting for it.
+
+        Raises:
+            SendError: If awaited iterator cleanup fails.
+        """
+        close_task = self.start_close()
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             return
         await asyncio.shield(close_task)
+
+
+class _TraceRequestOptions(TypedDict, total=False):
+    """Omit the trace extension entirely when socket tuning is disabled."""
+
+    extensions: dict[str, Callable[[str, Mapping[str, object]], Awaitable[None]]]
 
 
 def _adapt_body(
@@ -595,6 +614,24 @@ def _is_tls_failure(error: BaseException) -> bool:
     return False
 
 
+def _keepalive_trace(
+    options: tuple[SocketOption, ...],
+) -> Callable[[str, Mapping[str, object]], Awaitable[None]]:
+    """Tune the socket exposed by each completed TCP connection trace event."""
+
+    async def trace(event: str, info: Mapping[str, object]) -> None:
+        if event != 'connection.connect_tcp.complete':
+            return
+        get_extra_info = getattr(info['return_value'], 'get_extra_info', None)
+        if get_extra_info is None:
+            return
+        sock = get_extra_info('socket')
+        if sock is not None:
+            tune_socket(sock, options)
+
+    return trace
+
+
 def _map_httpx2_error(error: httpx2.HTTPError | httpx2.StreamError) -> TransportError:
     """Map an httpx2 failure into the shared transport vocabulary."""
     if isinstance(error, httpx2.ProxyError):
@@ -604,38 +641,34 @@ def _map_httpx2_error(error: httpx2.HTTPError | httpx2.StreamError) -> Transport
             return TLSError(str(error))
         return ConnectError(str(error))
     if isinstance(error, httpx2.PoolTimeout):
-        return ConnectError(str(error))
+        return ConnectError(str(error) or 'timed out waiting for a connection from the pool')
     if isinstance(error, httpx2.ReadTimeout):
         return ReadTimeoutError(str(error))
     return SendError(str(error))
 
 
 def _next_chunk(chunks: Iterator[bytes]) -> _PulledChunk:
-    """Pull one chunk and capture an exact-name loop observer when supported."""
-    pull_for_async = getattr(chunks, 'pull_for_async', None)
-    observe_async_chunk = getattr(chunks, 'observe_async_chunk', None)
-    if callable(pull_for_async) and callable(observe_async_chunk):
+    """Pull one chunk and capture its event-loop observer when supported."""
+    if (
+        isinstance(chunks, AsyncUploadObserver)
+        and callable(chunks.pull_for_async)
+        and callable(chunks.observe_async_chunk)
+    ):
         return _PulledChunk(
-            chunk=cast('Callable[[], bytes | None]', pull_for_async)(),
-            observe=cast('Callable[[bytes], None]', observe_async_chunk),
+            chunk=chunks.pull_for_async(),
+            observe=chunks.observe_async_chunk,
         )
     return _PulledChunk(chunk=next(chunks, None), observe=None)
 
 
 async def _next_response_chunk(
     iterator: AsyncIterator[bytes],
-    deadline: float | None,
 ) -> bytes:
-    """Read one response chunk against the remaining total budget."""
+    """Read one response chunk and map backend errors."""
     try:
-        if deadline is None:
-            return await anext(iterator)
-        async with asyncio.timeout_at(deadline):
-            return await anext(iterator)
+        return await anext(iterator)
     except TimeoutError as error:
-        if deadline is None:
-            raise SendError(str(error)) from error
-        raise ReadTimeoutError('total timeout exceeded during response body') from error
+        raise SendError(str(error)) from error
     except (httpx2.HTTPError, httpx2.StreamError) as error:
         current = asyncio.current_task()
         if current is not None and current.cancelling():
@@ -648,7 +681,7 @@ def _start_adapted_body_cleanup(
 ) -> asyncio.Task[None] | None:
     """Start and return request-body cleanup without delaying an error path."""
     if isinstance(body, _ThreadedBody):
-        return body._start_close()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        return body.start_close()
     return None
 
 

@@ -8,21 +8,21 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 import shotgun_api3
-from tests.live.test_async import (
-    _AsyncLiveResources,
-    _finalize_live_test,
-    _live_configuration,
-    _new_run_namespace,
-    _resolve_project,
+from tests.live._async_resources import (
+    AsyncLiveResources,
+    finalize_live_test,
+    live_configuration,
+    new_run_namespace,
+    resolve_project,
 )
-from tests.live.test_roundtrip import _png
+from tests.live._images import png
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
     from pathlib import Path
 
     from shotgun_api3 import AsyncShotgun, Shotgun
-    from tests.live.conftest import _LiveResources
+    from tests.live.conftest import LiveResources
 
 pytestmark = pytest.mark.live
 
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.live
 class _AsyncCase:
     client: AsyncShotgun
     project: dict[str, object]
-    resources: _AsyncLiveResources
+    resources: AsyncLiveResources
     namespace: str
 
 
@@ -108,7 +108,7 @@ def _navigation_arguments(expanded: dict[str, object]) -> tuple[str, str]:
 
 @pytest.fixture
 async def async_method_case(request: pytest.FixtureRequest) -> AsyncGenerator[_AsyncCase]:
-    configuration = _live_configuration(request)
+    configuration = live_configuration(request)
     client = shotgun_api3.AsyncShotgun(
         configuration.site,
         script_name=configuration.script_name,
@@ -117,12 +117,12 @@ async def async_method_case(request: pytest.FixtureRequest) -> AsyncGenerator[_A
     )
     resources = None
     try:
-        project = await _resolve_project(client, request, configuration.project_name)
-        namespace = _new_run_namespace()
-        resources = _AsyncLiveResources(client, project, namespace)
+        project = await resolve_project(client, request, configuration.project_name)
+        namespace = new_run_namespace()
+        resources = AsyncLiveResources(client, project, namespace)
         yield _AsyncCase(client, project, resources, namespace)
     finally:
-        await _finalize_live_test(resources, client, None)
+        await finalize_live_test(resources, client, None)
 
 
 @pytest.fixture
@@ -141,7 +141,7 @@ async def test_async_export_page_returns_csv(
     request: pytest.FixtureRequest,
     live_export_page: int,
 ) -> None:
-    configuration = _live_configuration(request)
+    configuration = live_configuration(request)
     async with shotgun_api3.AsyncShotgun(
         configuration.site,
         script_name=configuration.script_name,
@@ -201,7 +201,7 @@ async def test_async_thumbnail_sharing_from_file_and_ready_source(
 ) -> None:
     case = async_method_case
     image = tmp_path / f'{case.namespace}-shared-thumbnail.png'
-    await asyncio.to_thread(image.write_bytes, _png(64, 64))
+    await asyncio.to_thread(image.write_bytes, png(64, 64))
     entities: list[dict[str, object]] = []
     for index in range(3):
         entity = await case.client.create(
@@ -240,7 +240,7 @@ def test_export_page_returns_csv(live_sg: Shotgun, live_export_page: int) -> Non
 def test_navigation_search_matches_asset(
     live_sg: Shotgun,
     live_project: dict[str, object],
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
     live_namespace: str,
     method: str,
 ) -> None:
@@ -260,7 +260,7 @@ def test_navigation_search_matches_asset(
 def test_note_thread_returns_reply_and_selected_fields(
     live_sg: Shotgun,
     live_project: dict[str, object],
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
     live_namespace: str,
 ) -> None:
     note = live_resources.create(
@@ -279,12 +279,12 @@ def test_note_thread_returns_reply_and_selected_fields(
 def test_thumbnail_sharing_from_file_and_ready_source(
     live_sg: Shotgun,
     live_project: dict[str, object],
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
     live_namespace: str,
     tmp_path: Path,
 ) -> None:
     image = tmp_path / f'{live_namespace}-shared-thumbnail.png'
-    image.write_bytes(_png(64, 64))
+    image.write_bytes(png(64, 64))
     entities = [
         live_resources.create(
             'Asset', {'project': live_project, 'code': f'{live_namespace}-sharing-{index}'}

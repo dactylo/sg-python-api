@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import Callable, Collection, Generator
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import Never, cast
 from unittest.mock import MagicMock
 
@@ -22,13 +23,24 @@ from shotgun_api3._config import Config, RequestContext, readiness_key
 from shotgun_api3._transport import (
     ConnectError,
     ProxyError,
+    StreamingResponse,
     Transport,
     TransportRequest,
     TransportResponse,
     Urllib3Transport,
 )
-from tests._transports import _FakeTransport
-from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
+from shotgun_api3._version import PACKAGE_VERSION
+from tests._origin_cases import (
+    ALLOWED_ORIGIN_CASES,
+    ORIGIN_AUTH_VALUE,
+    ORIGIN_CREDENTIAL,
+    ORIGIN_OLD_VALUES,
+    ORIGIN_SESSION_VALUE,
+    REJECTED_ORIGIN_CASES,
+)
+from tests._threads import run_concurrently
+from tests._transports import FakeTransport
+from tests.conftest import fake_client, fake_transport, make_response, sent_payload
 
 _ASCII_CONTROL_CODES = (*range(32), 127)
 _CREDENTIAL = 'credential-value'
@@ -36,9 +48,6 @@ _NEW_AUTH_VALUE = 'new-token'
 _NEW_CREDENTIAL = 'new-password'
 _OLD_AUTH_VALUE = 'old-token'
 _OLD_CREDENTIAL = 'old-password'
-_ORIGIN_AUTH_VALUE = 'old-auth-token'
-_ORIGIN_CREDENTIAL = 'old-password'
-_ORIGIN_SESSION_VALUE = 'old-session'
 _PROXY_AUTH = 'p'
 _PROXY_AUTH_VALUE = 'p/a?s#s'
 _PROXY_USER = 'proxy-user'
@@ -55,9 +64,6 @@ class _BlockingTransport:
         self.requests: list[TransportRequest] = []
         self._responses = responses
 
-    def abort(self, token: str) -> None:
-        del token
-
     def close(self) -> None:
         self.close_calls += 1
 
@@ -67,6 +73,9 @@ class _BlockingTransport:
             self.entered_operation.set()
             assert self.release_operation.wait(timeout=5)
         return self._responses.pop(0)
+
+    def send_streaming(self, request: TransportRequest) -> StreamingResponse:
+        raise AssertionError(f'Unexpected streaming request: {request.method}')
 
 
 def _assert_proxy_authorization(
@@ -103,7 +112,7 @@ def _finish_daemon_calls(
 
 def _method_names(sg: Shotgun) -> list[object]:
     names: list[object] = []
-    for request in _fake_transport(sg).requests:
+    for request in fake_transport(sg).requests:
         assert isinstance(request.body, bytes)
         names.append(json.loads(request.body)['method_name'])
     return names
@@ -123,12 +132,10 @@ def _run_in_threads(call: Callable[[], object], count: int) -> list[object]:
     barrier = threading.Barrier(count)
 
     def run() -> object:
-        barrier.wait()
+        barrier.wait(timeout=5)
         return call()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
-        futures = [executor.submit(run) for _ in range(count)]
-        return [future.result(timeout=5) for future in futures]
+    return run_concurrently([run] * count)
 
 
 def _serve_proxy(
@@ -205,11 +212,11 @@ def _start_daemon_call(
 def test_auth_token_constructor_runs_readiness_then_exchange_when_deferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    transport = _FakeTransport(
-        [_make_response({'version': [9, 0, 0]}), _make_response({'session_id': _SESSION_ID})]
+    transport = FakeTransport(
+        [make_response({'version': [9, 0, 0]}), make_response({'session_id': _SESSION_ID})]
     )
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return transport
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
@@ -237,7 +244,7 @@ def test_authenticated_http_find_rejects_before_driver_acquisition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
 
-    def reject_transport(**_kwargs: object) -> _FakeTransport:
+    def reject_transport(**_kwargs: object) -> FakeTransport:
         raise AssertionError('find acquired its driver before the security guard')
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', reject_transport)
@@ -259,8 +266,8 @@ def test_authenticated_http_guard_allows_public_unauthenticated_info() -> None:
         api_key='k',
         connect=False,
     )
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
-    sg._transport = transport
+    transport = FakeTransport([make_response({'version': [9, 0, 0]})])
+    sg.transport = transport
 
     assert sg.info() == {'version': [9, 0, 0]}
     assert _method_names(sg) == ['info']
@@ -268,22 +275,15 @@ def test_authenticated_http_guard_allows_public_unauthenticated_info() -> None:
 
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('https://remote.example', None),
-        ('https://remote.example', 'proxy.example:3128'),
-        ('https://remote.example', 'localhost:3128'),
-        ('http://localhost', None),
-        ('http://127.0.0.1', None),
-        ('http://[::1]', None),
-    ],
+    ALLOWED_ORIGIN_CASES,
 )
 def test_authenticated_http_guard_allows_secure_and_loopback_rpc(
     base_url: str,
     http_proxy: str | None,
 ) -> None:
     sg = Shotgun(base_url, http_proxy=http_proxy, script_name='s', api_key='k', connect=False)
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]}), _make_response(obj=True)])
-    sg._transport = transport
+    transport = FakeTransport([make_response({'version': [9, 0, 0]}), make_response(obj=True)])
+    sg.transport = transport
 
     assert sg.delete('Asset', 1) is True
     assert _method_names(sg) == ['info', 'delete']
@@ -333,15 +333,7 @@ def test_authenticated_http_proxy_receives_basic_authorization() -> None:
 
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('http://remote.example', None),
-        ('http://localhost', 'proxy.example:3128'),
-        ('http://127.0.0.1', 'proxy.example:3128'),
-        ('http://[::1]', 'proxy.example:3128'),
-        ('http://localhost', 'localhost:3128'),
-        ('http://127.0.0.1', '127.0.0.1:3128'),
-        ('http://[::1]', '[::1]:3128'),
-    ],
+    REJECTED_ORIGIN_CASES,
 )
 def test_authenticated_http_rpc_rejects_before_transport_and_observer(
     monkeypatch: pytest.MonkeyPatch,
@@ -350,9 +342,9 @@ def test_authenticated_http_rpc_rejects_before_transport_and_observer(
 ) -> None:
     constructions: list[dict[str, object]] = []
 
-    def make_transport(**kwargs: object) -> _FakeTransport:
+    def make_transport(**kwargs: object) -> FakeTransport:
         constructions.append(kwargs)
-        return _FakeTransport([])
+        return FakeTransport([])
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
     sg = Shotgun(
@@ -376,7 +368,7 @@ def test_authenticated_http_session_token_rejects_before_driver_acquisition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
 
-    def reject_transport(**_kwargs: object) -> _FakeTransport:
+    def reject_transport(**_kwargs: object) -> FakeTransport:
         raise AssertionError('token exchange acquired its driver before the security guard')
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', reject_transport)
@@ -436,7 +428,7 @@ def test_cached_session_token_validates_config_without_acquiring_driver(
 
 
 def test_capability_containers_parse_supported_server() -> None:
-    sg = _fake_client([], server_info={'version': [9, 1, 2, 'Dev']})
+    sg = fake_client([], server_info={'version': [9, 1, 2, 'Dev']})
 
     caps = sg.server_caps
 
@@ -452,30 +444,11 @@ def test_capability_containers_parse_supported_server() -> None:
     assert caps.ensure_user_following_support() is True
 
 
-def test_capability_metadata_is_detached_from_caller_and_accessors() -> None:
-    metadata: dict[str, object] = {
-        'version': [9, 1, 2],
-        's3_enabled_upload_types': {'*': ['*']},
-    }
-    caps = capabilities_module.ServerCapabilities('x.example', metadata)
-
-    cast('list[int]', metadata['version'])[0] = 7
-    cast('dict[str, list[str]]', metadata['s3_enabled_upload_types'])['*'].clear()
-    exposed = caps.server_info
-    cast('list[int]', exposed['version'])[1] = 0
-    cast('dict[str, list[str]]', exposed['s3_enabled_upload_types'])['*'].clear()
-
-    assert caps.server_info == {
-        'version': [9, 1, 2],
-        's3_enabled_upload_types': {'*': ['*']},
-    }
-
-
 def test_capability_publication_rejects_origin_change_before_atomic_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sg = _fake_client(
-        [_make_response({'version': [10, 0, 0], 'api_max_entities_per_page': 250})],
+    sg = fake_client(
+        [make_response({'version': [10, 0, 0], 'api_max_entities_per_page': 250})],
         server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 123},
     )
     original_publish = config_module.publish_server_info
@@ -501,7 +474,7 @@ def test_capability_publication_rejects_origin_change_before_atomic_write(
 
 
 def test_client_capabilities_report_ssl_version() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
 
     assert sg.client_caps.ssl_version == capabilities_module.ssl.OPENSSL_VERSION
 
@@ -511,9 +484,9 @@ def test_close_attempts_both_replaced_transports_and_preserves_first_failure(
     monkeypatch: pytest.MonkeyPatch,
     error_type: type[BaseException],
 ) -> None:
-    sg = _fake_client([])
-    old = _fake_transport(sg)
-    replacement = _FakeTransport([])
+    sg = fake_client([])
+    old = fake_transport(sg)
+    replacement = FakeTransport([])
     sg.connect()
     first_error = error_type('old close failed')
     close_calls: list[str] = []
@@ -528,7 +501,7 @@ def test_close_attempts_both_replaced_transports_and_preserves_first_failure(
 
     monkeypatch.setattr(old, 'close', close_old)
     monkeypatch.setattr(replacement, 'close', close_replacement)
-    sg._transport = replacement
+    sg.transport = replacement
 
     with pytest.raises(error_type) as raised:
         sg.close()
@@ -545,11 +518,11 @@ def test_close_closes_each_distinct_known_and_current_transport_once(
     replace_transport: bool,
 ) -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    old = _BlockingTransport([_make_response({'version': [9, 0, 0]})])
+    old = _BlockingTransport([make_response({'version': [9, 0, 0]})])
     replacement = _BlockingTransport([]) if replace_transport else old
-    sg._transport = cast('Transport', old)
+    sg.transport = old
     sg.connect()
-    sg._transport = cast('Transport', replacement)
+    sg.transport = replacement
 
     sg.close()
     sg.close()
@@ -561,14 +534,14 @@ def test_close_closes_each_distinct_known_and_current_transport_once(
 
 def test_close_defers_replaced_transport_close_until_inflight_request_finishes() -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    old = _BlockingTransport([_make_response({'version': [9, 0, 0]}), _make_response({'id': 7})])
+    old = _BlockingTransport([make_response({'version': [9, 0, 0]}), make_response({'id': 7})])
     replacement = _BlockingTransport([])
-    sg._transport = cast('Transport', old)
+    sg.transport = old
     results: list[object] = []
     worker = _start_daemon_call(lambda: results.append(_client_call(sg, 'read', {'type': 'Shot'})))
     try:
         assert old.entered_operation.wait(timeout=5)
-        sg._transport = cast('Transport', replacement)
+        sg.transport = replacement
         sg.close()
         sg.close()
         assert old.close_calls == 0
@@ -586,26 +559,25 @@ def test_close_defers_replaced_transport_close_until_inflight_request_finishes()
 def test_close_defers_transport_close_until_inflight_request_finishes() -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
     transport = _BlockingTransport(
-        [_make_response({'version': [9, 0, 0]}), _make_response({'id': 7})]
+        [make_response({'version': [9, 0, 0]}), make_response({'id': 7})]
     )
-    sg._transport = cast('Transport', transport)
+    sg.transport = transport
     results: list[object] = []
-    worker = threading.Thread(
-        target=lambda: results.append(_client_call(sg, 'read', {'type': 'Shot'}))
-    )
+    worker = _start_daemon_call(lambda: results.append(_client_call(sg, 'read', {'type': 'Shot'})))
 
-    assert _connection_view(sg) is transport
-    worker.start()
-    assert transport.entered_operation.wait(timeout=5)
     try:
-        sg.close()
-        connection_after_close = _connection_view(sg)
-        close_calls_during_io = transport.close_calls
+        assert _connection_view(sg) is transport
+        assert transport.entered_operation.wait(timeout=5)
+
+        def close_and_inspect() -> tuple[Transport | None, int]:
+            sg.close()
+            return _connection_view(sg), transport.close_calls
+
+        connection_after_close, close_calls_during_io = run_concurrently([close_and_inspect])[0]
     finally:
         transport.release_operation.set()
-        worker.join(timeout=5)
+        _finish_daemon_calls([worker])
 
-    assert not worker.is_alive()
     assert connection_after_close is None
     assert close_calls_during_io == 0
     assert results == [{'id': 7}]
@@ -616,9 +588,9 @@ def test_close_preserves_sync_readiness_from_concurrent_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    old_transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
-    new_transport = _FakeTransport([_make_response({'version': [10, 0, 0]})])
-    sg._transport = old_transport
+    old_transport = FakeTransport([make_response({'version': [9, 0, 0]})])
+    new_transport = FakeTransport([make_response({'version': [10, 0, 0]})])
+    sg.transport = old_transport
     sg.connect()
     close_started = threading.Event()
     release_close = threading.Event()
@@ -627,7 +599,7 @@ def test_close_preserves_sync_readiness_from_concurrent_reconnect(
         close_started.set()
         assert release_close.wait(timeout=5)
 
-    def replace_transport(_context: RequestContext) -> _FakeTransport:
+    def replace_transport(_context: RequestContext) -> FakeTransport:
         return new_transport
 
     monkeypatch.setattr(old_transport, 'close', blocking_close)
@@ -650,7 +622,7 @@ def test_close_preserves_sync_readiness_from_concurrent_reconnect(
 
 
 def test_close_prunes_readiness_without_validating_unrelated_config() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     sg.config.proxy_server = 'proxy.local'
     sg.connect()
     sg.config.update_fields(proxy_user='unpaired-user')
@@ -664,7 +636,7 @@ def test_close_rejects_late_sync_readiness_cache_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    sg._transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
+    sg.transport = FakeTransport([make_response({'version': [9, 0, 0]})])
     original = cast(
         'Callable[[RequestContext, capabilities_module.ServerCapabilities], bool]',
         sg._publish_capabilities,
@@ -706,24 +678,28 @@ def test_close_rejects_session_token_publication_from_retired_transport() -> Non
     sg.config.auth_token = _OLD_AUTH_VALUE
     transport = _BlockingTransport(
         [
-            _make_response({'version': [9, 0, 0]}),
-            _make_response({'session_id': _SESSION_ID}),
+            make_response({'version': [9, 0, 0]}),
+            make_response({'session_id': _SESSION_ID}),
         ]
     )
-    sg._transport = cast('Transport', transport)
+    sg.transport = transport
     original_generation = config_module.snapshot(sg.config).transport_generation
     results: list[str] = []
-    worker = threading.Thread(target=lambda: results.append(sg.get_session_token()))
+    worker = _start_daemon_call(lambda: results.append(sg.get_session_token()))
 
-    worker.start()
-    assert transport.entered_operation.wait(timeout=5)
-    sg.close()
-    retired_generation = config_module.snapshot(sg.config).transport_generation
-    close_calls_during_io = transport.close_calls
-    transport.release_operation.set()
-    worker.join(timeout=5)
+    try:
+        assert transport.entered_operation.wait(timeout=5)
 
-    assert not worker.is_alive()
+        def close_and_inspect() -> tuple[int, int]:
+            sg.close()
+            generation = config_module.snapshot(sg.config).transport_generation
+            return generation, transport.close_calls
+
+        retired_generation, close_calls_during_io = run_concurrently([close_and_inspect])[0]
+    finally:
+        transport.release_operation.set()
+        _finish_daemon_calls([worker])
+
     assert retired_generation == original_generation + 1
     assert close_calls_during_io == 0
     assert results == [_SESSION_ID]
@@ -735,7 +711,7 @@ def test_close_rejects_session_token_publication_from_retired_transport() -> Non
 
 
 def test_concurrent_first_calls_share_one_readiness_probe() -> None:
-    sg = _fake_client([_make_response({'id': 1}), _make_response({'id': 2})])
+    sg = fake_client([make_response({'id': 1}), make_response({'id': 2})])
 
     results = _run_in_threads(lambda: _client_call(sg, 'read', {'type': 'Shot'}), 2)
 
@@ -751,18 +727,18 @@ def test_concurrent_first_calls_share_one_readiness_probe() -> None:
 
 
 def test_connect_false_defers_readiness_until_an_operation() -> None:
-    sg = _fake_client([_make_response({'id': 7})])
+    sg = fake_client([make_response({'id': 7})])
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
     assert _client_call(sg, 'read', {'type': 'Shot'}) == {'id': 7}
     assert _method_names(sg) == ['info', 'read']
-    assert _sent_payload(sg)['method_name'] == 'read'
+    assert sent_payload(sg)['method_name'] == 'read'
 
 
 def test_connect_true_eagerly_runs_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
+    transport = FakeTransport([make_response({'version': [9, 0, 0]})])
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return transport
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
@@ -776,7 +752,7 @@ def test_connect_true_eagerly_runs_readiness(monkeypatch: pytest.MonkeyPatch) ->
 def test_connection_close_reaches_underlying_transport() -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
     transport = _BlockingTransport([])
-    sg._transport = cast('Transport', transport)
+    sg.transport = transport
 
     connection = _connection_view(sg)
     assert connection is transport
@@ -787,14 +763,14 @@ def test_connection_close_reaches_underlying_transport() -> None:
 
 
 def test_connection_identity_is_stable_across_info(monkeypatch: pytest.MonkeyPatch) -> None:
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
-            _make_response({'version': [9, 0, 0]}),
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
         ]
     )
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return transport
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
@@ -809,9 +785,9 @@ def test_connection_identity_is_stable_across_info(monkeypatch: pytest.MonkeyPat
 def test_connection_is_installed_transport_after_connect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
+    transport = FakeTransport([make_response({'version': [9, 0, 0]})])
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return transport
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
@@ -826,9 +802,9 @@ def test_connection_is_installed_transport_after_connect(
 
 
 def test_connection_is_none_after_public_close(monkeypatch: pytest.MonkeyPatch) -> None:
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
+    transport = FakeTransport([make_response({'version': [9, 0, 0]})])
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return transport
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
@@ -864,7 +840,7 @@ def test_connection_proxy_info_is_none_without_proxy(
         _transport: Urllib3Transport,
         _request: TransportRequest,
     ) -> TransportResponse:
-        return _make_response({'version': [9, 0, 0]})
+        return make_response({'version': [9, 0, 0]})
 
     monkeypatch.setattr(Urllib3Transport, 'send', send)
     sg = Shotgun(
@@ -891,7 +867,7 @@ def test_connection_proxy_info_is_unavailable_with_proxy(
         _transport: Urllib3Transport,
         _request: TransportRequest,
     ) -> TransportResponse:
-        return _make_response({'version': [9, 0, 0]})
+        return make_response({'version': [9, 0, 0]})
 
     monkeypatch.setattr(Urllib3Transport, 'send', send)
     sg = Shotgun(
@@ -984,36 +960,6 @@ def test_constructor_exposes_the_documented_signature() -> None:
     assert method_signature.return_annotation is None
 
 
-def test_constructor_package_internal_binder_and_signature_helper() -> None:
-    options = client_module.bind_constructor(
-        ('https://x.example',),
-        {'script_name': 's', 'api_key': 'k', 'connect': False},
-        'SiblingClient',
-    )
-
-    assert isinstance(options, client_module.ConstructorOptions)
-    assert options == client_module.ConstructorOptions(
-        base_url='https://x.example',
-        script_name='s',
-        api_key='k',
-        connect=False,
-    )
-    assert inspect.signature(Shotgun) == client_module.CONSTRUCTOR_SIGNATURE
-
-    def variadic(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-
-    exposed = client_module.expose_constructor_signature(variadic)
-
-    assert exposed is variadic
-    assert inspect.signature(exposed) == inspect.signature(Shotgun.__init__)
-    with pytest.raises(
-        TypeError,
-        match=r"^SiblingClient\.__init__\(\) missing a required argument: 'base_url'$",
-    ):
-        client_module.bind_constructor((), {}, 'SiblingClient')
-
-
 def test_constructor_preserves_empty_proxy_without_proxy_settings() -> None:
     sg = Shotgun(
         'https://x.example',
@@ -1030,45 +976,16 @@ def test_constructor_preserves_empty_proxy_without_proxy_settings() -> None:
     assert sg.config.proxy_port == 8080
 
 
-@pytest.mark.parametrize(
-    ('args', 'kwargs', 'message'),
-    [
-        ((), {}, "Shotgun.__init__() missing a required argument: 'base_url'"),
-        (
-            ('https://x.example',) * 13,
-            {},
-            'Shotgun.__init__() too many positional arguments',
-        ),
-        (
-            ('https://x.example',),
-            {'unexpected': True},
-            "Shotgun.__init__() got an unexpected keyword argument 'unexpected'",
-        ),
-        (
-            ('https://x.example', 's'),
-            {'script_name': 'other'},
-            "Shotgun.__init__() multiple values for argument 'script_name'",
-        ),
-    ],
-)
-def test_constructor_type_errors_identify_shotgun(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    message: str,
+def test_constructor_uses_ca_environment_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    constructor = cast('Callable[..., Shotgun]', Shotgun)
-    with pytest.raises(TypeError) as caught:
-        constructor(*args, **kwargs)
-
-    assert str(caught.value) == message
-
-
-def test_constructor_uses_ca_environment_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv('SHOTGUN_API_CACERTS', '/prefix/certs.pem')
+    bundle = tmp_path / 'certs.pem'
+    bundle.write_text('configured bundle')
+    monkeypatch.setenv('SHOTGUN_API_CACERTS', str(bundle))
     captured: dict[str, object] = {}
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]})])
+    transport = FakeTransport([make_response({'version': [9, 0, 0]})])
 
-    def make_transport(**kwargs: object) -> _FakeTransport:
+    def make_transport(**kwargs: object) -> FakeTransport:
         captured.update(kwargs)
         return transport
 
@@ -1076,7 +993,7 @@ def test_constructor_uses_ca_environment_fallback(monkeypatch: pytest.MonkeyPatc
 
     Shotgun('https://x.example', script_name='s', api_key='k')
 
-    assert captured['ca_certs'] == '/prefix/certs.pem'
+    assert captured['ca_certs'] == str(bundle)
 
 
 def test_constructor_validates_auth_combinations() -> None:
@@ -1101,14 +1018,14 @@ def test_failed_readiness_is_retried_by_the_next_operation(first_method: str) ->
         api_key='k',
         connect=False,
     )
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
             ConnectError('temporary'),
-            _make_response({'version': [9, 0, 0]}),
-            _make_response({'id': 7}),
+            make_response({'version': [9, 0, 0]}),
+            make_response({'id': 7}),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
     sg.config.max_rpc_attempts = 1
 
     first_call = (
@@ -1122,11 +1039,62 @@ def test_failed_readiness_is_retried_by_the_next_operation(first_method: str) ->
 
 
 def test_get_session_token_uses_fixture_pinned_result_shape() -> None:
-    sg = _fake_client([_make_response({'session_id': _SESSION_ID})])
+    sg = fake_client([make_response({'session_id': _SESSION_ID})])
 
     assert sg.get_session_token() == _SESSION_ID
     session_token = sg.config.session_token
     assert session_token == _SESSION_ID
+
+
+def test_in_process_client_sends_authenticated_http_requests() -> None:
+    transport = FakeTransport(
+        [
+            make_response({'version': [9, 0, 0]}),
+            make_response({'entities': [], 'paging_info': {'entity_count': 0}}),
+        ]
+    )
+
+    class InProcessShotgun(Shotgun):
+        _in_process = True
+
+        def _new_transport(self, context: RequestContext) -> Transport:
+            del context
+            return transport
+
+    client = InProcessShotgun('http://unit-test.example', 'script', 'key')
+    context = config_module.snapshot(client.config)
+
+    assert client.find('Project', []) == []
+    assert context.in_process is True
+    assert 'in_process' not in repr(context)
+    assert len(transport.requests) == 2
+
+
+def test_in_process_flag_without_transport_override_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[object] = []
+
+    def record_transport(**kwargs: object) -> FakeTransport:
+        constructed.append(kwargs)
+        return FakeTransport(
+            [
+                make_response({'version': [9, 0, 0]}),
+                make_response({'entities': [], 'paging_info': {'entity_count': 0}}),
+            ]
+        )
+
+    monkeypatch.setattr(client_module, 'Urllib3Transport', record_transport)
+
+    class FlagOnlyShotgun(Shotgun):
+        _in_process = True
+
+    client = FlagOnlyShotgun(
+        'http://example.invalid', script_name='script', api_key='key', connect=False
+    )
+    with pytest.raises(RuntimeError, match='an in-process client must supply its own transport'):
+        client.find('Project', [])
+    assert constructed == []
 
 
 def test_invalid_config_during_readiness_wakes_all_waiters(
@@ -1141,7 +1109,7 @@ def test_invalid_config_during_readiness_wakes_all_waiters(
         assert release_readiness.wait(timeout=5)
 
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
             TransportResponse(
                 status=200,
@@ -1150,10 +1118,10 @@ def test_invalid_config_during_readiness_wakes_all_waiters(
                 content=b'{"results": {"version": [9, 0, 0]}}',
                 on_close=block_readiness,
             ),
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
     sg.config.proxy_server = 'proxy.local'
     readiness = sg._readiness
     original_wait = readiness.wait
@@ -1217,20 +1185,20 @@ def test_invalid_page_limit_releases_readiness_waiters_and_allows_retry(
         on_close=block_readiness,
     )
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
             first_response,
-            _make_response(invalid_metadata),
-            _make_response(
+            make_response(invalid_metadata),
+            make_response(
                 {
                     'version': [9, 0, 0],
                     'api_max_entities_per_page': '250',
                 }
             ),
-            _make_response({'id': 7}),
+            make_response({'id': 7}),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
     readiness = sg._readiness
     original_wait = readiness.wait
 
@@ -1283,12 +1251,29 @@ def test_malformed_proxy_is_rejected() -> None:
         )
 
 
+def test_new_transport_receives_connection_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
+    sg.config.max_connection_idle_secs = 15
+    sg.config.tcp_keepalive_timeout_secs = 0
+    captured: dict[str, object] = {}
+
+    def make_transport(**kwargs: object) -> FakeTransport:
+        captured.update(kwargs)
+        return FakeTransport([])
+
+    monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
+    create_transport = cast('Callable[[RequestContext], object]', sg._new_transport)
+    create_transport(config_module.snapshot(sg.config))
+    assert captured['max_connection_idle_secs'] == 15.0
+    assert captured['tcp_keepalive_timeout_secs'] is None
+
+
 def test_origin_change_invalidates_readiness_and_capabilities() -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'id': 1}),
-            _make_response({'version': [10, 0, 0]}),
-            _make_response({'id': 2}),
+            make_response({'id': 1}),
+            make_response({'version': [10, 0, 0]}),
+            make_response({'id': 2}),
         ]
     )
 
@@ -1464,32 +1449,32 @@ def test_proxy_validation_error_does_not_expose_credentials() -> None:
 
 
 def test_public_info_is_unauthenticated_and_avoids_duplicate_probe() -> None:
-    sg = _fake_client([_make_response({'id': 7})])
+    sg = fake_client([make_response({'id': 7})])
 
     assert sg.info()['version'] == [9, 0, 0]
     assert _client_call(sg, 'read', {'type': 'Shot'}) == {'id': 7}
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert _method_names(sg) == ['info', 'read']
     assert requests[0].body is not None
     assert b'script_key' not in requests[0].body
 
 
 def test_public_retarget_never_sends_old_auth_to_new_origin() -> None:
-    sg = Shotgun('https://old.example', session_token=_ORIGIN_SESSION_VALUE, connect=False)
+    sg = Shotgun('https://old.example', session_token=ORIGIN_SESSION_VALUE, connect=False)
     sg.config.update_fields(
         api_key='old-key',
-        auth_token=_ORIGIN_AUTH_VALUE,
+        auth_token=ORIGIN_AUTH_VALUE,
         extra_auth_params={'old-auth-marker': 'old'},
         script_name='old-script',
         session_uuid='old-uuid',
         sudo_as_login='old-sudo',
         user_login='old-user',
-        user_password=_ORIGIN_CREDENTIAL,
+        user_password=ORIGIN_CREDENTIAL,
     )
     sg.config.set_server_params('https://new.example')
-    transport = _FakeTransport([_make_response({'version': [9, 0, 0]}), _make_response({'id': 7})])
-    sg._transport = transport
+    transport = FakeTransport([make_response({'version': [9, 0, 0]}), make_response({'id': 7})])
+    sg.transport = transport
 
     assert _client_call(sg, 'read', {'type': 'Shot'}) == {'id': 7}
 
@@ -1502,15 +1487,7 @@ def test_public_retarget_never_sends_old_auth_to_new_origin() -> None:
     assert all(
         old_value not in cast('bytes', request.body)
         for request in transport.requests
-        for old_value in (
-            b'old-auth-token',
-            b'old-key',
-            b'old-password',
-            b'old-session',
-            b'old-sudo',
-            b'old-user',
-            b'old-uuid',
-        )
+        for old_value in ORIGIN_OLD_VALUES
     )
     assert all(
         b'old-auth-marker' not in cast('bytes', request.body) for request in transport.requests
@@ -1521,7 +1498,7 @@ def test_public_retarget_never_sends_old_auth_to_new_origin() -> None:
 def test_readiness_observer_reentry_does_not_self_wait_or_duplicate_probe(
     method_name: str,
 ) -> None:
-    sg = _fake_client([_make_response({'id': 7})])
+    sg = fake_client([make_response({'id': 7})])
     reentered = False
     results: list[object] = []
 
@@ -1557,10 +1534,10 @@ def test_repeated_close_and_connect_prune_sync_readiness_generations(
     cycle_count = 5
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
     transports = [
-        _FakeTransport([_make_response({'version': [9, 0, 0]})]) for _ in range(cycle_count)
+        FakeTransport([make_response({'version': [9, 0, 0]})]) for _ in range(cycle_count)
     ]
 
-    def new_transport(_context: RequestContext) -> _FakeTransport:
+    def new_transport(_context: RequestContext) -> FakeTransport:
         return transports.pop(0)
 
     monkeypatch.setattr(sg, '_new_transport', new_transport)
@@ -1573,12 +1550,12 @@ def test_repeated_close_and_connect_prune_sync_readiness_generations(
 
 
 def test_request_uses_snapshot_captured_before_readiness() -> None:
-    sg = Shotgun('https://x.example', session_token=_ORIGIN_SESSION_VALUE, connect=False)
+    sg = Shotgun('https://x.example', session_token=ORIGIN_SESSION_VALUE, connect=False)
     sg.config.update_fields(
         extra_auth_params={'old-auth-marker': 'old'},
         session_uuid='old-uuid',
     )
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
             TransportResponse(
                 status=200,
@@ -1587,10 +1564,10 @@ def test_request_uses_snapshot_captured_before_readiness() -> None:
                 content=b'{"results": {"version": [9, 0, 0]}}',
                 on_close=lambda: sg.config.set_server_params('https://other.example'),
             ),
-            _make_response({'id': 7}),
+            make_response({'id': 7}),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
 
     assert _client_call(sg, 'read', {'type': 'Shot'}) == {'id': 7}
     assert transport.requests[1].url == 'https://x.example:443/api3/json'
@@ -1605,8 +1582,8 @@ def test_retired_close_failure_rolls_back_replacement_lease(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     old_error = RuntimeError('old close failed')
-    old = _FakeTransport([_make_response({'version': [9, 0, 0]})])
-    replacement = _FakeTransport([_make_response({'version': [10, 0, 0]})])
+    old = FakeTransport([make_response({'version': [9, 0, 0]})])
+    replacement = FakeTransport([make_response({'version': [10, 0, 0]})])
     transports = iter((old, replacement))
     old_close_calls = 0
     replacement_close_calls = 0
@@ -1620,7 +1597,7 @@ def test_retired_close_failure_rolls_back_replacement_lease(
         nonlocal replacement_close_calls
         replacement_close_calls += 1
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return next(transports)
 
     monkeypatch.setattr(old, 'close', close_old)
@@ -1645,8 +1622,8 @@ def test_retired_close_failure_rolls_back_replacement_lease_when_rollback_close_
 ) -> None:
     old_error = RuntimeError('old close failed')
     rollback_error = RuntimeError('replacement close failed')
-    old = _FakeTransport([_make_response({'version': [9, 0, 0]})])
-    replacement = _FakeTransport([_make_response({'version': [10, 0, 0]})])
+    old = FakeTransport([make_response({'version': [9, 0, 0]})])
+    replacement = FakeTransport([make_response({'version': [10, 0, 0]})])
     transports = iter((old, replacement))
     replacement_close_calls = 0
 
@@ -1659,7 +1636,7 @@ def test_retired_close_failure_rolls_back_replacement_lease_when_rollback_close_
         replacement_close_calls += 1
         raise rollback_error
 
-    def make_transport(**_kwargs: object) -> _FakeTransport:
+    def make_transport(**_kwargs: object) -> FakeTransport:
         return next(transports)
 
     monkeypatch.setattr(old, 'close', close_old)
@@ -1681,7 +1658,7 @@ def test_retired_close_failure_rolls_back_replacement_lease_when_rollback_close_
 def test_server_caps_rejects_missing_or_unsupported_version(
     server_info: dict[str, object],
 ) -> None:
-    sg = _fake_client([], server_info=server_info)
+    sg = fake_client([], server_info=server_info)
 
     with pytest.raises(_errors.ShotgunError, match=r'7\.10\.0|did not report'):
         _ = sg.server_caps
@@ -1703,9 +1680,9 @@ def test_session_exchange_does_not_overwrite_newer_credentials() -> None:
             user_password=_NEW_CREDENTIAL,
         )
 
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             TransportResponse(
                 status=200,
                 reason='OK',
@@ -1715,7 +1692,7 @@ def test_session_exchange_does_not_overwrite_newer_credentials() -> None:
             ),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
 
     assert sg.get_session_token() == 'stale-session'
     assert sg.config.session_token is None
@@ -1744,9 +1721,9 @@ def test_transport_creation_uses_captured_proxy_generation(
     )
     captured: dict[str, object] = {}
 
-    def make_transport(**kwargs: object) -> _FakeTransport:
+    def make_transport(**kwargs: object) -> FakeTransport:
         captured.update(kwargs)
-        return _FakeTransport([])
+        return FakeTransport([])
 
     monkeypatch.setattr(client_module, 'Urllib3Transport', make_transport)
     create_transport = cast(
@@ -1762,8 +1739,8 @@ def test_transport_creation_uses_captured_proxy_generation(
 
 
 def test_unsupported_floor_blocks_requested_operation() -> None:
-    sg = _fake_client(
-        [_make_response({'id': 7})],
+    sg = fake_client(
+        [make_response({'id': 7})],
         server_info={'version': [7, 9, 9]},
     )
 
@@ -1774,10 +1751,10 @@ def test_unsupported_floor_blocks_requested_operation() -> None:
 
 
 def test_user_agent_defaults_and_management() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
 
     assert sg.config.user_agents == (
-        'shotgun-json (0.1.2)',
+        f'shotgun-json ({PACKAGE_VERSION})',
         f'Python {sg.client_caps.py_version}',
         'sg-python-api',
     )

@@ -33,7 +33,6 @@ from ._execution import (
     build_rpc_request,
 )
 from ._transport import (
-    ReadTimeoutError,
     SendError,
     TransportError,
     TransportRequest,
@@ -46,23 +45,15 @@ _HTTP_REDIRECT = 302
 
 @dataclasses.dataclass(frozen=True)
 class AttemptControl:
-    """Consume attempt bytes under deadline and progress control."""
+    """Consume attempt bytes with progress reporting."""
 
     _attempt: int
-    _clock: Callable[[], float]
-    _deadline: float | None
     _observer: ObserverCallback | None
     _operation: _protocol.OperationCategory
     _route: EventRoute
 
-    def _check_deadline(self) -> None:
-        """Raise when cumulative monotonic attempt time exceeds its limit."""
-        if self._deadline is not None and self._clock() > self._deadline:
-            raise ReadTimeoutError('total attempt timeout exceeded')
-
-    def _consume_buffered(self, body: bytes, total_bytes: int | None = None) -> bytes:
+    def consume_buffered(self, body: bytes, total_bytes: int | None = None) -> bytes:
         """Observe a received buffered body without rebuilding it."""
-        self._check_deadline()
         if body:
             notify_observer(
                 self._observer,
@@ -76,22 +67,13 @@ class AttemptControl:
             )
         return body
 
-    def _remaining_timeout(self) -> float | None:
-        """Return the remaining cumulative attempt timeout."""
-        if self._deadline is None:
-            return None
-        remaining = self._deadline - self._clock()
-        if remaining < 0:
-            raise ReadTimeoutError('total attempt timeout exceeded')
-        return remaining
-
     def consume_into(
         self,
         chunks: Iterable[bytes],
         sink: Callable[[bytes], object],
         total_bytes: int | None = None,
     ) -> None:
-        """Write chunks while enforcing deadline and progress controls.
+        """Write chunks while reporting progress.
 
         Args:
             chunks: Fresh streaming body chunks for this attempt.
@@ -99,14 +81,12 @@ class AttemptControl:
             total_bytes: Known complete body size, when available.
 
         Raises:
-            ReadTimeoutError: If cumulative attempt time exceeds the total
-                limit.
+            Exception: If reading a chunk or invoking the sink fails.
         """
         transferred = 0
         for chunk in chunks:
             sink(chunk)
             transferred += len(chunk)
-            self._check_deadline()
             if chunk:
                 notify_observer(
                     self._observer,
@@ -120,7 +100,7 @@ class AttemptControl:
                 )
 
     def consume(self, chunks: Iterable[bytes], total_bytes: int | None = None) -> bytes:
-        """Collect chunks while enforcing the total attempt deadline.
+        """Collect chunks while reporting progress.
 
         Args:
             chunks: Fresh buffered or streaming body chunks for this attempt.
@@ -130,8 +110,7 @@ class AttemptControl:
             Concatenated response bytes.
 
         Raises:
-            ReadTimeoutError: If cumulative attempt time exceeds the total
-                limit.
+            Exception: If reading a chunk fails.
         """
         body = BytesIO()
         self.consume_into(chunks, body.write, total_bytes=total_bytes)
@@ -265,7 +244,13 @@ class _ObservedRequestBody:
             raise
 
     def close(self) -> None:
-        """Close the source once even if its cleanup raises."""
+        """Close the source iterator at most once.
+
+        Later calls do not repeat cleanup even when the first close fails.
+
+        Raises:
+            Exception: If the source iterator's cleanup fails.
+        """
         if self._closed:
             return
         self._closed = True
@@ -351,11 +336,8 @@ class Driver:
     ) -> AttemptState[AttemptControl]:
         """Build immutable timing and observer state for one fresh attempt."""
         started = self._clock()
-        deadline = None if context.timeout.total is None else started + context.timeout.total
         control = AttemptControl(
             _attempt=attempt,
-            _clock=self._clock,
-            _deadline=deadline,
             _observer=context.on_progress,
             _operation=operation.category,
             _route=route,
@@ -393,7 +375,6 @@ class Driver:
                 response_status = response.status
                 response_headers = response.headers
                 correlation_id = response_correlation_id(response_headers)
-                state.control._check_deadline()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 failure = _protocol.classify_http_failure(
                     response_status,
                     response_headers,
@@ -475,7 +456,7 @@ class Driver:
                 buffered.headers,
                 buffered.content,
             )
-            body = control._consume_buffered(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            body = control.consume_buffered(
                 buffered.content,
                 total_bytes=len(buffered.content),
             )
@@ -569,7 +550,6 @@ class Driver:
         request: TransportRequest,
         state: AttemptState[AttemptControl],
         *,
-        redirected: bool,
         streaming: bool,
     ) -> tuple[LiveResponse, '_TerminalResponseBoundary'] | AttemptRetry:
         """Send once and keep a received response through body cleanup."""
@@ -579,8 +559,6 @@ class Driver:
         try:
             try:
                 with exception_capture:
-                    if redirected:
-                        request = _request_with_remaining_timeout(request, state.control)
                     if streaming:
                         response = self._transport.send_streaming(request)
                     else:
@@ -635,6 +613,10 @@ class Driver:
         Raises:
             TypeError: If the RPC transport response lacks the buffered
                 response contract (`reason` and `content`).
+            TransportError: If a terminal or exhausted transport failure
+                occurs.
+            Exception: If request construction, status validation, response
+                consumption, or cleanup fails.
         """
         normalized_params = copy.deepcopy(params)
         options = ExecutionOptions(logical_method_name=_logical_method_name)
@@ -667,6 +649,11 @@ class Driver:
 
         Yields:
             Decoded RPC results in page order.
+
+        Raises:
+            TransportError: If a page exhausts its transport attempts.
+            Exception: If building, validating, decoding, or cleaning up a page
+                operation fails.
         """
         if context.page_prefetch <= 0:
             page = first_page
@@ -718,9 +705,8 @@ class Driver:
             context: Immutable operation configuration.
             request_factory: Builder called once for every fresh attempt.
             consumer: Buffered or streaming response consumer using the
-                supplied deadline/progress control.
-            options: Explicit redirect, streaming, and sanitized
-                compatibility-warning controls.
+                supplied progress control.
+            options: Redirect, streaming, and observer controls.
 
         Returns:
             The successful consumer result.
@@ -728,7 +714,8 @@ class Driver:
         Raises:
             TransportError: If a terminal or exhausted transport failure
                 occurs.
-            Exception: If status validation or response consumption fails.
+            Exception: If request or redirect construction, status validation,
+                response consumption, or cleanup fails.
         """
         execution_options = options or ExecutionOptions()
         self._emit_warnings(context)
@@ -742,7 +729,6 @@ class Driver:
                 sent = self._send_request(
                     request,
                     state,
-                    redirected=redirected,
                     streaming=execution_options.streaming,
                 )
                 if isinstance(sent, AttemptRetry):
@@ -786,6 +772,7 @@ class Driver:
         Raises:
             ValueError: If `attempts` is not positive or `interval` is
                 negative.
+            Exception: If the predicate or configured sleep fails.
         """
         if attempts <= 0:
             raise ValueError('poll attempts must be positive')
@@ -817,13 +804,12 @@ def _observe_request_body(
     total_bytes: int | None,
     state: AttemptState[AttemptControl],
 ) -> Generator[bytes, None, None]:
-    """Yield request chunks with attempt deadline and progress reporting."""
+    """Yield request chunks with attempt progress reporting."""
     transferred = 0
     for chunk in chunks:
         yield chunk
         transferred += len(chunk)
         if chunk:
-            state.control._check_deadline()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
             notify_observer(
                 state.context.on_progress,
                 ProgressEvent(
@@ -851,15 +837,4 @@ def _request_with_progress(
             _transport.content_length(request.headers),
             state,
         ),
-    )
-
-
-def _request_with_remaining_timeout(
-    request: TransportRequest,
-    control: AttemptControl,
-) -> TransportRequest:
-    """Restrict a later hop to its remaining cumulative attempt timeout."""
-    return _transport.narrow_total_timeout(
-        request,
-        control._remaining_timeout(),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     )

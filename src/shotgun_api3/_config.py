@@ -1,8 +1,5 @@
 """Locked client configuration and immutable operation snapshots."""
 
-# Same-file collaborators access configuration implementation state.
-# pyright: reportPrivateUsage=false
-
 import base64
 import copy
 import dataclasses
@@ -13,6 +10,7 @@ import os
 import threading
 import urllib.parse
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
@@ -21,7 +19,15 @@ from ._sentinel import Unset as _Unset
 from ._transport import TimeoutConfig
 from ._version import PACKAGE_VERSION
 
-CompatibilityWarningCode: TypeAlias = Literal['legacy-infinite-timeout']
+__all__ = [
+    'CompatibilityWarningEvent',
+    'ProgressEvent',
+    'RequestEvent',
+    'ResponseEvent',
+    'RetryEvent',
+]
+
+_CompatibilityWarningCode: TypeAlias = Literal['legacy-infinite-timeout']
 EventRoute: TypeAlias = Literal[
     'allocation',
     'download',
@@ -32,10 +38,10 @@ EventRoute: TypeAlias = Literal[
     'read',
     'rpc',
 ]
-ObserverEvent: TypeAlias = (
+_ObserverEvent: TypeAlias = (
     'CompatibilityWarningEvent | ProgressEvent | RequestEvent | ResponseEvent | RetryEvent'
 )
-ObserverCallback: TypeAlias = Callable[[ObserverEvent], None]
+ObserverCallback: TypeAlias = Callable[[_ObserverEvent], None]
 
 Outcome: TypeAlias = Literal['error', 'retry', 'success']
 
@@ -69,6 +75,8 @@ _DEDICATED_AUTH_STRING_FIELDS = frozenset(
 _DEFAULT_CONNECT_TIMEOUT = 15.0
 _DEFAULT_PROXY_PORT = 8080
 _DEFAULT_READ_TIMEOUT = 300.0
+_KEEPALIVE_TARGET_MAX = 3600
+_KEEPALIVE_TARGET_MIN = 6
 _MAX_PORT = 65535
 _OBSERVER_FIELDS = (
     'on_compatibility_warning',
@@ -80,7 +88,7 @@ _OBSERVER_FIELDS = (
 _ORIGIN_FIELDS = frozenset({'api_path', 'scheme', 'server'})
 _ORIGIN_STRING_FIELDS = frozenset({'scheme', 'server'})
 _UNSET: Final = _Unset()
-_WARNING_MESSAGES: Mapping[CompatibilityWarningCode, str] = {
+_WARNING_MESSAGES: Mapping[_CompatibilityWarningCode, str] = {
     'legacy-infinite-timeout': 'Explicit None timeout enables legacy infinite waits.',
 }
 _PUBLIC_FIELDS = frozenset(
@@ -91,6 +99,7 @@ _PUBLIC_FIELDS = frozenset(
         'api_ver',
         'convert_datetimes_to_utc',
         'localized',
+        'max_connection_idle_secs',
         'max_rpc_attempts',
         'page_prefetch',
         'pool_maxsize',
@@ -104,6 +113,7 @@ _PUBLIC_FIELDS = frozenset(
         'server',
         'server_info',
         'session_uuid',
+        'tcp_keepalive_timeout_secs',
         'timeout_secs',
         'user_agents',
     }
@@ -111,12 +121,14 @@ _PUBLIC_FIELDS = frozenset(
 _TRANSPORT_FIELDS = frozenset(
     {
         *_ORIGIN_FIELDS,
+        'max_connection_idle_secs',
         'pool_maxsize',
         'proxy_pass',
         'proxy_port',
         'proxy_server',
         'proxy_user',
         'raw_http_proxy',
+        'tcp_keepalive_timeout_secs',
     }
 )
 
@@ -130,7 +142,7 @@ class CompatibilityWarningEvent:
         message: Fixed user-facing warning text.
     """
 
-    code: CompatibilityWarningCode
+    code: _CompatibilityWarningCode
     message: str
 
 
@@ -173,6 +185,10 @@ class RequestContext:
         page_prefetch: Maximum concurrent page requests; zero keeps paging
             serial.
         pool_maxsize: Maximum transport connection-pool size.
+        max_connection_idle_secs: Effective idle expiry limit in seconds, or
+            `None` when expiry is off.
+        tcp_keepalive_timeout_secs: Effective TCP keepalive target in seconds,
+            or `None` when keepalive is off.
         proxy_url: Normalized proxy URL, when configured.
         proxy_headers: Frozen proxy authentication headers.
         max_rpc_attempts: Maximum number of RPC attempts.
@@ -187,6 +203,7 @@ class RequestContext:
         on_progress: Optional transfer-progress observer.
         on_compatibility_warning: Optional compatibility-warning observer.
         site_url: Displayable site URL, when configured.
+        in_process: Whether the transport stays inside this process.
     """
 
     canonical_origin: str | None
@@ -202,6 +219,8 @@ class RequestContext:
     records_per_page: int
     page_prefetch: int
     pool_maxsize: int
+    max_connection_idle_secs: float | None
+    tcp_keepalive_timeout_secs: int | None
     proxy_url: str | None
     proxy_headers: Mapping[str, str] = dataclasses.field(repr=False)
     max_rpc_attempts: int
@@ -216,6 +235,7 @@ class RequestContext:
     on_progress: ObserverCallback | None
     on_compatibility_warning: ObserverCallback | None
     site_url: str | None
+    in_process: bool = dataclasses.field(default=False, repr=False)
 
 
 class Config:
@@ -226,11 +246,13 @@ class Config:
     `session_uuid`, `sudo_as_login`, `user_login`, and `user_password`), origin
     and API (`api_path`, `api_ver`, `scheme`, `server`, and `server_info`),
     proxy (`proxy_pass`, `proxy_port`, `proxy_server`, `proxy_user`, and
-    `raw_http_proxy`), transport, retry, and pagination (`max_rpc_attempts`,
-    `page_prefetch`, `pool_maxsize`, `rpc_attempt_interval`, `timeout_secs`,
-    and `user_agents`), conversion and localization (`convert_datetimes_to_utc`
-    and `localized`), and observers (`on_compatibility_warning`, `on_progress`,
-    `on_request`, `on_response`, and `on_retry`).
+    `raw_http_proxy`), transport, retry, and pagination
+    (`max_connection_idle_secs`, `max_rpc_attempts`, `page_prefetch`,
+    `pool_maxsize`, `rpc_attempt_interval`, `tcp_keepalive_timeout_secs`,
+    `timeout_secs`, and `user_agents`), conversion and localization
+    (`convert_datetimes_to_utc` and `localized`), and observers
+    (`on_compatibility_warning`, `on_progress`, `on_request`, `on_response`,
+    and `on_retry`).
 
     Reads return detached values except that observer callbacks and the unset
     sentinel retain their identities. Supported assignments are applied
@@ -242,6 +264,11 @@ class Config:
     For `timeout_secs`, the unset sentinel selects 15-second connect and
     300-second read limits, `None` disables both limits, and a finite positive
     number at most `threading.TIMEOUT_MAX` sets both limits.
+    `max_connection_idle_secs` accepts a nonnegative finite number and uses
+    `None` or `0` to turn expiry off; see `COMPATIBILITY.md` for its meaning.
+    `tcp_keepalive_timeout_secs` accepts whole seconds from 6 to 3600 and uses
+    `None` or `0` to turn keepalive off; see `COMPATIBILITY.md` for its
+    meaning.
     `rpc_attempt_interval` is in milliseconds. `page_prefetch=0` keeps paging
     serial; a positive N permits N concurrent page requests with at most N-1
     later pages fetched ahead. N=1 offers no processing lookahead.
@@ -254,13 +281,23 @@ class Config:
 
     Attributes:
         records_per_page: Effective server page limit, defaulting to 500.
+        lock: Lock protecting configuration storage and generation state.
+        values: Owned mutable configuration storage; direct access requires
+            holding `lock`.
+        auth_generation: Generation used to reject stale authentication
+            publication.
+        origin_generation: Generation identifying the configured origin.
+        transport_generation: Generation identifying transport configuration
+            and retirement changes.
+        in_process: Whether requests use an in-process transport.
     """
 
-    _lock: threading.Lock
-    _auth_generation: int
-    _origin_generation: int
-    _transport_generation: int
-    _values: dict[str, object]
+    lock: threading.Lock
+    auth_generation: int
+    in_process: bool
+    origin_generation: int
+    transport_generation: int
+    values: dict[str, object]
 
     api_key: str | None
     api_path: str | None
@@ -269,6 +306,7 @@ class Config:
     convert_datetimes_to_utc: bool
     extra_auth_params: dict[str, object] | None
     localized: bool
+    max_connection_idle_secs: float | None
     max_rpc_attempts: int
     on_compatibility_warning: ObserverCallback | None
     on_progress: ObserverCallback | None
@@ -290,12 +328,13 @@ class Config:
     session_token: str | None
     session_uuid: str | None
     sudo_as_login: str | None
+    tcp_keepalive_timeout_secs: int | None
     timeout_secs: float | _Unset | None
     user_agents: tuple[str, ...]
     user_login: str | None
     user_password: str | None
 
-    def __init__(self) -> None:
+    def __init__(self, *, _in_process: bool = False) -> None:
         """Initialize official configuration defaults and synchronization state.
 
         Read `SHOTGUN_API_RETRY_INTERVAL` as an integer number of milliseconds,
@@ -304,16 +343,21 @@ class Config:
         Raises:
             ValueError: If the environment value is not a nonnegative integer.
         """
-        object.__setattr__(self, '_lock', threading.Lock())
-        object.__setattr__(self, '_auth_generation', 0)
-        object.__setattr__(self, '_origin_generation', 0)
-        object.__setattr__(self, '_transport_generation', 0)
-        interval = int(os.environ.get('SHOTGUN_API_RETRY_INTERVAL', '3000'))
+        object.__setattr__(self, 'lock', threading.Lock())
+        object.__setattr__(self, 'auth_generation', 0)
+        object.__setattr__(self, 'in_process', _in_process)
+        object.__setattr__(self, 'origin_generation', 0)
+        object.__setattr__(self, 'transport_generation', 0)
+        interval_error = 'SHOTGUN_API_RETRY_INTERVAL must be a nonnegative integer of milliseconds'
+        try:
+            interval = int(os.environ.get('SHOTGUN_API_RETRY_INTERVAL', '3000'))
+        except ValueError:
+            raise ValueError(interval_error) from None
         if interval < 0:
-            raise ValueError('rpc_attempt_interval must be >= 0')
+            raise ValueError(interval_error)
         object.__setattr__(
             self,
-            '_values',
+            'values',
             {
                 'api_key': None,
                 'api_path': None,
@@ -322,6 +366,7 @@ class Config:
                 'convert_datetimes_to_utc': True,
                 'extra_auth_params': None,
                 'localized': False,
+                'max_connection_idle_secs': 60,
                 'max_rpc_attempts': 3,
                 'on_compatibility_warning': None,
                 'on_progress': None,
@@ -343,6 +388,7 @@ class Config:
                 'session_token': None,
                 'session_uuid': None,
                 'sudo_as_login': None,
+                'tcp_keepalive_timeout_secs': 60,
                 'timeout_secs': _UNSET,
                 'user_agents': _protocol.default_user_agent(PACKAGE_VERSION),
                 'user_login': None,
@@ -367,15 +413,34 @@ class Config:
             """
             if name not in _PUBLIC_FIELDS:
                 raise AttributeError(name)
-            with self._lock:
-                value = self._values[name]
+            with self.lock:
+                value = self.values[name]
             if name in _OBSERVER_FIELDS:
                 return value
             return value if value is _UNSET else copy.deepcopy(value)
 
         def __setattr__(self, name: str, value: object) -> None:
-            """Route direct official configuration writes through the lock."""
-            if name.startswith('_'):
+            """Route direct official configuration writes through the lock.
+
+            Args:
+                name: Official configuration name or internal storage
+                    attribute.
+                value: Replacement value for that attribute.
+
+            Raises:
+                AttributeError: If an official configuration name is unknown.
+                TypeError: If an official value has an unsupported type.
+                ValueError: If an official value violates its supported bounds
+                    or format.
+            """
+            if name.startswith('_') or name in {
+                'lock',
+                'auth_generation',
+                'in_process',
+                'origin_generation',
+                'transport_generation',
+                'values',
+            }:
                 object.__setattr__(self, name, value)
                 return
             self.update_fields(**{name: value})
@@ -390,13 +455,13 @@ class Config:
     ) -> None:
         """Advance locked state identities for the changed field groups."""
         if origin_changed:
-            retired_values.append(self._values['server_info'])
-            self._values['server_info'] = {}
-            self._origin_generation += 1
+            retired_values.append(self.values['server_info'])
+            self.values['server_info'] = {}
+            self.origin_generation += 1
         if transport_changed:
-            self._transport_generation += 1
+            self.transport_generation += 1
         if auth_changed:
-            self._auth_generation += 1
+            self.auth_generation += 1
 
     def append_user_agent(self, agent: str) -> None:
         """Append one user-agent entry under the configuration lock.
@@ -410,13 +475,13 @@ class Config:
         """
         owned_agent = _owned_string(agent)
         previous_agents: object = None
-        with self._lock:
-            agents = self._values['user_agents']
+        with self.lock:
+            agents = self.values['user_agents']
             if type(agents) is not tuple:
                 raise TypeError('user_agents must be a tuple')
             typed_agents = cast('tuple[str, ...]', agents)
             previous_agents = typed_agents
-            self._values['user_agents'] = (*typed_agents, owned_agent)
+            self.values['user_agents'] = (*typed_agents, owned_agent)
         del previous_agents
 
     @property
@@ -428,8 +493,8 @@ class Config:
             ShotgunError: If the server metadata contains an invalid page
                 limit.
         """
-        with self._lock:
-            server_info = self._values['server_info']
+        with self.lock:
+            server_info = self.values['server_info']
         if not isinstance(server_info, Mapping):
             raise TypeError('server_info must be a mapping')
         typed_server_info = cast('Mapping[str, object]', server_info)
@@ -438,9 +503,9 @@ class Config:
     def reset_user_agent(self) -> None:
         """Restore the official-compatible default user-agent entries."""
         previous_agents: object = None
-        with self._lock:
-            previous_agents = self._values['user_agents']
-            self._values['user_agents'] = _protocol.default_user_agent(PACKAGE_VERSION)
+        with self.lock:
+            previous_agents = self.values['user_agents']
+            self.values['user_agents'] = _protocol.default_user_agent(PACKAGE_VERSION)
         del previous_agents
 
     def update_fields(self, **fields: object) -> None:
@@ -481,20 +546,20 @@ class Config:
             if observer is not None and not callable(observer):
                 raise TypeError(f'{name} must be callable or None')
         retired_values: list[object] = []
-        with self._lock:
-            old_canonical_origin = _canonical_origin_or_none(self._values)
+        with self.lock:
+            old_canonical_origin = _canonical_origin_or_none(self.values)
             for name, value, is_observer in prepared:
-                if not is_observer or self._values[name] is not value:
-                    retired_values.append(self._values[name])
-                    self._values[name] = value
-            new_canonical_origin = _canonical_origin_or_none(self._values)
+                if not is_observer or self.values[name] is not value:
+                    retired_values.append(self.values[name])
+                    self.values[name] = value
+            new_canonical_origin = _canonical_origin_or_none(self.values)
             origin_boundary_crossed = bool({'scheme', 'server'} & copied.keys()) and (
                 old_canonical_origin is None
                 or new_canonical_origin is None
                 or old_canonical_origin != new_canonical_origin
             )
             if origin_boundary_crossed:
-                _retire_omitted_auth(self._values, copied, retired_values)
+                _retire_omitted_auth(self.values, copied, retired_values)
                 auth_changed = True
             self._advance_generations(
                 auth_changed=auth_changed,
@@ -518,7 +583,7 @@ class Config:
         Raises:
             ValueError: If `base_url` has an unsupported or invalid origin.
         """
-        scheme, server, api_path = parse_server_params(base_url)
+        scheme, server, api_path = _parse_server_params(base_url)
         self.update_fields(scheme=scheme, server=server, api_path=api_path)
 
     def set_session_uuid(self, session_uuid: str | None) -> None:
@@ -632,6 +697,34 @@ def _contains_ascii_control(value: str) -> bool:
     )
 
 
+def _effective_idle_limit(value: object) -> float | None:
+    """Resolve the effective finite idle expiry limit."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError('max_connection_idle_secs must be a number or None')
+    try:
+        effective = float(value)
+    except OverflowError:
+        raise ValueError(
+            'max_connection_idle_secs must be a finite number that is not negative'
+        ) from None
+    if not math.isfinite(effective) or effective < 0:
+        raise ValueError('max_connection_idle_secs must be a finite number that is not negative')
+    return effective or None
+
+
+def _effective_keepalive_target(value: object) -> int | None:
+    """Resolve the effective whole-second TCP keepalive target."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError('tcp_keepalive_timeout_secs must be a whole number of seconds or None')
+    if value != 0 and not _KEEPALIVE_TARGET_MIN <= value <= _KEEPALIVE_TARGET_MAX:
+        raise ValueError('tcp_keepalive_timeout_secs must be 0 or from 6 to 3600')
+    return value or None
+
+
 def _effective_timeout(value: object) -> TimeoutConfig:
     """Resolve official timeout semantics from one locked value."""
     if value is _UNSET:
@@ -639,7 +732,7 @@ def _effective_timeout(value: object) -> TimeoutConfig:
     if value is None:
         return TimeoutConfig(connect=None, read=None)
     if isinstance(value, bool) or not isinstance(value, int | float):
-        raise TypeError('timeout_secs must be a number, None, or UNSET')
+        raise TypeError('timeout_secs must be a number or None')
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError('timeout_secs must be finite and positive')
     if value <= 0 or value > threading.TIMEOUT_MAX:
@@ -825,6 +918,26 @@ def _copy_for_storage(name: str, value: object) -> object:
     return copied
 
 
+def _parse_server_params(base_url: str) -> tuple[str, str, str]:
+    """Parse a base URL into normalized server parameters."""
+    parsed = urllib.parse.urlsplit(base_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {'http', 'https'}:
+        raise ValueError('base_url must be http or https')
+    if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
+        raise ValueError('base_url must contain a host without credentials')
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError('base_url contains an invalid port') from exc
+    host = parsed.hostname.encode('idna').decode('ascii').lower()
+    host_for_server = f'[{host}]' if ':' in host else host
+    server = f'{host_for_server}:{port}' if port is not None else host_for_server
+    prefix = parsed.path.rstrip('/')
+    api_path = f'{prefix}/api3/json' if prefix else '/api3/json'
+    return scheme, server, api_path
+
+
 def _proxy_headers(values: Mapping[str, object]) -> Mapping[str, str]:
     """Build immutable Basic proxy authorization from captured credentials."""
     user = _owned_optional_string(values['proxy_user'])
@@ -974,6 +1087,10 @@ def _validated_retry_value(name: str, value: object) -> int:
 
 def _validate_assignment_values(copied: dict[str, object]) -> None:
     """Validate independent field values before committing an assignment batch."""
+    if 'max_connection_idle_secs' in copied:
+        _effective_idle_limit(copied['max_connection_idle_secs'])
+    if 'tcp_keepalive_timeout_secs' in copied:
+        _effective_keepalive_target(copied['tcp_keepalive_timeout_secs'])
     for name in ('page_prefetch', 'pool_maxsize', 'proxy_port'):
         if name in copied:
             _integer(copied[name], name)
@@ -992,10 +1109,8 @@ def advance_transport_generation(config: Config) -> None:
     Args:
         config: Internal configuration whose transport identity is retiring.
     """
-    lock = cast('threading.Lock', object.__getattribute__(config, '_lock'))
-    with lock:
-        generation = cast('int', object.__getattribute__(config, '_transport_generation'))
-        object.__setattr__(config, '_transport_generation', generation + 1)
+    with config.lock:
+        config.transport_generation += 1
 
 
 def auth_spec(config: Config) -> _protocol.AuthSpec:
@@ -1009,8 +1124,8 @@ def auth_spec(config: Config) -> _protocol.AuthSpec:
         Field bindings are frozen, but additional authentication parameters
         remain a mutable dictionary detached from this configuration.
     """
-    with config._lock:
-        values = dict(config._values)
+    with config.lock:
+        values = dict(config.values)
     return _auth_spec(values)
 
 
@@ -1025,12 +1140,41 @@ def compatibility_warning_events(
     Returns:
         Immutable compatibility-warning events in publication order.
     """
-    codes: list[CompatibilityWarningCode] = []
+    codes: list[_CompatibilityWarningCode] = []
     if timeout.connect is None and timeout.read is None:
         codes.append('legacy-infinite-timeout')
     return tuple(
         CompatibilityWarningEvent(code=code, message=_WARNING_MESSAGES[code]) for code in codes
     )
+
+
+def constructor_ca_certs(ca_certs: str | None) -> str | None:
+    """Resolve and validate the constructor's certificate-authority bundle.
+
+    Args:
+        ca_certs: Bundle path, with a false value falling back to
+            `SHOTGUN_API_CACERTS`.
+
+    Returns:
+        The selected readable file path, or `None` for default trust roots.
+
+    Raises:
+        ValueError: If the selected path is not a readable file.
+    """
+    bundle = ca_certs or os.environ.get('SHOTGUN_API_CACERTS') or None
+    if bundle is None:
+        return None
+    source = 'ca_certs' if ca_certs else 'SHOTGUN_API_CACERTS'
+    message = f'{source} must name a readable CA bundle file: {bundle}'
+    path = Path(bundle)
+    try:
+        if not path.is_file():
+            raise ValueError(message)
+        with path.open('rb'):
+            pass
+    except OSError:
+        raise ValueError(message) from None
+    return bundle
 
 
 def constructor_http_proxy_fields(http_proxy: object) -> dict[str, object] | None:
@@ -1068,7 +1212,7 @@ def event_route(operation: _protocol.OperationDescriptor) -> EventRoute:
     return operation.endpoint_role or 'rpc'
 
 
-def notify_observer(observer: ObserverCallback | None, event: ObserverEvent) -> None:
+def notify_observer(observer: ObserverCallback | None, event: _ObserverEvent) -> None:
     """Invoke an observer and suppress ordinary `Exception` failures.
 
     Process-control exceptions propagate. Logged warnings identify only the
@@ -1082,36 +1226,6 @@ def notify_observer(observer: ObserverCallback | None, event: ObserverEvent) -> 
         return
     with _ObserverBoundary(type(event).__name__):
         observer(event)
-
-
-def parse_server_params(base_url: str) -> tuple[str, str, str]:
-    """Parse a base URL into normalized server parameters.
-
-    Args:
-        base_url: HTTP or HTTPS site URL.
-
-    Returns:
-        The normalized scheme, server authority, and API path.
-
-    Raises:
-        ValueError: If `base_url` has an unsupported or invalid origin.
-    """
-    parsed = urllib.parse.urlsplit(base_url)
-    scheme = parsed.scheme.lower()
-    if scheme not in {'http', 'https'}:
-        raise ValueError('base_url must be http or https')
-    if parsed.hostname is None or parsed.username is not None or parsed.password is not None:
-        raise ValueError('base_url must contain a host without credentials')
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError('base_url contains an invalid port') from exc
-    host = parsed.hostname.encode('idna').decode('ascii').lower()
-    host_for_server = f'[{host}]' if ':' in host else host
-    server = f'{host_for_server}:{port}' if port is not None else host_for_server
-    prefix = parsed.path.rstrip('/')
-    api_path = f'{prefix}/api3/json' if prefix else '/api3/json'
-    return scheme, server, api_path
 
 
 def publish_server_info(
@@ -1137,14 +1251,14 @@ def publish_server_info(
         raise TypeError('server_info must be a dictionary')
     typed_copied = cast('dict[str, object]', copied)
     previous_server_info: object = None
-    with config._lock:
+    with config.lock:
         if (
-            context.origin_generation != config._origin_generation
-            or context.transport_generation != config._transport_generation
+            context.origin_generation != config.origin_generation
+            or context.transport_generation != config.transport_generation
         ):
             return False
-        previous_server_info = config._values['server_info']
-        config._values['server_info'] = typed_copied
+        previous_server_info = config.values['server_info']
+        config.values['server_info'] = typed_copied
     del previous_server_info
     return True
 
@@ -1186,25 +1300,25 @@ def publish_session_token(config: Config, context: RequestContext, session_token
     previous_session_token: object = None
     previous_user_login: object = None
     previous_user_password: object = None
-    with config._lock:
+    with config.lock:
         if (
-            context.origin_generation != config._origin_generation
-            or context.transport_generation != config._transport_generation
-            or context.auth_generation != config._auth_generation
+            context.origin_generation != config.origin_generation
+            or context.transport_generation != config.transport_generation
+            or context.auth_generation != config.auth_generation
         ):
             return False
-        previous_session_token = config._values['session_token']
-        config._values['session_token'] = owned_session_token
+        previous_session_token = config.values['session_token']
+        config.values['session_token'] = owned_session_token
         if context.has_one_use_auth_token:
-            previous_auth_token = config._values['auth_token']
-            previous_extra_auth_params = config._values['extra_auth_params']
-            previous_user_login = config._values['user_login']
-            previous_user_password = config._values['user_password']
-            config._values['auth_token'] = None
-            config._values['user_login'] = None
-            config._values['user_password'] = None
-            config._values['extra_auth_params'] = retained_extra_auth_params
-        config._auth_generation += 1
+            previous_auth_token = config.values['auth_token']
+            previous_extra_auth_params = config.values['extra_auth_params']
+            previous_user_login = config.values['user_login']
+            previous_user_password = config.values['user_password']
+            config.values['auth_token'] = None
+            config.values['user_login'] = None
+            config.values['user_password'] = None
+            config.values['extra_auth_params'] = retained_extra_auth_params
+        config.auth_generation += 1
     del previous_auth_token
     del previous_extra_auth_params
     del previous_session_token
@@ -1223,14 +1337,14 @@ def readiness_identity(config: Config) -> tuple[str, int] | None:
         Canonical origin and transport generation, or `None` when the origin is
         unconfigured or invalid.
     """
-    with config._lock:
+    with config.lock:
         try:
-            origin = _canonical_origin(config._values)
+            origin = _canonical_origin(config.values)
         except (TypeError, ValueError):
             return None
         if origin is None:
             return None
-        return origin, config._transport_generation
+        return origin, config.transport_generation
 
 
 def readiness_key(context: RequestContext) -> tuple[str, int]:
@@ -1251,7 +1365,7 @@ def readiness_key(context: RequestContext) -> tuple[str, int]:
 
 
 def require_secure_rpc(context: RequestContext, include_auth: bool) -> None:
-    """Allow captured authentication over HTTP only for direct loopback connections.
+    """Allow captured authentication over HTTP only in process or on loopback.
 
     Args:
         context: Immutable request settings captured before operation I/O.
@@ -1261,7 +1375,12 @@ def require_secure_rpc(context: RequestContext, include_auth: bool) -> None:
         ValueError: If authenticated HTTP uses a proxy or a non-loopback
             origin.
     """
-    if not include_auth or not context.auth or context.canonical_origin is None:
+    if (
+        context.in_process
+        or not include_auth
+        or not context.auth
+        or context.canonical_origin is None
+    ):
         return
     parsed = urllib.parse.urlsplit(context.canonical_origin)
     if parsed.scheme != 'http':
@@ -1366,11 +1485,12 @@ def snapshot(config: Config, auth_spec: _protocol.AuthSpec | None = None) -> Req
         ValueError: If stored URL, proxy, retry, or timeout values are invalid.
         ShotgunError: If stored server metadata contains an invalid page limit.
     """
-    with config._lock:
-        values = dict(config._values)
-        auth_generation = config._auth_generation
-        origin_generation = config._origin_generation
-        transport_generation = config._transport_generation
+    with config.lock:
+        values = dict(config.values)
+        auth_generation = config.auth_generation
+        in_process = config.in_process
+        origin_generation = config.origin_generation
+        transport_generation = config.transport_generation
     if auth_spec is None:
         copied_spec = _auth_spec(values)
     else:
@@ -1417,6 +1537,10 @@ def snapshot(config: Config, auth_spec: _protocol.AuthSpec | None = None) -> Req
         records_per_page=records_per_page,
         page_prefetch=_integer(values['page_prefetch'], 'page_prefetch'),
         pool_maxsize=_integer(values['pool_maxsize'], 'pool_maxsize'),
+        max_connection_idle_secs=_effective_idle_limit(values['max_connection_idle_secs']),
+        tcp_keepalive_timeout_secs=_effective_keepalive_target(
+            values['tcp_keepalive_timeout_secs']
+        ),
         proxy_url=_proxy_url(values),
         proxy_headers=_proxy_headers(values),
         max_rpc_attempts=_integer(values['max_rpc_attempts'], 'max_rpc_attempts'),
@@ -1434,6 +1558,7 @@ def snapshot(config: Config, auth_spec: _protocol.AuthSpec | None = None) -> Req
         on_progress=_observer(values, 'on_progress'),
         on_compatibility_warning=_observer(values, 'on_compatibility_warning'),
         site_url=site_url,
+        in_process=in_process,
     )
 
 

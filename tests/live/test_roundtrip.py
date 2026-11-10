@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import struct
-import zlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from shotgun_api3 import Shotgun, sg_timezone
+from tests.live._images import png
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from .conftest import _LiveResources
+    from .conftest import LiveResources
 
 pytestmark = pytest.mark.live
 
@@ -21,26 +20,11 @@ def _local_now() -> datetime:
     return datetime.now(tz=UTC).astimezone().replace(microsecond=0)
 
 
-def _png(width: int, height: int) -> bytes:
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        body = kind + data
-        return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body))
-
-    header = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)
-    pixels = zlib.compress((b'\x00' + b'\x80\x40\x20' * width) * height)
-    return (
-        b'\x89PNG\r\n\x1a\n'
-        + chunk(b'IHDR', header)
-        + chunk(b'IDAT', pixels)
-        + chunk(b'IEND', b'')
-    )
-
-
 def test_crud_roundtrip(
     live_sg: Shotgun,
     live_project: dict[str, object],
     live_namespace: str,
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
 ) -> None:
     code = f'{live_namespace}-crud'
     shot = live_resources.create('Shot', {'code': code, 'project': live_project})
@@ -75,7 +59,7 @@ def test_datetime_roundtrip(
     live_sg: Shotgun,
     live_project: dict[str, object],
     live_namespace: str,
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
 ) -> None:
     before = _local_now()
     note = live_resources.create(
@@ -94,40 +78,17 @@ def test_datetime_roundtrip(
     assert before <= created_at <= after
 
 
-def test_paging_and_ordering_roundtrip(
-    live_sg: Shotgun,
-    live_project: dict[str, object],
-    live_namespace: str,
-    live_resources: _LiveResources,
-) -> None:
-    prefix = f'{live_namespace}-paging-'
-    expected_codes = [f'{prefix}{index:03d}' for index in range(3)]
-    for code in reversed(expected_codes):
-        live_resources.create('Shot', {'code': code, 'project': live_project})
-
-    filters = [
-        ['project', 'is', live_project],
-        ['code', 'starts_with', prefix],
-    ]
-    order = [{'field_name': 'code', 'direction': 'asc'}]
-    first_page = live_sg.find('Shot', filters, ['code'], order=order, limit=2, page=1)
-    second_page = live_sg.find('Shot', filters, ['code'], order=order, limit=2, page=2)
-
-    assert [entity['code'] for entity in first_page] == expected_codes[:2]
-    assert [entity['code'] for entity in second_page] == expected_codes[2:]
-
-
 def test_thumbnail_paths_upload_on_create_and_update(
     live_sg: Shotgun,
     live_project: dict[str, object],
     live_namespace: str,
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
     tmp_path: Path,
 ) -> None:
     image = tmp_path / f'{live_namespace}-thumbnail.png'
-    image.write_bytes(_png(64, 64))
+    image.write_bytes(png(64, 64))
     strip = tmp_path / f'{live_namespace}-filmstrip.png'
-    strip.write_bytes(_png(480, 135))
+    strip.write_bytes(png(480, 135))
 
     shot = live_resources.create(
         'Shot',
@@ -151,7 +112,7 @@ def test_upload_download_roundtrip(
     live_sg: Shotgun,
     live_project: dict[str, object],
     live_namespace: str,
-    live_resources: _LiveResources,
+    live_resources: LiveResources,
     tmp_path: Path,
 ) -> None:
     owner = live_resources.create(

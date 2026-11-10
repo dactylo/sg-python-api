@@ -173,15 +173,12 @@ if [[ -n $(
     exit 1
 fi
 
-# Keep the public input scope aligned with _artifact_evidence.py.
+artifact_inputs=()
+while IFS= read -r artifact_input; do
+    artifact_inputs+=("$artifact_input")
+done <"$REPO_ROOT/scripts/artifact_inputs.txt"
 CANDIDATE_COMMIT=$(git -C "$REPO_ROOT" rev-list --max-count=1 'HEAD^{commit}' -- \
-    ':(top,glob)*' \
-    ':(top,glob).github/**' \
-    ':(top,glob)docs/*.md' \
-    ':(top,glob)examples/**' \
-    ':(top,glob)scripts/**' \
-    ':(top,glob)src/**' \
-    ':(top,glob)tests/**')
+    "${artifact_inputs[@]}")
 STATUS='RUNNING'
 mkdir -p -- "$(dirname -- "$RESULTS_FILE")"
 REPORT_ENABLED=1

@@ -1,8 +1,5 @@
 import copy
 import inspect
-import json
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -12,9 +9,16 @@ from shotgun_api3 import _crud, _errors
 from shotgun_api3._client import Shotgun
 from shotgun_api3._config import ResponseEvent
 from shotgun_api3._transport import TransportResponse
-from tests._pyright import run_pyright
-from tests._transports import _FakeTransport
-from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
+from tests._transports import FakeTransport
+from tests.client._crud_cases import (
+    FIND_METHOD_NAMES,
+    INVALID_RETURN_FIELDS,
+    RETURN_FIELD_CASES,
+    STRING_FIELD_SEQUENCES,
+    STRING_FIELDS,
+)
+from tests.client._payloads import rpc_params
+from tests.conftest import fake_client, fake_transport, make_response, sent_payload
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -25,12 +29,6 @@ def _page(ids: list[int], count: int) -> dict[str, object]:
         'entities': [{'type': 'Shot', 'id': entity_id} for entity_id in ids],
         'paging_info': {'entity_count': count},
     }
-
-
-def _params(sg: Shotgun, index: int = 0) -> dict[str, object]:
-    payload = _sent_payload(sg, index)
-    params = cast('list[object]', payload['params'])
-    return cast('dict[str, object]', params[1])
 
 
 def _run_result_contract_case(sg: Shotgun, operation: str) -> object:
@@ -68,13 +66,13 @@ def test_batch_builds_exact_calls_without_mutating_requests() -> None:
     ]
     original = copy.deepcopy(requests)
     response = [{'type': 'Shot', 'id': 9}, {'type': 'Shot', 'id': 9}, True]
-    sg = _fake_client([_make_response(response)])
+    sg = fake_client([make_response(response)])
 
     assert sg.batch(requests) == response
 
     assert requests == original
-    assert _sent_payload(sg)['method_name'] == 'batch'
-    assert cast('list[object]', _sent_payload(sg)['params'])[1] == [
+    assert sent_payload(sg)['method_name'] == 'batch'
+    assert cast('list[object]', sent_payload(sg)['params'])[1] == [
         {
             'request_type': 'create',
             'type': 'Shot',
@@ -114,7 +112,7 @@ def test_batch_detaches_nested_data_before_readiness() -> None:
             'return_fields': return_fields,
         }
     ]
-    sg = _fake_client([_make_response([{'type': 'Shot', 'id': 1}])])
+    sg = fake_client([make_response([{'type': 'Shot', 'id': 1}])])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -130,7 +128,7 @@ def test_batch_detaches_nested_data_before_readiness() -> None:
 
     sg.batch(requests)
 
-    assert cast('list[object]', _sent_payload(sg)['params'])[1] == [
+    assert cast('list[object]', sent_payload(sg)['params'])[1] == [
         {
             'request_type': 'create',
             'type': 'Shot',
@@ -143,14 +141,14 @@ def test_batch_detaches_nested_data_before_readiness() -> None:
 
 
 def test_batch_empty_requests_are_a_noop_without_readiness() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
 
     assert sg.batch([]) == []
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_batch_empty_return_fields_use_default_in_one_rpc() -> None:
-    sg = _fake_client([_make_response([{'type': 'Shot', 'id': 1}])])
+    sg = fake_client([make_response([{'type': 'Shot', 'id': 1}])])
 
     result = sg.batch(
         [
@@ -164,7 +162,7 @@ def test_batch_empty_return_fields_use_default_in_one_rpc() -> None:
     )
 
     assert result == [{'type': 'Shot', 'id': 1}]
-    assert cast('list[object]', _sent_payload(sg)['params'])[1] == [
+    assert cast('list[object]', sent_payload(sg)['params'])[1] == [
         {
             'request_type': 'create',
             'type': 'Shot',
@@ -172,21 +170,21 @@ def test_batch_empty_return_fields_use_default_in_one_rpc() -> None:
             'return_fields': ['id'],
         }
     ]
-    assert len(_fake_transport(sg).requests) == 2
+    assert len(fake_transport(sg).requests) == 2
 
 
 def test_batch_rejects_invalid_request_container_before_readiness() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     batch = cast('Callable[[object], object]', sg.batch)
 
     with pytest.raises(_errors.ShotgunError, match=r'^batch requests must be a list$'):
         batch(())
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_batch_validates_every_member_before_readiness() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     requests: list[dict[str, Any]] = [
         {'request_type': 'delete', 'entity_type': 'Shot', 'entity_id': 1},
         {'request_type': 'update', 'entity_type': 'Shot', 'entity_id': True, 'data': {}},
@@ -198,12 +196,12 @@ def test_batch_validates_every_member_before_readiness() -> None:
     ):
         sg.batch(requests)
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_batch_validation_does_not_expose_request_values() -> None:
     sensitive_value = 'opaque-sensitive-value'
-    sg = _fake_client([])
+    sg = fake_client([])
 
     with pytest.raises(_errors.ShotgunError) as error:
         sg.batch(
@@ -318,19 +316,19 @@ def test_batch_validation_is_useful_and_does_not_send(
     request_value: object,
     message: str,
 ) -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     batch = cast('Callable[[object], object]', sg.batch)
 
     with pytest.raises(_errors.ShotgunError, match=f'^{message}$'):
         batch([request_value])
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_create_detaches_nested_data_before_readiness() -> None:
     nested = {'tags': ['original']}
     data = {'metadata': nested}
-    sg = _fake_client([_make_response({'type': 'Shot', 'id': 1})])
+    sg = fake_client([make_response({'type': 'Shot', 'id': 1})])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -345,7 +343,7 @@ def test_create_detaches_nested_data_before_readiness() -> None:
 
     sg.create('Shot', data)
 
-    assert cast('list[dict[str, object]]', _params(sg)['fields']) == [
+    assert cast('list[dict[str, object]]', rpc_params(sg)['fields']) == [
         {'field_name': 'metadata', 'value': {'tags': ['original']}}
     ]
     assert data == {'metadata': {'tags': ['changed']}}
@@ -353,47 +351,16 @@ def test_create_detaches_nested_data_before_readiness() -> None:
 
 @pytest.mark.parametrize(
     'fields',
-    ['code', '', b'code', b'', 0, 1, False, ['code', 1], ('code', None)],
+    INVALID_RETURN_FIELDS,
 )
 def test_create_rejects_invalid_return_fields_before_io(fields: object) -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     create = cast('Callable[[str, dict[str, object], object], object]', sg.create)
 
     with pytest.raises(_errors.ShotgunError, match=r'^create return_fields must be .*strings.*$'):
         create('Shot', {}, fields)
 
-    assert _fake_transport(sg).requests == []
-
-
-@pytest.mark.parametrize(
-    ('fields_factory', 'expected'),
-    [
-        (lambda: None, ['id']),
-        (list, ['id']),
-        (tuple, ['id']),
-        (lambda: ['code', ''], ['code', '']),
-        (lambda: ('code', ''), ['code', '']),
-        (lambda: (field for field in ['code', '']), ['code', '']),
-        (lambda: (field for field in ''), []),
-    ],
-    ids=['none', 'empty-list', 'empty-tuple', 'list', 'tuple', 'iterator', 'empty-iterator'],
-)
-def test_create_return_fields_preserve_defaults_and_detach_before_readiness(
-    fields_factory: 'Callable[[], object]', expected: list[str]
-) -> None:
-    fields = fields_factory()
-    sg = _fake_client([_make_response({'type': 'Shot', 'id': 1})])
-    create = cast('Callable[[str, dict[str, object], object], object]', sg.create)
-
-    def mutate_after_readiness(event: object) -> None:
-        if isinstance(event, ResponseEvent) and isinstance(fields, list):
-            fields[:] = ['changed']
-
-    sg.config.on_response = mutate_after_readiness
-
-    create('Shot', {}, fields)
-
-    assert _params(sg)['return_fields'] == expected
+    assert fake_transport(sg).requests == []
 
 
 def test_create_update_delete_and_revive_build_exact_payloads_without_mutation() -> None:
@@ -410,12 +377,12 @@ def test_create_update_delete_and_revive_build_exact_payloads_without_mutation()
     create_original = copy.deepcopy(create_data)
     update_original = copy.deepcopy(update_data)
     modes_original = modes.copy()
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'type': 'Shot', 'id': 5, 'code': 'X'}),
-            _make_response({'type': 'Shot', 'id': 5, 'code': 'Y'}),
-            _make_response(obj=True),
-            _make_response(obj=True),
+            make_response({'type': 'Shot', 'id': 5, 'code': 'X'}),
+            make_response({'type': 'Shot', 'id': 5, 'code': 'Y'}),
+            make_response(obj=True),
+            make_response(obj=True),
         ]
     )
 
@@ -427,7 +394,7 @@ def test_create_update_delete_and_revive_build_exact_payloads_without_mutation()
     assert create_data == create_original
     assert update_data == update_original
     assert modes == modes_original
-    assert _params(sg, 0) == {
+    assert rpc_params(sg, 0) == {
         'type': 'Shot',
         'fields': [
             {'field_name': 'code', 'value': 'X'},
@@ -438,7 +405,7 @@ def test_create_update_delete_and_revive_build_exact_payloads_without_mutation()
         ],
         'return_fields': ['code'],
     }
-    assert _params(sg, 1) == {
+    assert rpc_params(sg, 1) == {
         'type': 'Shot',
         'id': 5,
         'fields': [
@@ -449,41 +416,18 @@ def test_create_update_delete_and_revive_build_exact_payloads_without_mutation()
             }
         ],
     }
-    assert _params(sg, 2) == {'type': 'Shot', 'id': 5}
-    assert _params(sg, 3) == {'type': 'Shot', 'id': 5}
-
-
-@pytest.mark.parametrize(
-    ('operation', 'result', 'message'),
-    [
-        ('create', ['sensitive-create-result'], 'create did not return a dictionary'),
-        ('update', 'sensitive-update-result', 'update did not return a dictionary'),
-        ('delete', 1, 'delete did not return a boolean'),
-        ('revive', 0, 'revive did not return a boolean'),
-        ('batch', {'value': 'sensitive-batch-result'}, 'batch did not return a list'),
-    ],
-)
-def test_crud_and_batch_reject_invalid_result_shapes_without_values(
-    operation: str,
-    result: object,
-    message: str,
-) -> None:
-    sg = _fake_client([_make_response(result)])
-
-    with pytest.raises(_errors.ShotgunError, match=f'^{message}$') as error:
-        _run_result_contract_case(sg, operation)
-
-    assert 'sensitive-' not in str(error.value)
+    assert rpc_params(sg, 2) == {'type': 'Shot', 'id': 5}
+    assert rpc_params(sg, 3) == {'type': 'Shot', 'id': 5}
 
 
 def test_crud_projection_reads_canonical_runtime_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entity = {'type': 'Project', 'id': 2, 'name': 'P', 'sg_status': 'Active'}
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'type': 'Shot', 'id': 5}),
-            _make_response({'type': 'Shot', 'id': 5}),
+            make_response({'type': 'Shot', 'id': 5}),
+            make_response({'type': 'Shot', 'id': 5}),
         ]
     )
 
@@ -492,16 +436,16 @@ def test_crud_projection_reads_canonical_runtime_flag(
     monkeypatch.setattr(shotgun_module, 'SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION', False)
     sg.update('Shot', 5, {'project': entity})
 
-    assert cast('list[dict[str, object]]', _params(sg, 0)['fields']) == [
+    assert cast('list[dict[str, object]]', rpc_params(sg, 0)['fields']) == [
         {'field_name': 'project', 'value': entity}
     ]
-    assert cast('list[dict[str, object]]', _params(sg, 1)['fields']) == [
+    assert cast('list[dict[str, object]]', rpc_params(sg, 1)['fields']) == [
         {'field_name': 'project', 'value': {'type': 'Project', 'id': 2, 'name': 'P'}}
     ]
 
 
 def test_crud_rejects_invalid_data_before_readiness() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     create = cast('Callable[[str, object], object]', sg.create)
     update = cast('Callable[[str, int, object], object]', sg.update)
 
@@ -510,13 +454,13 @@ def test_crud_rejects_invalid_data_before_readiness() -> None:
     with pytest.raises(_errors.ShotgunError, match='update data must be a dictionary'):
         update('Shot', 1, [])
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_crud_validates_field_names_and_update_modes_before_readiness() -> None:
-    create_sg = _fake_client([])
-    update_fields_sg = _fake_client([])
-    update_sg = _fake_client([])
+    create_sg = fake_client([])
+    update_fields_sg = fake_client([])
+    update_sg = fake_client([])
     create = cast('Callable[[str, object], object]', create_sg.create)
     update_fields = cast('Callable[..., object]', update_fields_sg.update)
     update = cast('Callable[..., object]', update_sg.update)
@@ -537,9 +481,9 @@ def test_crud_validates_field_names_and_update_modes_before_readiness() -> None:
     ):
         update('Shot', 1, {}, {'assets': 1})
 
-    assert _fake_transport(create_sg).requests == []
-    assert _fake_transport(update_fields_sg).requests == []
-    assert _fake_transport(update_sg).requests == []
+    assert fake_transport(create_sg).requests == []
+    assert fake_transport(update_fields_sg).requests == []
+    assert fake_transport(update_sg).requests == []
 
 
 def test_find_and_find_one_expose_exact_signatures_and_binding_identity() -> None:
@@ -595,7 +539,7 @@ def test_find_and_find_one_expose_exact_signatures_and_binding_identity() -> Non
         None,
     )
 
-    sg = _fake_client([])
+    sg = fake_client([])
     find = cast('Callable[..., object]', sg.find)
     find_one = cast('Callable[..., object]', sg.find_one)
     with pytest.raises(TypeError, match=r'^Shotgun\.find\(\)'):
@@ -613,7 +557,7 @@ def test_find_builds_exact_read_payload_without_mutating_inputs() -> None:
     ]
     presets: list[dict[str, object]] = []
     original = copy.deepcopy((filters, fields, order, presets))
-    sg = _fake_client([_make_response(_page([], 0))])
+    sg = fake_client([make_response(_page([], 0))])
 
     assert (
         sg.find(
@@ -631,7 +575,7 @@ def test_find_builds_exact_read_payload_without_mutating_inputs() -> None:
     )
 
     assert (filters, fields, order, presets) == original
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': 'Shot',
         'return_fields': ['code'],
         'filters': {
@@ -651,11 +595,11 @@ def test_find_builds_exact_read_payload_without_mutating_inputs() -> None:
 
 
 def test_find_defaults_to_id_and_omits_optional_read_keys() -> None:
-    sg = _fake_client([_make_response(_page([], 0))])
+    sg = fake_client([make_response(_page([], 0))])
 
     assert sg.find('Shot', [], fields=[]) == []
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': 'Shot',
         'return_fields': ['id'],
         'filters': {'logical_operator': 'and', 'conditions': []},
@@ -673,7 +617,7 @@ def test_find_detaches_all_mutable_inputs_before_readiness() -> None:
     order = [{'field_name': 'code', 'direction': 'asc'}]
     preset_value = {'nested': ['original-preset']}
     presets = [{'preset_name': 'LATEST', 'values': [preset_value]}]
-    sg = _fake_client([_make_response(_page([], 0))])
+    sg = fake_client([make_response(_page([], 0))])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -699,7 +643,7 @@ def test_find_detaches_all_mutable_inputs_before_readiness() -> None:
         additional_filter_presets=presets,
     )
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': ['original-type'],
         'return_fields': [['original-field']],
         'filters': {
@@ -726,60 +670,19 @@ def test_find_detaches_all_mutable_inputs_before_readiness() -> None:
 
 
 def test_find_explicit_page_fetches_one_page_without_result_truncation() -> None:
-    sg = _fake_client([_make_response(_page([7, 8], 900))])
+    sg = fake_client([make_response(_page([7, 8], 900))])
 
     result = sg.find('Shot', [], limit=1, page=3)
 
     assert [record['id'] for record in result] == [7, 8]
-    assert cast('dict[str, object]', _params(sg)['paging']) == {
+    assert cast('dict[str, object]', rpc_params(sg)['paging']) == {
         'entities_per_page': 1,
         'current_page': 3,
     }
 
 
-@pytest.mark.parametrize(
-    ('paging_info', 'message'),
-    [
-        (
-            {'entity_count': True},
-            'paging_info entity_count must be a nonnegative integer',
-        ),
-        (
-            {'entity_count': '1'},
-            'paging_info entity_count must be a nonnegative integer',
-        ),
-        (
-            {'has_next_page': 'yes'},
-            'paging_info has_next_page must be a boolean',
-        ),
-    ],
-)
-def test_find_explicit_page_rejects_malformed_active_paging_signal(
-    paging_info: dict[str, object],
-    message: str,
-) -> None:
-    sg = _fake_client(
-        [
-            _make_response(
-                {
-                    'entities': [{'type': 'Shot', 'id': 1}],
-                    'paging_info': paging_info,
-                }
-            )
-        ]
-    )
-
-    with pytest.raises(_errors.ShotgunError, match=f'^{message}$'):
-        sg.find('Shot', [], page=3)
-
-    assert len(_fake_transport(sg).requests) == 2
-    assert sg._lease_counts == {}
-
-
 def test_find_explicit_page_rejects_non_dictionary_paging_info() -> None:
-    sg = _fake_client(
-        [_make_response({'entities': [{'type': 'Shot', 'id': 1}], 'paging_info': []})]
-    )
+    sg = fake_client([make_response({'entities': [{'type': 'Shot', 'id': 1}], 'paging_info': []})])
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -788,41 +691,13 @@ def test_find_explicit_page_rejects_non_dictionary_paging_info() -> None:
         sg.find('Shot', [], page=3)
 
 
-@pytest.mark.parametrize(
-    'paging_info',
-    [
-        {'entity_count': 900},
-        {'has_next_page': True},
-        {'has_next_page': False},
-        {},
-    ],
-)
-def test_find_explicit_page_validates_metadata_but_ignores_verdict(
-    paging_info: dict[str, object],
-) -> None:
-    sg = _fake_client(
-        [
-            _make_response(
-                {
-                    'entities': [{'type': 'Shot', 'id': 1}],
-                    'paging_info': paging_info,
-                }
-            )
-        ]
-    )
-
-    assert sg.find('Shot', [], page=3) == [{'type': 'Shot', 'id': 1}]
-    assert len(_fake_transport(sg).requests) == 2
-    assert sg._lease_counts == {}
-
-
 def test_find_injects_platform_local_path_fields() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     local_path_field = sg.client_caps.local_path_field
     assert local_path_field is not None
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(
+            make_response(
                 {
                     'entities': [
                         {
@@ -849,42 +724,163 @@ def test_find_injects_platform_local_path_fields() -> None:
 
 
 def test_find_limit_stops_and_truncates_after_consuming_page() -> None:
-    sg = _fake_client([_make_response(_page([1, 2, 3, 4], 900))])
+    sg = fake_client([make_response(_page([1, 2, 3, 4], 900))])
 
     result = sg.find('Shot', [], limit=3)
 
     assert [record['id'] for record in result] == [1, 2, 3]
-    assert cast('dict[str, object]', _params(sg)['paging']) == {
+    assert cast('dict[str, object]', rpc_params(sg)['paging']) == {
         'entities_per_page': 3,
         'current_page': 1,
     }
 
 
 def test_find_one_returns_first_entity_or_none() -> None:
-    sg = _fake_client([_make_response(_page([1], 1))])
-    empty = _fake_client([_make_response(_page([], 0))])
+    sg = fake_client([make_response(_page([1], 1))])
+    empty = fake_client([make_response(_page([], 0))])
 
     assert sg.find_one('Shot', [['id', 'is', 1]]) == {'type': 'Shot', 'id': 1}
     assert empty.find_one('Shot', [['id', 'is', 99]]) is None
-    assert cast('dict[str, object]', _params(sg)['paging']) == {
+    assert cast('dict[str, object]', rpc_params(sg)['paging']) == {
         'entities_per_page': 1,
         'current_page': 1,
     }
 
 
-def test_find_paginates_serially_until_count_is_reached() -> None:
-    sg = _fake_client(
+@pytest.mark.parametrize('method_name', FIND_METHOD_NAMES)
+@pytest.mark.parametrize('fields', STRING_FIELDS)
+def test_find_rejects_string_fields(method_name: str, fields: object) -> None:
+    sg = fake_client([])
+    method = cast('Callable[[str, list[object], object], object]', getattr(sg, method_name))
+
+    with pytest.raises(_errors.ShotgunError, match=r'fields'):
+        method('Shot', [], fields)
+
+    assert fake_transport(sg).requests == []
+
+
+@pytest.mark.parametrize('method_name', FIND_METHOD_NAMES)
+@pytest.mark.parametrize('fields', STRING_FIELD_SEQUENCES)
+def test_find_accepts_string_field_sequences(method_name: str, fields: object) -> None:
+    sg = fake_client([make_response(_page([41], 1))])
+    method = cast('Callable[[str, list[object], object], object]', getattr(sg, method_name))
+
+    method('Shot', [], fields)
+
+    assert rpc_params(sg)['return_fields'] == ['code']
+
+
+@pytest.mark.parametrize(
+    ('fields_factory', 'expected'),
+    RETURN_FIELD_CASES,
+    ids=['none', 'empty-list', 'empty-tuple', 'list', 'tuple', 'iterator', 'empty-iterator'],
+)
+def test_create_return_fields_preserve_defaults_and_detach_before_readiness(
+    fields_factory: 'Callable[[], object]', expected: list[str]
+) -> None:
+    fields = fields_factory()
+    sg = fake_client([make_response({'type': 'Shot', 'id': 1})])
+    create = cast('Callable[[str, dict[str, object], object], object]', sg.create)
+
+    def mutate_after_readiness(event: object) -> None:
+        if isinstance(event, ResponseEvent) and isinstance(fields, list):
+            fields[:] = ['changed']
+
+    sg.config.on_response = mutate_after_readiness
+
+    create('Shot', {}, fields)
+
+    assert rpc_params(sg)['return_fields'] == expected
+
+
+@pytest.mark.parametrize(
+    ('operation', 'result', 'message'),
+    [
+        ('create', ['sensitive-create-result'], 'create did not return a dictionary'),
+        ('update', 'sensitive-update-result', 'update did not return a dictionary'),
+        ('delete', 1, 'delete did not return a boolean'),
+        ('revive', 0, 'revive did not return a boolean'),
+        ('batch', {'value': 'sensitive-batch-result'}, 'batch did not return a list'),
+    ],
+)
+def test_crud_and_batch_reject_invalid_result_shapes_without_values(
+    operation: str,
+    result: object,
+    message: str,
+) -> None:
+    sg = fake_client([make_response(result)])
+
+    with pytest.raises(_errors.ShotgunError, match=f'^{message}$') as error:
+        _run_result_contract_case(sg, operation)
+
+    assert 'sensitive-' not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ('paging_info', 'message'),
+    [
+        (
+            {'entity_count': True},
+            'paging_info entity_count must be a nonnegative integer',
+        ),
+        (
+            {'entity_count': '1'},
+            'paging_info entity_count must be a nonnegative integer',
+        ),
+        (
+            {'has_next_page': 'yes'},
+            'paging_info has_next_page must be a boolean',
+        ),
+    ],
+)
+def test_find_explicit_page_rejects_malformed_active_paging_signal(
+    paging_info: dict[str, object],
+    message: str,
+) -> None:
+    sg = fake_client(
         [
-            _make_response(_page(list(range(1, 501)), 502)),
-            _make_response(_page([501, 502], 502)),
+            make_response(
+                {
+                    'entities': [{'type': 'Shot', 'id': 1}],
+                    'paging_info': paging_info,
+                }
+            )
         ]
     )
 
-    result = sg.find('Shot', [])
+    with pytest.raises(_errors.ShotgunError, match=f'^{message}$'):
+        sg.find('Shot', [], page=3)
 
-    assert len(result) == 502
-    assert cast('dict[str, object]', _params(sg, 0)['paging'])['current_page'] == 1
-    assert cast('dict[str, object]', _params(sg, 1)['paging'])['current_page'] == 2
+    assert len(fake_transport(sg).requests) == 2
+    assert sg._lease_counts == {}
+
+
+@pytest.mark.parametrize(
+    'paging_info',
+    [
+        {'entity_count': 900},
+        {'has_next_page': True},
+        {'has_next_page': False},
+        {},
+    ],
+)
+def test_find_explicit_page_validates_metadata_but_ignores_verdict(
+    paging_info: dict[str, object],
+) -> None:
+    sg = fake_client(
+        [
+            make_response(
+                {
+                    'entities': [{'type': 'Shot', 'id': 1}],
+                    'paging_info': paging_info,
+                }
+            )
+        ]
+    )
+
+    assert sg.find('Shot', [], page=3) == [{'type': 'Shot', 'id': 1}]
+    assert len(fake_transport(sg).requests) == 2
+    assert sg._lease_counts == {}
 
 
 @pytest.mark.parametrize(
@@ -904,36 +900,38 @@ def test_find_rejects_malformed_active_paging_signal_without_extra_page(
     paging_info: dict[str, object],
     message: str,
 ) -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(
+            make_response(
                 {
-                    'entities': [{'type': 'Shot', 'id': index} for index in range(500)],
+                    'entities': [{'type': 'Shot', 'id': index} for index in range(2)],
                     'paging_info': paging_info,
                 }
             )
-        ]
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
 
     with pytest.raises(_errors.ShotgunError, match=f'^{message}$'):
         sg.find('Shot', [])
 
-    assert len(_fake_transport(sg).requests) == 2
+    assert len(fake_transport(sg).requests) == 2
 
 
 @pytest.mark.parametrize('paging_info', [None, [], 'invalid'])
 def test_find_rejects_non_dictionary_paging_info_without_extra_page(
     paging_info: object,
 ) -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(
+            make_response(
                 {
-                    'entities': [{'type': 'Shot', 'id': index} for index in range(500)],
+                    'entities': [{'type': 'Shot', 'id': index} for index in range(2)],
                     'paging_info': paging_info,
                 }
             )
-        ]
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
 
     with pytest.raises(
@@ -942,17 +940,18 @@ def test_find_rejects_non_dictionary_paging_info_without_extra_page(
     ):
         sg.find('Shot', [])
 
-    assert len(_fake_transport(sg).requests) == 2
+    assert len(fake_transport(sg).requests) == 2
 
 
 def test_find_reuses_detached_presets_across_pages() -> None:
     preset_value = {'nested': ['original']}
     presets = [{'preset_name': 'LATEST', 'values': [preset_value]}]
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(_page(list(range(1, 501)), 501)),
-            _make_response(_page([501], 501)),
-        ]
+            make_response(_page([1, 2], 3)),
+            make_response(_page([3], 3)),
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
     response_count = 0
 
@@ -976,51 +975,54 @@ def test_find_reuses_detached_presets_across_pages() -> None:
             'values': [{'nested': ['original']}],
         }
     ]
-    assert _params(sg, 0)['additional_filter_presets'] == expected
-    assert _params(sg, 1)['additional_filter_presets'] == expected
+    assert rpc_params(sg, 0)['additional_filter_presets'] == expected
+    assert rpc_params(sg, 1)['additional_filter_presets'] == expected
     assert preset_value == {'nested': ['changed-between-pages']}
 
 
 def test_find_treats_none_entity_count_as_absent() -> None:
-    terminal = _fake_client(
+    terminal = fake_client(
         [
-            _make_response(
+            make_response(
                 {
-                    'entities': [{'type': 'Shot', 'id': index} for index in range(500)],
+                    'entities': [{'type': 'Shot', 'id': index} for index in range(2)],
                     'paging_info': {'entity_count': None, 'has_next_page': False},
                 }
             )
-        ]
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
-    continuing = _fake_client(
+    continuing = fake_client(
         [
-            _make_response(
+            make_response(
                 {
-                    'entities': [{'type': 'Shot', 'id': index} for index in range(500)],
+                    'entities': [{'type': 'Shot', 'id': index} for index in range(2)],
                     'paging_info': {'entity_count': None, 'has_next_page': True},
                 }
             ),
-            _make_response(
+            make_response(
                 {
-                    'entities': [{'type': 'Shot', 'id': 500}],
+                    'entities': [{'type': 'Shot', 'id': 2}],
                     'paging_info': {'entity_count': None, 'has_next_page': False},
                 }
             ),
-        ]
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
 
-    assert len(terminal.find('Shot', [])) == 500
-    assert len(continuing.find('Shot', [])) == 501
-    assert len(_fake_transport(terminal).requests) == 2
-    assert len(_fake_transport(continuing).requests) == 3
+    assert len(terminal.find('Shot', [])) == 2
+    assert len(continuing.find('Shot', [])) == 3
+    assert len(fake_transport(terminal).requests) == 2
+    assert len(fake_transport(continuing).requests) == 3
 
 
 def test_find_uses_one_immutable_snapshot_for_all_pages() -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(_page(list(range(1, 501)), 502)),
-            _make_response(_page([501, 502], 502)),
-        ]
+            make_response(_page([1, 2], 4)),
+            make_response(_page([3, 4], 4)),
+        ],
+        server_info={'version': [9, 0, 0], 'api_max_entities_per_page': 2},
     )
     sg.set_session_uuid('original-session')
     response_count = 0
@@ -1038,7 +1040,7 @@ def test_find_uses_one_immutable_snapshot_for_all_pages() -> None:
     sg.find('Shot', [])
 
     for index in (0, 1):
-        params = cast('list[object]', _sent_payload(sg, index)['params'])
+        params = cast('list[object]', sent_payload(sg, index)['params'])
         auth = cast('dict[str, object]', params[0])
         assert auth['session_uuid'] == 'original-session'
     assert sg.config.session_uuid == 'next-operation-session'
@@ -1061,18 +1063,18 @@ def test_find_validates_paging_and_order_before_readiness(
     kwargs: dict[str, object],
     message: str,
 ) -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     find = cast('Callable[..., object]', sg.find)
 
     with pytest.raises(_errors.ShotgunError, match=f'^{message}$'):
         find('Shot', [], **kwargs)
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_first_find_explicit_page_uses_readiness_page_limit() -> None:
-    sg = _fake_client(
-        [_make_response(_page([5, 6], 10))],
+    sg = fake_client(
+        [make_response(_page([5, 6], 10))],
         server_info={
             'version': [9, 0, 0],
             'api_max_entities_per_page': 2,
@@ -1080,7 +1082,7 @@ def test_first_find_explicit_page_uses_readiness_page_limit() -> None:
     )
 
     assert [entity['id'] for entity in sg.find('Shot', [], page=3)] == [5, 6]
-    assert cast('dict[str, object]', _params(sg)['paging']) == {
+    assert cast('dict[str, object]', rpc_params(sg)['paging']) == {
         'entities_per_page': 2,
         'current_page': 3,
     }
@@ -1088,7 +1090,7 @@ def test_first_find_explicit_page_uses_readiness_page_limit() -> None:
 
 def test_first_find_keeps_the_leased_snapshot_when_readiness_publication_is_rejected() -> None:
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
             TransportResponse(
                 status=200,
@@ -1097,7 +1099,7 @@ def test_first_find_keeps_the_leased_snapshot_when_readiness_publication_is_reje
                 content=(b'{"results":{"version":[9,0,0],"api_max_entities_per_page":2}}'),
                 on_close=lambda: sg.config.set_server_params('https://other.example'),
             ),
-            _make_response(
+            make_response(
                 {
                     'entities': [
                         {'type': 'Shot', 'id': 1},
@@ -1106,7 +1108,7 @@ def test_first_find_keeps_the_leased_snapshot_when_readiness_publication_is_reje
                     'paging_info': {'has_next_page': True},
                 }
             ),
-            _make_response(
+            make_response(
                 {
                     'entities': [{'type': 'Shot', 'id': 3}],
                     'paging_info': {'has_next_page': False},
@@ -1114,11 +1116,11 @@ def test_first_find_keeps_the_leased_snapshot_when_readiness_publication_is_reje
             ),
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
 
     assert [entity['id'] for entity in sg.find('Shot', [])] == [1, 2, 3]
     assert all(request.url == 'https://x.example:443/api3/json' for request in transport.requests)
-    assert cast('dict[str, object]', _params(sg, 0)['paging']) == {
+    assert cast('dict[str, object]', rpc_params(sg, 0)['paging']) == {
         'entities_per_page': 2,
         'current_page': 1,
     }
@@ -1145,9 +1147,9 @@ def test_first_find_keeps_the_leased_snapshot_when_readiness_publication_is_reje
 def test_first_find_uses_readiness_page_limit(
     paging_info: list[dict[str, object]],
 ) -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response(
+            make_response(
                 {
                     'entities': [
                         {'type': 'Shot', 'id': 1},
@@ -1156,7 +1158,7 @@ def test_first_find_uses_readiness_page_limit(
                     'paging_info': paging_info[0],
                 }
             ),
-            _make_response(
+            make_response(
                 {
                     'entities': [{'type': 'Shot', 'id': 3}],
                     'paging_info': paging_info[1],
@@ -1170,10 +1172,27 @@ def test_first_find_uses_readiness_page_limit(
     )
 
     assert [entity['id'] for entity in sg.find('Shot', [])] == [1, 2, 3]
-    assert [cast('dict[str, object]', _params(sg, index)['paging']) for index in range(2)] == [
+    assert [cast('dict[str, object]', rpc_params(sg, index)['paging']) for index in range(2)] == [
         {'entities_per_page': 2, 'current_page': 1},
         {'entities_per_page': 2, 'current_page': 2},
     ]
+
+
+@pytest.mark.parametrize(
+    ('filter_operator', 'message'),
+    [(None, 'filters must be a list or tuple'), ('invalid', "Invalid filter_operator: 'invalid'")],
+)
+def test_find_validates_operator_before_rejecting_noncontainer_filters(
+    filter_operator: str | None,
+    message: str,
+) -> None:
+    sg = fake_client([])
+
+    with pytest.raises(_errors.Fault) as caught:
+        sg.find('Shot', cast('Any', None), filter_operator=filter_operator)
+
+    assert str(caught.value) == message
+    assert not fake_transport(sg).requests
 
 
 def test_prepared_find_finalizes_limit_and_page_from_server_limit() -> None:
@@ -1194,102 +1213,11 @@ def test_prepared_find_finalizes_limit_and_page_from_server_limit() -> None:
     assert explicit.paging == {'entities_per_page': 2, 'current_page': 3}
 
 
-@pytest.mark.parametrize('asynchronous', [False, True])
-@pytest.mark.parametrize('mock', [False, True])
-def test_result_annotations_preserve_only_validated_topology(
-    *, asynchronous: bool, mock: bool
-) -> None:
-    module = 'shotgun_api3.lib.mockgun' if mock else 'shotgun_api3'
-    client = 'AsyncShotgun' if asynchronous else 'Shotgun'
-    await_prefix = 'await ' if asynchronous else ''
-    definition = 'async def' if asynchronous else 'def'
-    contracts = {
-        'batch([])': 'list[object]',
-        "create('Shot', {})": 'dict[str, object]',
-        "find('Shot', [])": 'list[dict[str, object]]',
-        "find_one('Shot', [])": 'dict[str, object] | None',
-        "update('Shot', 1, {})": ('list[dict[str, object]]' if mock else 'dict[str, object]'),
-        'schema_entity_read()': 'dict[str, object]',
-        "schema_field_read('Shot')": 'dict[str, object]',
-        'schema_read()': 'dict[str, object]',
-        "delete('Shot', 1)": 'bool',
-        "revive('Shot', 1)": 'bool',
-    }
-    if not mock:
-        contracts.update(
-            {
-                "activity_stream_read('Shot', 1)": 'dict[str, object]',
-                "authenticate_human_user('user', 'password')": 'dict[str, object] | None',
-                'follow({}, {})': 'dict[str, object]',
-                'followers({})': 'list[dict[str, object]]',
-                'following({})': 'list[dict[str, object]]',
-                "nav_expand('/')": 'dict[str, object]',
-                "nav_search_entity('/', {})": 'list[dict[str, object]]',
-                "nav_search_string('/', 'shot')": 'list[dict[str, object]]',
-                'note_thread_read(1)': 'list[dict[str, object]]',
-                'preferences_read()': 'dict[str, object]',
-                "summarize('Shot', [], [])": 'dict[str, object]',
-                "text_search('shot', {'Shot': []})": 'dict[str, object]',
-                'unfollow({}, {})': 'dict[str, object]',
-                'user_subscriptions_read()': 'list[dict[str, object]]',
-                "work_schedule_read('2026-07-01', '2026-07-31')": 'dict[str, object]',
-                "work_schedule_update('2026-07-04', False)": 'dict[str, object]',
-                'info()': 'dict[str, object]',
-                "schema_field_create('Shot', 'text', 'Custom')": 'str',
-            }
-        )
-    lines = [
-        'from typing import assert_type',
-        f'from {module} import {client}',
-        f'{definition} check(client: {client}) -> None:',
-        *(
-            f'    assert_type({await_prefix}client.{call}, {expected})'
-            for call, expected in contracts.items()
-        ),
-        f"    assert_type(({await_prefix}client.create('Shot', {{}}))['id'], object)",
-        f"    ({await_prefix}client.create('Shot', {{}}))['id'].nonexistent()",
-    ]
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-        probe = Path(directory) / 'result_types.py'
-        probe.write_text('\n'.join(lines) + '\n', encoding='utf-8')
-        repository = Path(__file__).parents[2]
-        result = run_pyright(probe, cwd=repository)
-
-    report = json.loads(result.stdout)
-    diagnostics = report['generalDiagnostics']
-    assert result.returncode == 1, result.stdout
-    assert {item['rule'] for item in diagnostics} == {
-        'reportAttributeAccessIssue',
-        'reportUnknownMemberType',
-    }, result.stdout
-    assert all(
-        item['range']['start']['line'] == len(lines) - 1 and 'nonexistent' in item['message']
-        for item in diagnostics
-    ), result.stdout
-
-
-@pytest.mark.parametrize(
-    ('filter_operator', 'message'),
-    [(None, 'filters must be a list or tuple'), ('invalid', "Invalid filter_operator: 'invalid'")],
-)
-def test_find_validates_operator_before_rejecting_noncontainer_filters(
-    filter_operator: str | None,
-    message: str,
-) -> None:
-    sg = _fake_client([])
-
-    with pytest.raises(_errors.Fault) as caught:
-        sg.find('Shot', cast('Any', None), filter_operator=filter_operator)
-
-    assert str(caught.value) == message
-    assert not _fake_transport(sg).requests
-
-
 def test_update_detaches_nested_data_before_readiness() -> None:
     nested = {'tags': ['original']}
     data = {'metadata': nested}
     modes = {'metadata': 'set'}
-    sg = _fake_client([_make_response({'type': 'Shot', 'id': 1})])
+    sg = fake_client([make_response({'type': 'Shot', 'id': 1})])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -1305,7 +1233,7 @@ def test_update_detaches_nested_data_before_readiness() -> None:
 
     sg.update('Shot', 1, data, modes)
 
-    assert cast('list[dict[str, object]]', _params(sg)['fields']) == [
+    assert cast('list[dict[str, object]]', rpc_params(sg)['fields']) == [
         {
             'field_name': 'metadata',
             'value': {'tags': ['original']},

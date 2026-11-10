@@ -1,5 +1,19 @@
+import re
 import tomllib
 from pathlib import Path
+
+
+def test_changelog_heading_matches_version() -> None:
+    repository = Path(__file__).parents[1]
+    with (repository / 'pyproject.toml').open('rb') as pyproject_file:
+        version = tomllib.load(pyproject_file)['project']['version']
+
+    changelog = (repository / 'CHANGELOG.md').read_text(encoding='utf-8')
+    newest_heading = re.search(
+        r'^## (\d+\.\d+\.\d+) \(\d{4}-\d{2}-\d{2}\)$', changelog, re.MULTILINE
+    )
+    assert newest_heading is not None
+    assert newest_heading.group(1) == version
 
 
 def test_project_metadata_separates_dev_group_from_public_metadata() -> None:
@@ -24,11 +38,5 @@ def test_sdist_uses_public_file_allowlist() -> None:
     assert 'exclude' not in sdist
     assert sdist['include'] == [
         '/README.md',
-        '/COMPATIBILITY.md',
-        '/docs/*.md',
-        '/examples/**',
-        '/Makefile',
-        '/scripts/**',
-        '/src/**',
-        '/tests/**',
+        '/src',
     ]

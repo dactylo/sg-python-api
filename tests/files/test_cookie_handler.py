@@ -2,7 +2,7 @@ import inspect
 import json
 import urllib.parse
 import urllib.request
-from typing import Any, cast
+from typing import cast
 
 import pytest
 
@@ -12,8 +12,8 @@ from shotgun_api3._transport import (
     CaseInsensitiveHeaders,
     TransportResponse,
 )
-from tests._transports import _FakeTransport
-from tests.conftest import _fake_client, _fake_transport, _make_response
+from tests._transports import FakeTransport
+from tests.conftest import fake_client, fake_transport, make_response
 
 _COOKIE_VALUE = 'new-session'
 
@@ -23,24 +23,24 @@ class _CookieRequest:
         parsed = urllib.parse.urlsplit(url)
         if parsed.scheme not in {'http', 'https'} or parsed.hostname is None:
             raise ValueError('cookie test URL must use HTTP or HTTPS')
-        self.full_url = url
-        self.headers: dict[str, str] = {}
+        self._full_url = url
+        self._headers: dict[str, str] = {}
         self.host = parsed.netloc
         self.origin_req_host = parsed.hostname
         self.type = parsed.scheme
         self.unverifiable = False
 
     def add_unredirected_header(self, name: str, value: str) -> None:
-        self.headers[name] = value
+        self._headers[name] = value
 
     def get_full_url(self) -> str:
-        return self.full_url
+        return self._full_url
 
     def get_header(self, name: str, default: str | None = None) -> str | None:
-        return self.headers.get(name, default)
+        return self._headers.get(name, default)
 
     def has_header(self, name: str) -> bool:
-        return name in self.headers
+        return name in self._headers
 
 
 def _cookie_header(
@@ -49,9 +49,9 @@ def _cookie_header(
 ) -> str | None:
     request = _CookieRequest(url)
     if request.type == 'https':
-        handler.https_request(cast('Any', request))
+        handler.https_request(cast('urllib.request.Request', request))
     else:
-        handler.http_request(cast('Any', request))
+        handler.http_request(cast('urllib.request.Request', request))
     return request.get_header('Cookie')
 
 
@@ -181,13 +181,13 @@ def test_get_auth_cookie_handler_binds_token_and_cookie_to_one_origin_snapshot()
         content=json.dumps({'results': {'session_id': 'old-origin-token'}}).encode(),
         on_close=change_origin,
     )
-    transport = _FakeTransport(
+    transport = FakeTransport(
         [
-            _make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
+            make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
             token_response,
         ]
     )
-    sg._transport = transport
+    sg.transport = transport
 
     handler = sg.get_auth_cookie_handler()
 
@@ -203,13 +203,13 @@ def test_get_auth_cookie_handler_binds_token_and_cookie_to_one_origin_snapshot()
 
 
 def test_get_auth_cookie_handler_exchanges_uncached_token() -> None:
-    sg = _fake_client([_make_response({'session_id': _COOKIE_VALUE})])
+    sg = fake_client([make_response({'session_id': _COOKIE_VALUE})])
 
     handler = sg.get_auth_cookie_handler()
 
     assert isinstance(handler, urllib.request.HTTPCookieProcessor)
     assert _cookie_header(handler, 'https://x.example/asset') == f'_session_id={_COOKIE_VALUE}'
-    request = _fake_transport(sg).requests[1]
+    request = fake_transport(sg).requests[1]
     assert isinstance(request.body, bytes)
     assert json.loads(request.body) == {
         'method_name': 'get_session_token',

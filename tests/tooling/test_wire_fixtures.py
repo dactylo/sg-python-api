@@ -4,12 +4,11 @@ import datetime as dt
 import json
 import subprocess
 import sys
-import tempfile
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import pytest
@@ -25,12 +24,15 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._pyright import run_pyright
-from tests._transports import _AsyncFakeTransport, _FakeTransport
-from tests.tooling._wire_replay import _ASYNC_REPLAY_RECIPES, _REPLAY_RECIPES
+from tests._transports import AsyncFakeTransport, FakeTransport
+from tests.tooling._wire_replay import ASYNC_REPLAY_RECIPES, REPLAY_RECIPES
+
+_FixtureClient = TypeVar('_FixtureClient', Shotgun, AsyncShotgun)
 
 _FIXTURES = Path('tests/fixtures')
 _READINESS_BODY = b'{"results":{"version":[9,0,0],"api_max_entities_per_page":500}}'
+
+
 _REPLAY_EXPECTED_RESULTS: dict[str, object] = {
     'batch': [
         {
@@ -158,19 +160,19 @@ class _CleanupClient:
         active_after_delete: bool = False,
     ) -> None:
         self.calls: list[tuple[object, ...]] = []
-        self.cleanup_error = cleanup_error
-        self.close_error = close_error
-        self.active_after_delete = active_after_delete
+        self._cleanup_error = cleanup_error
+        self._close_error = close_error
+        self._active_after_delete = active_after_delete
 
     def close(self) -> None:
         self.calls.append(('close',))
-        if self.close_error is not None:
-            raise self.close_error
+        if self._close_error is not None:
+            raise self._close_error
 
     def delete(self, entity_type: str, entity_id: int) -> bool:
         self.calls.append(('delete', entity_type, entity_id))
-        if self.cleanup_error is not None:
-            raise self.cleanup_error
+        if self._cleanup_error is not None:
+            raise self._cleanup_error
         return True
 
     def find_one(
@@ -180,14 +182,7 @@ class _CleanupClient:
         fields: list[str],
     ) -> dict[str, object] | None:
         self.calls.append(('find_one', entity_type, filters, fields))
-        return {'type': entity_type, 'id': filters[0][-1]} if self.active_after_delete else None
-
-
-class _ClosingTransport(_FakeTransport):
-    closed = False
-
-    def close(self) -> None:
-        self.closed = True
+        return {'type': entity_type, 'id': filters[0][-1]} if self._active_after_delete else None
 
 
 def _add_request_key(record: dict[str, object]) -> None:
@@ -225,54 +220,6 @@ def _expected_wire_result(value: object) -> object:
             for key, item in cast('dict[str, object]', value).items()
         }
     return value
-
-
-def _fixture(label: str = 'info') -> dict[str, object]:
-    is_fault = label == 'fault_bad_auth'
-    rpc_method = probe_wire._CAPTURE_SPECS[label][0]
-    response = (
-        {'exception': True, 'error_code': 102, 'message': 'REDACTED'}
-        if is_fault
-        else {'results': {'version': [9, 0, 0]}}
-    )
-    body: dict[str, object] = (
-        {
-            'method_name': 'read',
-            'params': {
-                'type': 'Project',
-                'return_fields': ['id'],
-                'filters': [],
-                'return_only': 'active',
-                'paging': {'entities_per_page': 1, 'current_page': 1},
-                'api_return_image_urls': True,
-            },
-            'session_token': 'REDACTED',
-        }
-        if is_fault
-        else {'method_name': rpc_method, 'params': []}
-    )
-    return {
-        'schema_version': probe_wire._SCHEMA_VERSION,
-        'operation': label,
-        'auth_mode': 'session' if is_fault else 'script',
-        'outcome': (
-            {'kind': 'fault', 'exception': 'AuthenticationFault'}
-            if is_fault
-            else {'kind': 'success'}
-        ),
-        'request': {
-            'method': 'POST',
-            'path': '/api3/json',
-            'headers': {'content-type': 'application/json'},
-            'body': body,
-        },
-        'response': {
-            'status': 200,
-            'reason': 'OK',
-            'headers': {'content-type': 'application/json'},
-            'content_b64': base64.b64encode(json.dumps(response).encode()).decode('ascii'),
-        },
-    }
 
 
 def _fixture_session_token() -> str:
@@ -395,6 +342,28 @@ def _mutate_work_schedule(record: dict[str, object], canary: str) -> None:
     response['content_b64'] = base64.b64encode(json.dumps(content).encode()).decode()
 
 
+def _recorded_response(record: dict[str, object]) -> TransportResponse:
+    status = record['status']
+    reason = record['reason']
+    headers = record['headers']
+    content = record['content_b64']
+    assert isinstance(status, int)
+    assert isinstance(reason, str)
+    assert isinstance(headers, dict)
+    assert isinstance(content, str)
+    checked_headers: dict[str, str] = {}
+    for name, value in cast('dict[object, object]', headers).items():
+        assert isinstance(name, str)
+        assert isinstance(value, str)
+        checked_headers[name] = value
+    return TransportResponse(
+        status=status,
+        reason=reason,
+        headers=checked_headers,
+        content=base64.b64decode(content, validate=True),
+    )
+
+
 def _remove_schema_version(record: dict[str, object]) -> None:
     record.pop('schema_version')
 
@@ -424,7 +393,416 @@ def _request(body: object) -> TransportRequest:
         headers={'Content-Type': 'application/json', 'Authorization': 'Bearer configured-secret'},
         body=json.dumps(body).encode(),
         timeout=TimeoutConfig(connect=1, read=1),
-        token=uuid.UUID(int=0).hex,
+    )
+
+
+def _sanitize(value: object, secrets: Collection[str]) -> object:
+    if isinstance(value, dict):
+        sanitized: dict[object, object] = {}
+        for key, item in cast('dict[object, object]', value).items():
+            sanitized[key] = (
+                probe_wire._REDACTED
+                if probe_wire._is_sensitive_key(key)
+                else _sanitize(item, secrets)
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize(item, secrets) for item in cast('list[object]', value)]
+    if isinstance(value, tuple):
+        return tuple(_sanitize(item, secrets) for item in cast('tuple[object, ...]', value))
+    if isinstance(value, str):
+        return probe_wire._redact_text(value, secrets)
+    if isinstance(value, bytes):
+        sanitized_bytes = value
+        for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+            sanitized_bytes = sanitized_bytes.replace(
+                secret.encode(), probe_wire._REDACTED.encode()
+            )
+        return sanitized_bytes
+    return value
+
+
+def test_activity_capture_rejects_non_dictionary_update() -> None:
+    record = cast(
+        'dict[str, object]',
+        json.loads((_FIXTURES / 'activity_stream_read.json').read_text(encoding='utf-8')),
+    )
+    response = cast('dict[str, object]', record['response'])
+    response['content_b64'] = base64.b64encode(
+        b'{"entity_type":"Project","entity_id":1,"latest_update_id":1,'
+        b'"earliest_update_id":1,"updates":["private update"]}'
+    ).decode()
+
+    with pytest.raises(probe_wire._FixtureError, match='activity response updates'):
+        probe_wire._normalize_fixture_record(record)
+
+
+def test_cleanup_and_close_failures_preserve_the_primary_failure() -> None:
+    primary = RuntimeError('primary')
+    cleanup = RuntimeError('cleanup')
+    close = RuntimeError('close')
+    normal = _CleanupClient(cleanup_error=cleanup)
+    bad = _CleanupClient(close_error=close)
+    resources = probe_wire._ResourceRegistry()
+    resources.track('Note', 1)
+
+    def fail() -> None:
+        raise primary
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        probe_wire._run_guarded(fail, resources, normal, [normal, bad])
+
+    assert caught.value.exceptions == (primary, cleanup, close)
+    assert normal.calls[-1] == ('close',)
+    assert bad.calls == [('close',)]
+
+
+def test_cleanup_is_reverse_order_and_every_client_closes() -> None:
+    normal = _CleanupClient()
+    bad = _CleanupClient()
+    resources = probe_wire._ResourceRegistry()
+    resources.track('Note', 1)
+    resources.track('Attachment', 2)
+
+    result = probe_wire._run_guarded(lambda: 'result', resources, normal, [normal, bad])
+
+    assert result == 'result'
+    assert normal.calls == [
+        ('delete', 'Attachment', 2),
+        ('find_one', 'Attachment', [['id', 'is', 2]], ['id']),
+        ('delete', 'Note', 1),
+        ('find_one', 'Note', [['id', 'is', 1]], ['id']),
+        ('close',),
+    ]
+    assert bad.calls == [('close',)]
+
+
+def test_cleanup_reports_record_still_active_after_delete() -> None:
+    normal = _CleanupClient(active_after_delete=True)
+    resources = probe_wire._ResourceRegistry()
+    resources.track('Asset', 7)
+
+    with pytest.raises(probe_wire._ProbeError, match='cleanup left active Asset'):
+        probe_wire._run_guarded(lambda: None, resources, normal, [normal])
+    assert normal.calls[-1] == ('close',)
+
+
+def test_direct_probe_execution_imports_the_checkout_client() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            (
+                'import pathlib, runpy, sys; '
+                "namespace = runpy.run_path('scripts/probe_wire.py'); "
+                "client = namespace['_load_client_class'](); "
+                'print(pathlib.Path(sys.modules[client.__module__].__file__).resolve())'
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        env={},
+        text=True,
+    )
+
+    assert Path(result.stdout.strip()) == Path('src/shotgun_api3/_client.py').resolve()
+
+
+def test_fixture_inventory_accepts_each_required_label_exactly_once() -> None:
+    inventory = probe_wire._validate_fixture_inventory(_inventory())
+
+    assert frozenset(inventory) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
+
+
+def test_fixture_publication_failure_preserves_previous_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / 'fixtures'
+    directory.mkdir()
+    sentinel = directory / 'previous.json'
+    sentinel.write_text('{"previous":true}\n')
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    original_replace = Path.replace
+    moved_to_backup = False
+
+    def fail_staging_replace(path: Path, target: Path) -> Path:
+        nonlocal moved_to_backup
+        if path == directory:
+            moved_to_backup = True
+            return original_replace(path, target)
+        if path.name.endswith('.staging') and target == directory:
+            assert moved_to_backup
+            raise OSError('injected publication failure')
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, 'replace', fail_staging_replace)
+
+    with pytest.raises(OSError, match='injected publication failure'):
+        probe_wire._write_fixture_directory(directory, _inventory())
+
+    assert moved_to_backup
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+    assert {path.name for path in tmp_path.iterdir()} == {'fixtures'}
+
+
+def test_fixture_publication_replaces_stale_inventory(tmp_path: Path) -> None:
+    directory = tmp_path / 'fixtures'
+    directory.mkdir()
+    (directory / 'stale.json').write_text('{}')
+
+    probe_wire._write_fixture_directory(directory, _inventory())
+
+    assert {path.stem for path in directory.glob('*.json')} == set(
+        probe_wire._REQUIRED_OPERATION_LABELS
+    )
+    assert not (directory / 'stale.json').exists()
+
+
+def test_fixture_session_token_normalization_emits_synthetic_response() -> None:
+    record = next(item for item in _inventory() if item['operation'] == 'get_session_token')
+    response = cast('dict[str, object]', record['response'])
+    content = cast(
+        'dict[str, object]',
+        json.loads(base64.b64decode(cast('str', response['content_b64']), validate=True)),
+    )
+    raw_value = 'raw-session-value-with-a-different-length'
+    content['session_id'] = raw_value
+    response['content_b64'] = base64.b64encode(json.dumps(content).encode()).decode()
+    normalized = probe_wire._normalize_fixture_record(
+        record,
+        {'session_token': raw_value},
+    )
+
+    normalized_response = cast('dict[str, object]', normalized['response'])
+    final_content = base64.b64decode(
+        cast('str', normalized_response['content_b64']),
+        validate=True,
+    )
+    assert json.loads(final_content)['session_id'] == 'X' * 21
+    assert 'redactions' not in normalized_response
+    assert raw_value.encode() not in final_content
+
+
+def test_header_selection_is_case_insensitive_allowlisted_and_sanitized() -> None:
+    headers = {
+        'CONTENT-TYPE': 'application/json',
+        'X-Request-ID': 'request-123',
+        'Set-Cookie': 'session_id=configured-secret',
+        'X-Ignored': 'must-not-survive',
+    }
+
+    selected = probe_wire._select_headers(
+        headers,
+        {'content-type', 'set-cookie', 'x-request-id'},
+        {'configured-secret'},
+    )
+
+    assert selected == {
+        'content-type': 'application/json',
+        'set-cookie': 'REDACTED',
+        'x-request-id': 'request-123',
+    }
+
+
+def test_nav_seed_comes_from_expanded_type_and_field_metadata() -> None:
+    expanded: dict[str, object] = {
+        'path': '/',
+        'target_entities': {'type': 'Project', 'additional_filter_presets': []},
+        'children': [
+            {
+                'target_entities': {
+                    'type': 'Asset',
+                    'additional_filter_presets': [{'seed': {'type': 'Asset', 'field': 'project'}}],
+                }
+            }
+        ],
+    }
+
+    assert probe_wire._qualified_nav_seed(expanded) == 'Asset.project'
+
+
+def test_navigation_project_path_uses_project_expansion_result() -> None:
+    expanded: dict[str, object] = {
+        'path': '/returned/project',
+        'target_entities': {'additional_filter_presets': []},
+    }
+
+    assert probe_wire._project_nav_path(expanded) == '/returned/project'
+
+
+def test_recording_transport_groups_operation_error_with_missing_exchange() -> None:
+    recorder = probe_wire._RecordingTransport(FakeTransport([]), {})
+    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
+    primary = RuntimeError('operation failed')
+
+    with pytest.raises(ExceptionGroup) as caught, recorder.capture(spec):
+        raise primary
+
+    assert caught.value.exceptions[0] is primary
+    capture_error = caught.value.exceptions[1]
+    assert isinstance(capture_error, probe_wire._ProbeError)
+    assert str(capture_error) == 'info did not capture exactly one exchange; captured 0'
+    assert recorder.records == {}
+    assert recorder._pending is None
+
+
+def test_recording_transport_returns_exact_response_but_publishes_normalized_metadata() -> None:
+    content = json.dumps(
+        {
+            'version': [9, 1, 2],
+            'full_version': [9, 1, 2, 3],
+            's3_uploads_enabled': True,
+            's3_direct_uploads_enabled': True,
+            's3_enabled_upload_types': {'private': True},
+            'shotgunlocalhost_browser_integration_enabled': True,
+            'unified_login_flow_enabled': True,
+            'authentication_app_session_launcher_enabled': True,
+            'analytics_site_id': 'private-site-id',
+            'analytics_site_name': 'Private Site',
+            'user_authentication_method': 'private-auth-method',
+            'api_max_entities_per_page': 999,
+        },
+        separators=(',', ':'),
+    ).encode()
+    inner = FakeTransport(
+        [
+            TransportResponse(
+                status=200,
+                reason='Private Reason',
+                headers={
+                    'Content-Type': 'application/octet-stream',
+                    'X-Request-ID': 'request-123',
+                    'Set-Cookie': 'must-not-survive',
+                },
+                content=content,
+            )
+        ]
+    )
+    recorder = probe_wire._RecordingTransport(inner, {'api_key': 'configured-secret'})
+    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
+
+    with recorder.capture(spec):
+        returned = recorder.send(_request({'method_name': 'info', 'params': []}))
+        assert recorder.records == {}
+
+    record = recorder.records['info']
+    assert recorder._pending is None
+    response = cast('dict[str, object]', record['response'])
+    assert returned.content == content
+    published = base64.b64decode(cast('str', response['content_b64']), validate=True)
+    assert published != content
+    assert b'Private Site' not in published
+    assert response['status'] == 200
+    assert response['reason'] == 'OK'
+    assert response['headers'] == {'content-type': 'application/json'}
+
+
+def test_required_inventory_matches_capture_and_replay_recipes() -> None:
+    expected = frozenset(
+        {
+            'activity_stream_read',
+            'batch',
+            'create',
+            'fault_bad_auth',
+            'following',
+            'get_session_token',
+            'info',
+            'nav_expand',
+            'nav_search_entity',
+            'nav_search_string',
+            'note_thread_read',
+            'preferences_read',
+            'read',
+            'schema_entity_read',
+            'schema_read',
+            'summarize',
+            'text_search',
+            'update_project_last_accessed',
+            'user_subscriptions_read',
+            'work_schedule_read',
+        }
+    )
+    assert expected == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
+    assert {path.stem for path in _FIXTURES.glob('*.json')} == expected
+    assert frozenset(probe_wire._CAPTURE_SPECS) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
+    assert all(
+        set(spec) == {'rpc_method', 'auth_mode', 'outcome'}
+        for spec in probe_wire._CAPTURE_SPECS.values()
+    )
+    assert frozenset(REPLAY_RECIPES) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
+
+
+@pytest.fixture(scope='module')
+def validated_corpus() -> dict[str, dict[str, object]]:
+    return probe_wire._load_fixture_directory(_FIXTURES)
+
+
+class _ClosingTransport(FakeTransport):
+    closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _fixture(label: str = 'info') -> dict[str, object]:
+    is_fault = label == 'fault_bad_auth'
+    rpc_method = probe_wire._CAPTURE_SPECS[label]['rpc_method']
+    response = (
+        {'exception': True, 'error_code': 102, 'message': 'REDACTED'}
+        if is_fault
+        else {'results': {'version': [9, 0, 0]}}
+    )
+    body: dict[str, object] = (
+        {
+            'method_name': 'read',
+            'params': {
+                'type': 'Project',
+                'return_fields': ['id'],
+                'filters': [],
+                'return_only': 'active',
+                'paging': {'entities_per_page': 1, 'current_page': 1},
+                'api_return_image_urls': True,
+            },
+            'session_token': 'REDACTED',
+        }
+        if is_fault
+        else {'method_name': rpc_method, 'params': []}
+    )
+    return {
+        'schema_version': probe_wire._SCHEMA_VERSION,
+        'operation': label,
+        'auth_mode': 'session' if is_fault else 'script',
+        'outcome': (
+            {'kind': 'fault', 'exception': 'AuthenticationFault'}
+            if is_fault
+            else {'kind': 'success'}
+        ),
+        'request': {
+            'method': 'POST',
+            'path': '/api3/json',
+            'headers': {'content-type': 'application/json'},
+            'body': body,
+        },
+        'response': {
+            'status': 200,
+            'reason': 'OK',
+            'headers': {'content-type': 'application/json'},
+            'content_b64': base64.b64encode(json.dumps(response).encode()).decode('ascii'),
+        },
+    }
+
+
+def _fixture_client(
+    client_type: type[_FixtureClient], *, session_token: str | None = None
+) -> _FixtureClient:
+    if session_token is not None:
+        return client_type('https://fixture.invalid', session_token=session_token, connect=False)
+    return client_type(
+        'https://fixture.invalid',
+        script_name='fixture-script',
+        api_key='fixture-key',
+        connect=False,
     )
 
 
@@ -490,17 +868,10 @@ def _live_mutation_state(
     bad_inner = _ClosingTransport([])
     recorder = probe_wire._RecordingTransport(inner, {})
     bad_recorder = probe_wire._RecordingTransport(bad_inner, {})
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    bad_client = Shotgun(
-        'https://fixture.invalid', session_token=_fixture_session_token(), connect=False
-    )
-    client._transport = recorder
-    bad_client._transport = bad_recorder
+    client = _fixture_client(Shotgun)
+    bad_client = _fixture_client(Shotgun, session_token=_fixture_session_token())
+    client.transport = recorder
+    bad_client.transport = bad_recorder
     return probe_wire._LiveState(bad_client, bad_recorder, client, recorder), inner, bad_inner
 
 
@@ -523,27 +894,22 @@ def _wire_fixture(label: str, params: dict[str, object], result: object) -> dict
 
 
 def test_activity_capture_and_replay_use_current_flat_wire_contract() -> None:
-    assert probe_wire._CAPTURE_SPECS['activity_stream_read'] == (
-        'activity_stream',
-        'script',
-        'success',
-    )
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _FakeTransport(
+    assert probe_wire._CAPTURE_SPECS['activity_stream_read'] == {
+        'rpc_method': 'activity_stream',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    }
+    client = _fixture_client(Shotgun)
+    transport = FakeTransport(
         [
             _response(_READINESS_BODY),
             _response(b'{"results":{"updates":[]}}'),
         ]
     )
-    client._transport = transport
+    client.transport = transport
 
     try:
-        assert _REPLAY_RECIPES['activity_stream_read'](client, None) == {'updates': []}
+        assert REPLAY_RECIPES['activity_stream_read'](client, None) == {'updates': []}
     finally:
         client.close()
 
@@ -561,21 +927,6 @@ def test_activity_capture_and_replay_use_current_flat_wire_contract() -> None:
         'limit': None,
         'entity_fields': {},
     }
-
-
-def test_activity_capture_rejects_non_dictionary_update() -> None:
-    record = cast(
-        'dict[str, object]',
-        json.loads((_FIXTURES / 'activity_stream_read.json').read_text(encoding='utf-8')),
-    )
-    response = cast('dict[str, object]', record['response'])
-    response['content_b64'] = base64.b64encode(
-        b'{"entity_type":"Project","entity_id":1,"latest_update_id":1,'
-        b'"earliest_update_id":1,"updates":["private update"]}'
-    ).decode()
-
-    with pytest.raises(probe_wire._FixtureError, match='activity response updates'):
-        probe_wire._normalize_fixture_record(record)
 
 
 def test_activity_capture_sanitizes_populated_updates_and_replays_datetime() -> None:
@@ -617,15 +968,10 @@ def test_activity_capture_sanitizes_populated_updates_and_replays_datetime() -> 
     assert result['entity_id'] == 1
     assert result['latest_update_id'] == 1
     assert result['earliest_update_id'] == 1
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    client._transport = _FakeTransport([_response(_READINESS_BODY), _response(content)])
+    client = _fixture_client(Shotgun)
+    client.transport = FakeTransport([_response(_READINESS_BODY), _response(content)])
     try:
-        replayed = _REPLAY_RECIPES['activity_stream_read'](client, None)
+        replayed = REPLAY_RECIPES['activity_stream_read'](client, None)
     finally:
         client.close()
     replayed_updates = cast(
@@ -636,14 +982,9 @@ def test_activity_capture_sanitizes_populated_updates_and_replays_datetime() -> 
 
 
 def test_bad_auth_capture_uses_isolated_session_client_and_exact_fault() -> None:
-    normal = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
+    normal = _fixture_client(Shotgun)
     before = config_module.auth_spec(normal.config)
-    bad_inner = _FakeTransport(
+    bad_inner = FakeTransport(
         [
             _response(_READINESS_BODY),
             _response(b'{"exception":true,"error_code":102,"message":"rejected"}'),
@@ -653,12 +994,8 @@ def test_bad_auth_capture_uses_isolated_session_client_and_exact_fault() -> None
         bad_inner,
         {'invalid_session': 'fixture-invalid-session'},
     )
-    bad = Shotgun(
-        'https://fixture.invalid',
-        session_token=_fixture_session_token(),
-        connect=False,
-    )
-    bad._transport = recorder
+    bad = _fixture_client(Shotgun, session_token=_fixture_session_token())
+    bad.transport = recorder
 
     try:
         probe_wire._capture_bad_auth(bad, recorder)
@@ -669,83 +1006,6 @@ def test_bad_auth_capture_uses_isolated_session_client_and_exact_fault() -> None
     assert config_module.auth_spec(normal.config) == before
     assert recorder.records['fault_bad_auth']['auth_mode'] == 'session'
     assert len(bad_inner.requests) == 2
-
-
-def test_cleanup_and_close_failures_preserve_the_primary_failure() -> None:
-    primary = RuntimeError('primary')
-    cleanup = RuntimeError('cleanup')
-    close = RuntimeError('close')
-    normal = _CleanupClient(cleanup_error=cleanup)
-    bad = _CleanupClient(close_error=close)
-    resources = probe_wire._ResourceRegistry()
-    resources._track('Note', 1)
-
-    def fail() -> None:
-        raise primary
-
-    with pytest.raises(BaseExceptionGroup) as caught:
-        probe_wire._run_guarded(fail, resources, normal, [normal, bad])
-
-    assert caught.value.exceptions == (primary, cleanup, close)
-    assert normal.calls[-1] == ('close',)
-    assert bad.calls == [('close',)]
-
-
-def test_cleanup_is_reverse_order_and_every_client_closes() -> None:
-    normal = _CleanupClient()
-    bad = _CleanupClient()
-    resources = probe_wire._ResourceRegistry()
-    resources._track('Note', 1)
-    resources._track('Attachment', 2)
-
-    result = probe_wire._run_guarded(lambda: 'result', resources, normal, [normal, bad])
-
-    assert result == 'result'
-    assert normal.calls == [
-        ('delete', 'Attachment', 2),
-        ('find_one', 'Attachment', [['id', 'is', 2]], ['id']),
-        ('delete', 'Note', 1),
-        ('find_one', 'Note', [['id', 'is', 1]], ['id']),
-        ('close',),
-    ]
-    assert bad.calls == [('close',)]
-
-
-def test_cleanup_reports_record_still_active_after_delete() -> None:
-    normal = _CleanupClient(active_after_delete=True)
-    resources = probe_wire._ResourceRegistry()
-    resources._track('Asset', 7)
-
-    with pytest.raises(probe_wire._ProbeError, match='cleanup left active Asset'):
-        probe_wire._run_guarded(lambda: None, resources, normal, [normal])
-    assert normal.calls[-1] == ('close',)
-
-
-def test_direct_probe_execution_imports_the_checkout_client() -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            '-c',
-            (
-                'import pathlib, runpy, sys; '
-                "namespace = runpy.run_path('scripts/probe_wire.py'); "
-                "client = namespace['_load_client_class'](); "
-                'print(pathlib.Path(sys.modules[client.__module__].__file__).resolve())'
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        env={},
-        text=True,
-    )
-
-    assert Path(result.stdout.strip()) == Path('src/shotgun_api3/_client.py').resolve()
-
-
-def test_fixture_inventory_accepts_each_required_label_exactly_once() -> None:
-    inventory = probe_wire._validate_fixture_inventory(_inventory())
-
-    assert frozenset(inventory) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
 
 
 @pytest.mark.parametrize('case', ['empty', 'missing', 'unknown', 'duplicate'])
@@ -762,57 +1022,6 @@ def test_fixture_inventory_rejects_incomplete_or_ambiguous_sets(case: str) -> No
 
     with pytest.raises(probe_wire._FixtureError):
         probe_wire._validate_fixture_inventory(records)
-
-
-def test_fixture_normalizer_inventory_has_one_explicit_owner_per_operation() -> None:
-    normalizers = probe_wire._fixture_normalizers()
-    assert tuple(normalizers) == tuple(probe_wire._REQUIRED_OPERATION_LABELS)
-    assert len(set(normalizers.values())) == len(probe_wire._REQUIRED_OPERATION_LABELS)
-
-
-def test_fixture_publication_failure_preserves_previous_inventory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    directory = tmp_path / 'fixtures'
-    directory.mkdir()
-    sentinel = directory / 'previous.json'
-    sentinel.write_text('{"previous":true}\n')
-    before = {path.name: path.read_bytes() for path in directory.iterdir()}
-    original_replace = Path.replace
-    moved_to_backup = False
-
-    def fail_staging_replace(path: Path, target: Path) -> Path:
-        nonlocal moved_to_backup
-        if path == directory:
-            moved_to_backup = True
-            return original_replace(path, target)
-        if path.name.endswith('.staging') and target == directory:
-            assert moved_to_backup
-            raise OSError('injected publication failure')
-        return original_replace(path, target)
-
-    monkeypatch.setattr(Path, 'replace', fail_staging_replace)
-
-    with pytest.raises(OSError, match='injected publication failure'):
-        probe_wire._write_fixture_directory(directory, _inventory())
-
-    assert moved_to_backup
-    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
-    assert {path.name for path in tmp_path.iterdir()} == {'fixtures'}
-
-
-def test_fixture_publication_replaces_stale_inventory(tmp_path: Path) -> None:
-    directory = tmp_path / 'fixtures'
-    directory.mkdir()
-    (directory / 'stale.json').write_text('{}')
-
-    probe_wire._write_fixture_directory(directory, _inventory())
-
-    assert {path.stem for path in directory.glob('*.json')} == set(
-        probe_wire._REQUIRED_OPERATION_LABELS
-    )
-    assert not (directory / 'stale.json').exists()
 
 
 def test_fixture_scan_rejects_configured_secret_and_private_canary_safely() -> None:
@@ -898,99 +1107,6 @@ def test_fixture_schema_rejects_legacy_response_redactions() -> None:
         probe_wire._normalize_fixture_record(record)
 
 
-def test_fixture_session_token_normalization_emits_synthetic_response() -> None:
-    record = next(item for item in _inventory() if item['operation'] == 'get_session_token')
-    response = cast('dict[str, object]', record['response'])
-    content = cast(
-        'dict[str, object]',
-        json.loads(base64.b64decode(cast('str', response['content_b64']), validate=True)),
-    )
-    raw_value = 'raw-session-value-with-a-different-length'
-    content['session_id'] = raw_value
-    response['content_b64'] = base64.b64encode(json.dumps(content).encode()).decode()
-    normalized = probe_wire._normalize_fixture_record(
-        record,
-        {'session_token': raw_value},
-    )
-
-    normalized_response = cast('dict[str, object]', normalized['response'])
-    final_content = base64.b64decode(
-        cast('str', normalized_response['content_b64']),
-        validate=True,
-    )
-    assert json.loads(final_content)['session_id'] == 'X' * 21
-    assert 'redactions' not in normalized_response
-    assert raw_value.encode() not in final_content
-
-
-def test_fixture_utility_static_boundaries_require_dictionary_records() -> None:
-    source = """from collections.abc import Mapping
-from pathlib import Path
-from types import MappingProxyType
-from typing import assert_type
-
-from scripts import probe_wire
-
-directory = Path('fixtures')
-record: dict[str, object] = {}
-records = [record]
-secrets: Mapping[str, str] = MappingProxyType({'api_key': 'secret'})
-headers: Mapping[str, str] = MappingProxyType({'content-type': 'application/json'})
-assert_type(probe_wire._normalize_fixture_record(record, secrets), dict[str, object])
-assert_type(probe_wire._validate_fixture_inventory(records), dict[str, dict[str, object]])
-probe_wire._assert_no_secret_bytes(record, secrets)
-probe_wire._write_fixture_directory(directory, records, secrets=secrets)
-assert_type(probe_wire._select_headers(headers, (), ()), dict[str, str])
-
-record_mapping: Mapping[str, object] = MappingProxyType(record)
-record_mappings: list[Mapping[str, object]] = [record_mapping]
-probe_wire._assert_no_secret_bytes(record_mapping, secrets)
-probe_wire._normalize_fixture_record(record_mapping, secrets)
-probe_wire._validate_fixture_inventory(record_mappings)
-probe_wire._write_fixture_directory(directory, record_mappings, secrets=secrets)
-"""
-    invalid_lines = {
-        index
-        for index, line in enumerate(source.splitlines())
-        if line.startswith('probe_wire.')
-        and 'record_mapping' in line
-        and '_normalize_fixture_record' not in line
-    }
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
-        probe = Path(directory) / 'fixture_utility_types.py'
-        probe.write_text(source, encoding='utf-8')
-        repository = Path(__file__).parents[2]
-        result = run_pyright(probe, cwd=repository)
-
-    report = json.loads(result.stdout)
-    diagnostics = report['generalDiagnostics']
-    assert result.returncode == 1, result.stdout
-    assert report['summary']['errorCount'] == 3
-    assert {item['rule'] for item in diagnostics} == {'reportArgumentType'}
-    assert {item['range']['start']['line'] for item in diagnostics} == invalid_lines
-
-
-def test_header_selection_is_case_insensitive_allowlisted_and_sanitized() -> None:
-    headers = {
-        'CONTENT-TYPE': 'application/json',
-        'X-Request-ID': 'request-123',
-        'Set-Cookie': 'session_id=configured-secret',
-        'X-Ignored': 'must-not-survive',
-    }
-
-    selected = probe_wire._select_headers(
-        headers,
-        {'content-type', 'set-cookie', 'x-request-id'},
-        {'configured-secret'},
-    )
-
-    assert selected == {
-        'content-type': 'application/json',
-        'set-cookie': 'REDACTED',
-        'x-request-id': 'request-123',
-    }
-
-
 def test_issued_session_token_is_normalized_then_replays_synthetic_result() -> None:
     token = _fixture_session_token()
     content = json.dumps(
@@ -998,12 +1114,12 @@ def test_issued_session_token_is_normalized_then_replays_synthetic_result() -> N
         separators=(',', ':'),
     ).encode()
     recorder = probe_wire._RecordingTransport(
-        _FakeTransport([_response(content)]),
+        FakeTransport([_response(content)]),
         {'api_key': 'configured-key'},
     )
     spec = probe_wire._CaptureSpec('get_session_token', 'get_session_token', 'script', 'success')
 
-    with recorder._capture(spec):
+    with recorder.capture(spec):
         recorder.send(
             _request(
                 {
@@ -1012,30 +1128,17 @@ def test_issued_session_token_is_normalized_then_replays_synthetic_result() -> N
                 }
             )
         )
-    recorder._add_secret('session_token', token)
+    recorder.add_secret('session_token', token)
 
     record = recorder.records['get_session_token']
     response_record = cast('dict[str, object]', record['response'])
-    response = TransportResponse(
-        status=cast('int', response_record['status']),
-        reason=cast('str', response_record['reason']),
-        headers=cast('dict[str, str]', response_record['headers']),
-        content=base64.b64decode(
-            cast('str', response_record['content_b64']),
-            validate=True,
-        ),
-    )
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _FakeTransport([_response(_READINESS_BODY), response])
-    client._transport = transport
+    response = _recorded_response(response_record)
+    client = _fixture_client(Shotgun)
+    transport = FakeTransport([_response(_READINESS_BODY), response])
+    client.transport = transport
 
     try:
-        result = _REPLAY_RECIPES['get_session_token'](client, None)
+        result = REPLAY_RECIPES['get_session_token'](client, None)
     finally:
         client.close()
 
@@ -1055,7 +1158,9 @@ def test_live_setup_filters_project_by_configured_exact_name() -> None:
             state.client,
             [state.client, state.bad_client],
         )
-    body = json.loads(cast('bytes', inner.requests[1].body))
+    request_body = inner.requests[1].body
+    assert isinstance(request_body, bytes)
+    body = json.loads(request_body)
     project_read = body['params'][-1]
     assert project_read['type'] == 'Project'
     assert project_read['filters'] == {
@@ -1065,22 +1170,17 @@ def test_live_setup_filters_project_by_configured_exact_name() -> None:
 
 
 def test_nav_expand_replay_uses_the_site_independent_root_path() -> None:
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _FakeTransport(
+    client = _fixture_client(Shotgun)
+    transport = FakeTransport(
         [
             _response(_READINESS_BODY),
             _response(b'{"results":{"label":"Project"}}'),
         ]
     )
-    client._transport = transport
+    client.transport = transport
 
     try:
-        assert _REPLAY_RECIPES['nav_expand'](client, None) == {'label': 'Project'}
+        assert REPLAY_RECIPES['nav_expand'](client, None) == {'label': 'Project'}
     finally:
         client.close()
 
@@ -1092,30 +1192,259 @@ def test_nav_expand_replay_uses_the_site_independent_root_path() -> None:
     assert params[-1] == {'path': '/'}
 
 
-def test_nav_seed_comes_from_expanded_type_and_field_metadata() -> None:
-    expanded: dict[str, object] = {
-        'path': '/',
-        'target_entities': {'type': 'Project', 'additional_filter_presets': []},
-        'children': [
-            {
-                'target_entities': {
-                    'type': 'Asset',
-                    'additional_filter_presets': [{'seed': {'type': 'Asset', 'field': 'project'}}],
+def test_note_thread_capture_preserves_datetime_decoding_with_synthetic_utc() -> None:
+    normalized = probe_wire._normalize_fixture_record(
+        _wire_fixture(
+            'note_thread_read',
+            {'note_id': 77},
+            [
+                {'type': 'Note', 'id': 77, 'created_at': '2026-10-13T12:34:56Z'},
+                {'type': 'Reply', 'id': 88, 'created_at': '2026-10-13T12:35:00Z'},
+            ],
+        )
+    )
+    response_record = cast('dict[str, object]', normalized['response'])
+    content = base64.b64decode(cast('str', response_record['content_b64']))
+    rows = cast('list[dict[str, object]]', json.loads(content))
+    assert [row['created_at'] for row in rows] == ['2026-01-05T00:00:00Z'] * 2
+    client = _fixture_client(Shotgun)
+    client.transport = FakeTransport([_response(_READINESS_BODY), _response(content)])
+    try:
+        decoded = client.note_thread_read(1)
+    finally:
+        client.close()
+    assert [row['created_at'] for row in decoded] == [
+        dt.datetime(2026, 1, 5, tzinfo=dt.UTC).astimezone()
+    ] * 2
+
+
+def test_project_access_capture_and_replay_use_current_wire_name() -> None:
+    assert probe_wire._CAPTURE_SPECS['update_project_last_accessed'] == {
+        'rpc_method': 'update_project_last_accessed_by_current_user',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    }
+    client = _fixture_client(Shotgun)
+    transport = FakeTransport(
+        [
+            _response(_READINESS_BODY),
+            _response(b'{"results":true}'),
+        ]
+    )
+    client.transport = transport
+
+    try:
+        assert REPLAY_RECIPES['update_project_last_accessed'](client, None) is None
+    finally:
+        client.close()
+
+    request = transport.requests[-1]
+    assert isinstance(request.body, bytes)
+    payload = json.loads(request.body)
+    assert payload['method_name'] == 'update_project_last_accessed_by_current_user'
+    params = payload['params']
+    assert isinstance(params, list)
+    assert params[-1] == {'project_id': 1, 'user_id': 1}
+
+
+def test_published_fixture_inventory_is_complete(
+    validated_corpus: dict[str, dict[str, object]],
+) -> None:
+    records = validated_corpus
+    assert frozenset(records) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
+
+
+def test_recording_transport_rejects_duplicate_exchange_without_publication() -> None:
+    recorder = probe_wire._RecordingTransport(
+        FakeTransport([_response(_READINESS_BODY), _response(_READINESS_BODY)]),
+        {},
+    )
+    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
+
+    def send_twice() -> None:
+        with recorder.capture(spec):
+            recorder.send(_request({'method_name': 'info', 'params': []}))
+            assert recorder.records == {}
+            recorder.send(_request({'method_name': 'info', 'params': []}))
+
+    with pytest.raises(ExceptionGroup) as caught:
+        send_twice()
+
+    assert all(isinstance(error, probe_wire._ProbeError) for error in caught.value.exceptions)
+    assert [str(error) for error in caught.value.exceptions] == [
+        'info matched more than one exchange',
+        'info did not capture exactly one exchange; captured 2',
+    ]
+    assert recorder.records == {}
+    assert recorder._pending is None
+    assert recorder._raw_response_content == {}
+
+
+def test_recording_transport_requires_one_matching_exchange() -> None:
+    recorder = probe_wire._RecordingTransport(
+        FakeTransport([_response(b'{"results":{}}')]),
+        {},
+    )
+    spec = probe_wire._CaptureSpec('read', 'read', 'script', 'success')
+
+    with (
+        pytest.raises(probe_wire._ProbeError, match='did not capture'),
+        recorder.capture(spec),
+    ):
+        recorder.send(_request({'method_name': 'info', 'params': []}))
+
+    assert recorder.records == {}
+    assert recorder._pending is None
+
+
+def test_recording_transport_sanitizes_request_and_preserves_json_response() -> None:
+    content = json.dumps(
+        {'session_id': 'issued-session', 'user_type': 'ApiUser', 'user_id': 987654321},
+        separators=(',', ':'),
+    ).encode()
+    inner = FakeTransport([_response(content)])
+    recorder = probe_wire._RecordingTransport(
+        inner,
+        {
+            'api_key': 'configured-secret',
+            'script_key': 'script-key',
+            'session_token': 'session-value',
+        },
+    )
+    spec = probe_wire._CaptureSpec('get_session_token', 'get_session_token', 'script', 'success')
+
+    with recorder.capture(spec):
+        recorder.send(
+            _request(
+                {
+                    'method_name': 'get_session_token',
+                    'params': [{'script_name': 'probe-script', 'script_key': 'script-key'}],
                 }
-            }
-        ],
+            )
+        )
+
+    record = recorder.records['get_session_token']
+    request = cast('dict[str, object]', record['request'])
+    body = cast('dict[str, object]', request['body'])
+    response = cast('dict[str, object]', record['response'])
+
+    auth = cast('dict[str, object]', cast('list[object]', body['params'])[0])
+    assert auth['script_name'] == 'REDACTED'
+    assert auth['script_key'] == 'REDACTED'
+    assert request['path'] == '/api3/json'
+    normalized_content = cast(
+        'dict[str, object]',
+        json.loads(base64.b64decode(cast('str', response['content_b64']), validate=True)),
+    )
+    assert normalized_content == {
+        'session_id': 'X' * 21,
+        'user_type': 'ApiUser',
+        'user_id': 1,
     }
 
-    assert probe_wire._qualified_nav_seed(expanded) == 'Asset.project'
+
+def test_secret_scan_allows_incidental_identifier_substrings_in_json_keys() -> None:
+    content = b'{"results":{"latest_update_id":1}}'
+    record = _fixture()
+    response = cast('dict[str, object]', record['response'])
+    response['content_b64'] = base64.b64encode(content).decode()
+
+    probe_wire._assert_no_secret_bytes(record, {'script_name': 'test'})
+
+    assert base64.b64decode(response['content_b64'], validate=True) == content
 
 
-def test_navigation_project_path_uses_project_expansion_result() -> None:
-    expanded: dict[str, object] = {
-        'path': '/returned/project',
-        'target_entities': {'additional_filter_presets': []},
+def test_secret_scan_blocks_credential_substrings_and_reports_safely() -> None:
+    record = _fixture()
+    response = cast('dict[str, object]', record['response'])
+    response['content_b64'] = base64.b64encode(
+        b'{"results":{"ordinary":"prefix-configured-secret-suffix"}}'
+    ).decode()
+
+    with pytest.raises(
+        probe_wire._ProbeError,
+        match=r'^info fixture final scan failed for api_key$',
+    ) as caught:
+        probe_wire._assert_no_secret_bytes(record, {'api_key': 'configured-secret'})
+
+    assert 'configured-secret' not in str(caught.value)
+
+
+def test_subscription_wire_capture_preserves_mapping_order_and_value_types() -> None:
+    record = _wire_fixture(
+        'user_subscriptions_read',
+        {},
+        {'77': 'private plan', '88': 'other private plan'},
+    )
+
+    normalized = probe_wire._normalize_fixture_record(record)
+    response = cast('dict[str, object]', normalized['response'])
+
+    assert json.loads(base64.b64decode(cast('str', response['content_b64']))) == {
+        'results': {
+            '1': 'Fixture subscription 1',
+            '2': 'Fixture subscription 2',
+        }
     }
+    client = _fixture_client(Shotgun)
+    client.transport = FakeTransport(
+        [
+            _response(_READINESS_BODY),
+            _response(base64.b64decode(cast('str', response['content_b64']))),
+        ]
+    )
+    try:
+        assert REPLAY_RECIPES['user_subscriptions_read'](client, None) == [
+            {'humanUserId': '1', 'subscription': 'Fixture subscription 1'},
+            {'humanUserId': '2', 'subscription': 'Fixture subscription 2'},
+        ]
+    finally:
+        client.close()
 
-    assert probe_wire._project_nav_path(expanded) == '/returned/project'
+
+def test_subscription_wire_capture_requires_results_envelope() -> None:
+    record = _wire_fixture('user_subscriptions_read', {}, {'77': 'private plan'})
+    response = cast('dict[str, object]', record['response'])
+    response['content_b64'] = base64.b64encode(b'{"77":"private plan"}').decode()
+
+    with pytest.raises(probe_wire._FixtureError, match='subscriptions response'):
+        probe_wire._normalize_fixture_record(record)
+
+
+def test_text_search_capture_and_replay_use_current_flat_wire_contract() -> None:
+    assert probe_wire._CAPTURE_SPECS['text_search'] == {
+        'rpc_method': 'query_display_name_cache',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    }
+    client = _fixture_client(Shotgun)
+    transport = FakeTransport(
+        [
+            _response(_READINESS_BODY),
+            _response(b'{"results":{"matches":[]}}'),
+        ]
+    )
+    client.transport = transport
+
+    try:
+        assert REPLAY_RECIPES['text_search'](client, None) == {'matches': []}
+    finally:
+        client.close()
+
+    request = transport.requests[-1]
+    assert isinstance(request.body, bytes)
+    payload = json.loads(request.body)
+    assert payload['method_name'] == 'query_display_name_cache'
+    params = payload['params']
+    assert isinstance(params, list)
+    assert params[-1] == {
+        'text': 'wire probe',
+        'entity_types': {
+            'Project': {'logical_operator': 'and', 'conditions': []},
+        },
+        'project_ids': [],
+        'max_results': None,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1158,7 +1487,7 @@ def test_navigation_project_path_uses_project_expansion_result() -> None:
         ),
     ],
 )
-def test_new_wire_capture_normalizes_private_results(
+def test_wire_capture_normalizes_private_results(
     label: str,
     rpc_method: str,
     params: dict[str, object],
@@ -1173,20 +1502,15 @@ def test_new_wire_capture_normalizes_private_results(
     assert body['method_name'] == rpc_method
     assert json.loads(base64.b64decode(cast('str', response['content_b64']))) == expected
     assert b'private' not in base64.b64decode(cast('str', response['content_b64']))
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    client._transport = _FakeTransport(
+    client = _fixture_client(Shotgun)
+    client.transport = FakeTransport(
         [
             _response(_READINESS_BODY),
             _response(base64.b64decode(cast('str', response['content_b64']))),
         ]
     )
     try:
-        assert _REPLAY_RECIPES[label](client, body) == expected
+        assert REPLAY_RECIPES[label](client, body) == expected
     finally:
         client.close()
 
@@ -1221,7 +1545,7 @@ def test_new_wire_capture_normalizes_private_results(
         ('user_subscriptions_read', {}, {'77': 'private plan'}),
     ],
 )
-async def test_new_synthetic_fixture_replays_through_async_decoder(
+async def test_synthetic_fixture_replays_through_async_decoder(
     label: str, params: dict[str, object], result: object
 ) -> None:
     normalized = probe_wire._normalize_fixture_record(_wire_fixture(label, params, result))
@@ -1229,412 +1553,18 @@ async def test_new_synthetic_fixture_replays_through_async_decoder(
     body = cast('dict[str, object]', request['body'])
     response_record = cast('dict[str, object]', normalized['response'])
     response = _response(base64.b64decode(cast('str', response_record['content_b64'])))
-    client = AsyncShotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _AsyncFakeTransport([_response(_READINESS_BODY), response])
+    client = _fixture_client(AsyncShotgun)
+    transport = AsyncFakeTransport([_response(_READINESS_BODY), response])
     client._transport = transport
     try:
-        assert await _ASYNC_REPLAY_RECIPES[label](client, body) == _replay_expected_result(
+        assert await ASYNC_REPLAY_RECIPES[label](client, body) == _replay_expected_result(
             label, response
         )
         sent = transport.requests[-1]
         assert isinstance(sent.body, bytes)
-        assert (
-            probe_wire._sanitize(json.loads(sent.body), {'fixture-script', 'fixture-key'}) == body
-        )
+        assert _sanitize(json.loads(sent.body), {'fixture-script', 'fixture-key'}) == body
     finally:
         await client.close()
-
-
-def test_note_thread_capture_preserves_datetime_decoding_with_synthetic_utc() -> None:
-    normalized = probe_wire._normalize_fixture_record(
-        _wire_fixture(
-            'note_thread_read',
-            {'note_id': 77},
-            [
-                {'type': 'Note', 'id': 77, 'created_at': '2026-10-13T12:34:56Z'},
-                {'type': 'Reply', 'id': 88, 'created_at': '2026-10-13T12:35:00Z'},
-            ],
-        )
-    )
-    response_record = cast('dict[str, object]', normalized['response'])
-    content = base64.b64decode(cast('str', response_record['content_b64']))
-    rows = cast('list[dict[str, object]]', json.loads(content))
-    assert [row['created_at'] for row in rows] == ['2026-01-05T00:00:00Z'] * 2
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    client._transport = _FakeTransport([_response(_READINESS_BODY), _response(content)])
-    try:
-        decoded = client.note_thread_read(1)
-    finally:
-        client.close()
-    assert [row['created_at'] for row in decoded] == [
-        dt.datetime(2026, 1, 5, tzinfo=dt.UTC).astimezone()
-    ] * 2
-
-
-def test_project_access_capture_and_replay_use_current_wire_name() -> None:
-    assert probe_wire._CAPTURE_SPECS['update_project_last_accessed'] == (
-        'update_project_last_accessed_by_current_user',
-        'script',
-        'success',
-    )
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _FakeTransport(
-        [
-            _response(_READINESS_BODY),
-            _response(b'{"results":true}'),
-        ]
-    )
-    client._transport = transport
-
-    try:
-        assert _REPLAY_RECIPES['update_project_last_accessed'](client, None) is None
-    finally:
-        client.close()
-
-    request = transport.requests[-1]
-    assert isinstance(request.body, bytes)
-    payload = json.loads(request.body)
-    assert payload['method_name'] == 'update_project_last_accessed_by_current_user'
-    params = payload['params']
-    assert isinstance(params, list)
-    assert params[-1] == {'project_id': 1, 'user_id': 1}
-
-
-def test_published_fixture_inventory_is_complete() -> None:
-    records = probe_wire._load_fixture_directory(_FIXTURES)
-
-    assert frozenset(records) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
-
-
-def test_recording_transport_groups_operation_error_with_missing_exchange() -> None:
-    recorder = probe_wire._RecordingTransport(_FakeTransport([]), {})
-    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
-    primary = RuntimeError('operation failed')
-
-    with pytest.raises(ExceptionGroup) as caught, recorder._capture(spec):
-        raise primary
-
-    assert caught.value.exceptions[0] is primary
-    capture_error = caught.value.exceptions[1]
-    assert isinstance(capture_error, probe_wire._ProbeError)
-    assert str(capture_error) == 'info did not capture exactly one exchange; captured 0'
-    assert recorder.records == {}
-    assert recorder._pending is None
-
-
-def test_recording_transport_rejects_duplicate_exchange_without_publication() -> None:
-    recorder = probe_wire._RecordingTransport(
-        _FakeTransport([_response(_READINESS_BODY), _response(_READINESS_BODY)]),
-        {},
-    )
-    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
-
-    def send_twice() -> None:
-        with recorder._capture(spec):
-            recorder.send(_request({'method_name': 'info', 'params': []}))
-            assert recorder.records == {}
-            recorder.send(_request({'method_name': 'info', 'params': []}))
-
-    with pytest.raises(ExceptionGroup) as caught:
-        send_twice()
-
-    assert all(isinstance(error, probe_wire._ProbeError) for error in caught.value.exceptions)
-    assert [str(error) for error in caught.value.exceptions] == [
-        'info matched more than one exchange',
-        'info did not capture exactly one exchange; captured 2',
-    ]
-    assert recorder.records == {}
-    assert recorder._pending is None
-    assert recorder._raw_response_content == {}
-
-
-def test_recording_transport_requires_one_matching_exchange() -> None:
-    recorder = probe_wire._RecordingTransport(
-        _FakeTransport([_response(b'{"results":{}}')]),
-        {},
-    )
-    spec = probe_wire._CaptureSpec('read', 'read', 'script', 'success')
-
-    with (
-        pytest.raises(probe_wire._ProbeError, match='did not capture'),
-        recorder._capture(spec),
-    ):
-        recorder.send(_request({'method_name': 'info', 'params': []}))
-
-    assert recorder.records == {}
-    assert recorder._pending is None
-
-
-def test_recording_transport_returns_exact_response_but_publishes_normalized_metadata() -> None:
-    content = json.dumps(
-        {
-            'version': [9, 1, 2],
-            'full_version': [9, 1, 2, 3],
-            's3_uploads_enabled': True,
-            's3_direct_uploads_enabled': True,
-            's3_enabled_upload_types': {'private': True},
-            'shotgunlocalhost_browser_integration_enabled': True,
-            'unified_login_flow_enabled': True,
-            'authentication_app_session_launcher_enabled': True,
-            'analytics_site_id': 'private-site-id',
-            'analytics_site_name': 'Private Site',
-            'user_authentication_method': 'private-auth-method',
-            'api_max_entities_per_page': 999,
-        },
-        separators=(',', ':'),
-    ).encode()
-    inner = _FakeTransport(
-        [
-            TransportResponse(
-                status=200,
-                reason='Private Reason',
-                headers={
-                    'Content-Type': 'application/octet-stream',
-                    'X-Request-ID': 'request-123',
-                    'Set-Cookie': 'must-not-survive',
-                },
-                content=content,
-            )
-        ]
-    )
-    recorder = probe_wire._RecordingTransport(inner, {'api_key': 'configured-secret'})
-    spec = probe_wire._CaptureSpec('info', 'info', 'script', 'success')
-
-    with recorder._capture(spec):
-        returned = recorder.send(_request({'method_name': 'info', 'params': []}))
-        assert recorder.records == {}
-
-    record = recorder.records['info']
-    assert recorder._pending is None
-    response = cast('dict[str, object]', record['response'])
-    assert returned.content == content
-    published = base64.b64decode(cast('str', response['content_b64']), validate=True)
-    assert published != content
-    assert b'Private Site' not in published
-    assert response['status'] == 200
-    assert response['reason'] == 'OK'
-    assert response['headers'] == {'content-type': 'application/json'}
-
-
-def test_recording_transport_sanitizes_request_and_preserves_json_response() -> None:
-    content = json.dumps(
-        {'session_id': 'issued-session', 'user_type': 'ApiUser', 'user_id': 987654321},
-        separators=(',', ':'),
-    ).encode()
-    inner = _FakeTransport([_response(content)])
-    recorder = probe_wire._RecordingTransport(
-        inner,
-        {
-            'api_key': 'configured-secret',
-            'script_key': 'script-key',
-            'session_token': 'session-value',
-        },
-    )
-    spec = probe_wire._CaptureSpec('get_session_token', 'get_session_token', 'script', 'success')
-
-    with recorder._capture(spec):
-        recorder.send(
-            _request(
-                {
-                    'method_name': 'get_session_token',
-                    'params': [{'script_name': 'probe-script', 'script_key': 'script-key'}],
-                }
-            )
-        )
-
-    record = recorder.records['get_session_token']
-    request = cast('dict[str, object]', record['request'])
-    body = cast('dict[str, object]', request['body'])
-    response = cast('dict[str, object]', record['response'])
-
-    auth = cast('dict[str, object]', cast('list[object]', body['params'])[0])
-    assert auth['script_name'] == 'REDACTED'
-    assert auth['script_key'] == 'REDACTED'
-    assert request['path'] == '/api3/json'
-    normalized_content = cast(
-        'dict[str, object]',
-        json.loads(base64.b64decode(cast('str', response['content_b64']), validate=True)),
-    )
-    assert normalized_content == {
-        'session_id': 'X' * 21,
-        'user_type': 'ApiUser',
-        'user_id': 1,
-    }
-
-
-def test_required_inventory_matches_capture_and_replay_recipes() -> None:
-    expected = frozenset(
-        {
-            'activity_stream_read',
-            'batch',
-            'create',
-            'fault_bad_auth',
-            'following',
-            'get_session_token',
-            'info',
-            'nav_expand',
-            'nav_search_entity',
-            'nav_search_string',
-            'note_thread_read',
-            'preferences_read',
-            'read',
-            'schema_entity_read',
-            'schema_read',
-            'summarize',
-            'text_search',
-            'update_project_last_accessed',
-            'user_subscriptions_read',
-            'work_schedule_read',
-        }
-    )
-    assert expected == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
-    assert frozenset(probe_wire._CAPTURE_SPECS) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
-    assert frozenset(_REPLAY_RECIPES) == frozenset(probe_wire._REQUIRED_OPERATION_LABELS)
-
-
-def test_sanitizer_removes_nested_secrets_and_common_sensitive_values() -> None:
-    value = {
-        'ordinary': 'prefix-configured-secret-suffix',
-        'nested': [
-            {'script_key': 'script-key'},
-            {'Session-ID': 'session-value'},
-            {'userPassword': 'password-value'},
-            {'authorization': 'Bearer configured-secret'},
-        ],
-    }
-
-    sanitized = probe_wire._sanitize(value, {'configured-secret', 'script-key'})
-    encoded = json.dumps(sanitized, sort_keys=True).encode()
-
-    assert b'configured-secret' not in encoded
-    assert b'script-key' not in encoded
-    assert b'session-value' not in encoded
-    assert b'password-value' not in encoded
-    assert cast('dict[str, object]', sanitized)['ordinary'] == 'prefix-REDACTED-suffix'
-
-
-def test_secret_scan_allows_incidental_identifier_substrings_in_json_keys() -> None:
-    content = b'{"results":{"latest_update_id":1}}'
-    record = _fixture()
-    response = cast('dict[str, object]', record['response'])
-    response['content_b64'] = base64.b64encode(content).decode()
-
-    probe_wire._assert_no_secret_bytes(record, {'script_name': 'test'})
-
-    assert base64.b64decode(response['content_b64'], validate=True) == content
-
-
-def test_secret_scan_blocks_credential_substrings_and_reports_safely() -> None:
-    record = _fixture()
-    response = cast('dict[str, object]', record['response'])
-    response['content_b64'] = base64.b64encode(
-        b'{"results":{"ordinary":"prefix-configured-secret-suffix"}}'
-    ).decode()
-
-    with pytest.raises(
-        probe_wire._ProbeError,
-        match=r'^info fixture final scan failed for api_key$',
-    ) as caught:
-        probe_wire._assert_no_secret_bytes(record, {'api_key': 'configured-secret'})
-
-    assert 'configured-secret' not in str(caught.value)
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ('content', 'expected'),
-    [
-        (b'{"results":{"7":null,"9":null}}', True),
-        (b'{"results":{"7":null,"9":"assignment refused"}}', False),
-    ],
-)
-async def test_subscription_create_replays_per_user_results_on_both_facades(
-    content: bytes, expected: bool
-) -> None:
-    sync = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    async_client = AsyncShotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    sync_transport = _FakeTransport([_response(_READINESS_BODY), _response(content)])
-    async_transport = _AsyncFakeTransport([_response(_READINESS_BODY), _response(content)])
-    sync._transport = sync_transport
-    async_client._transport = async_transport
-    users = [
-        {'humanUserId': 7, 'subscription': 'artist'},
-        {'humanUserId': '9', 'subscription': ['reviewer', 'artist']},
-    ]
-    try:
-        assert sync.user_subscriptions_create(users) is expected
-        assert await async_client.user_subscriptions_create(users) is expected
-        for transport in (sync_transport, async_transport):
-            body = transport.requests[-1].body
-            assert isinstance(body, bytes)
-            payload = json.loads(body)
-            assert payload['method_name'] == 'user_subscriptions_create'
-            assert payload['params'][-1] == {'7': 'artist', '9': ['reviewer', 'artist']}
-    finally:
-        sync.close()
-        await async_client.close()
-
-
-def test_subscription_wire_capture_preserves_mapping_order_and_value_types() -> None:
-    record = _wire_fixture(
-        'user_subscriptions_read',
-        {},
-        {'77': 'private plan', '88': 'other private plan'},
-    )
-
-    normalized = probe_wire._normalize_fixture_record(record)
-    response = cast('dict[str, object]', normalized['response'])
-
-    assert json.loads(base64.b64decode(cast('str', response['content_b64']))) == {
-        'results': {
-            '1': 'Fixture subscription 1',
-            '2': 'Fixture subscription 2',
-        }
-    }
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    client._transport = _FakeTransport(
-        [
-            _response(_READINESS_BODY),
-            _response(base64.b64decode(cast('str', response['content_b64']))),
-        ]
-    )
-    try:
-        assert _REPLAY_RECIPES['user_subscriptions_read'](client, None) == [
-            {'humanUserId': '1', 'subscription': 'Fixture subscription 1'},
-            {'humanUserId': '2', 'subscription': 'Fixture subscription 2'},
-        ]
-    finally:
-        client.close()
 
 
 @pytest.mark.parametrize('result', [[], {'user': 'plan'}, {'1': 7}])
@@ -1699,8 +1629,22 @@ def test_fixture_publication_normalizes_or_rejects_each_private_surface_before_s
             records,
             private_canaries={canary, '987654321'},
         )
-        assert canary.encode() not in b''.join(path.read_bytes() for path in directory.iterdir())
-        assert b'987654321' not in b''.join(path.read_bytes() for path in directory.iterdir())
+        for path in directory.iterdir():
+            published = json.loads(path.read_bytes())
+            response = cast('dict[str, object]', published['response'])
+            encoded = cast('str', response['content_b64'])
+            decoded = base64.b64decode(encoded, validate=True)
+            metadata = json.dumps(
+                {
+                    **published,
+                    'response': {
+                        key: value for key, value in response.items() if key != 'content_b64'
+                    },
+                }
+            ).encode('ascii')
+            for secret in (canary.encode(), b'987654321'):
+                assert secret not in metadata
+                assert secret not in decoded
     else:
         with pytest.raises(probe_wire._FixtureError) as caught:
             probe_wire._write_fixture_directory(
@@ -1757,7 +1701,10 @@ def test_live_batch_rejects_unexpected_result_count_without_tracking(
     assert isinstance(primary, probe_wire._ProbeError)
     assert str(primary) == 'batch capture did not create exactly one entity'
     assert isinstance(normalization, probe_wire._FixtureError)
-    bodies = [json.loads(cast('bytes', request.body)) for request in inner.requests]
+    bodies: list[dict[str, Any]] = []
+    for request in inner.requests:
+        assert isinstance(request.body, bytes)
+        bodies.append(json.loads(request.body))
     deletes = [body['params'][-1] for body in bodies if body['method_name'] == 'delete']
     assert deletes == [{'type': 'Note', 'id': 41}]
     assert inner.closed
@@ -1800,7 +1747,10 @@ def test_live_malformed_mutation_identity_does_not_authorize_cleanup(
     primary, normalization = caught.value.exceptions
     assert isinstance(primary, probe_wire._ProbeError)
     assert isinstance(normalization, probe_wire._FixtureError)
-    bodies = [json.loads(cast('bytes', request.body)) for request in inner.requests]
+    bodies: list[dict[str, Any]] = []
+    for request in inner.requests:
+        assert isinstance(request.body, bytes)
+        bodies.append(json.loads(request.body))
     deletes = [body['params'][-1] for body in bodies if body['method_name'] == 'delete']
     assert deletes == ([{'type': 'Note', 'id': 41}] if label == 'batch' else [])
     assert inner.closed
@@ -1849,7 +1799,10 @@ def test_live_mutation_is_cleaned_when_normalization_rejects_response(
         assert f'{label} fixture normalization failed' in str(primary)
         assert isinstance(cleanup, probe_wire._ProbeError)
         assert str(cleanup) == 'cleanup rejected Note'
-    bodies = [json.loads(cast('bytes', request.body)) for request in inner.requests]
+    bodies: list[dict[str, Any]] = []
+    for request in inner.requests:
+        assert isinstance(request.body, bytes)
+        bodies.append(json.loads(request.body))
     deletes = [body['params'][-1] for body in bodies if body['method_name'] == 'delete']
     expected_ids = [42, 41] if label == 'batch' else [42]
     assert deletes == [{'type': 'Note', 'id': entity_id} for entity_id in expected_ids]
@@ -1861,52 +1814,40 @@ def test_live_mutation_is_cleaned_when_normalization_rejects_response(
 
 
 @pytest.mark.parametrize('label', sorted(probe_wire._REQUIRED_OPERATION_LABELS))
-def test_published_fixture_replays_through_fake_transport(label: str) -> None:
-    records = probe_wire._load_fixture_directory(_FIXTURES)
+def test_published_fixture_replays_through_fake_transport(
+    label: str, validated_corpus: dict[str, dict[str, object]]
+) -> None:
+    records = copy.deepcopy(validated_corpus)
     record = records[label]
     request_record = cast('dict[str, object]', record['request'])
     request_body = cast('dict[str, object]', request_record['body'])
     response_record = cast('dict[str, object]', record['response'])
-    response = TransportResponse(
-        status=cast('int', response_record['status']),
-        reason=cast('str', response_record['reason']),
-        headers=cast('dict[str, str]', response_record['headers']),
-        content=base64.b64decode(cast('str', response_record['content_b64']), validate=True),
-    )
+    response = _recorded_response(response_record)
     auth_mode = record['auth_mode']
     if auth_mode == 'script':
-        client = Shotgun(
-            'https://fixture.invalid',
-            script_name='fixture-script',
-            api_key='fixture-key',
-            connect=False,
-        )
+        client = _fixture_client(Shotgun)
     else:
-        client = Shotgun(
-            'https://fixture.invalid',
-            session_token=_fixture_session_token(),
-            connect=False,
-        )
+        client = _fixture_client(Shotgun, session_token=_fixture_session_token())
     scripted: list[TransportResponse | TransportError] = (
         [response] if label == 'info' else [_response(_READINESS_BODY), response]
     )
-    transport = _FakeTransport(scripted)
-    client._transport = transport
+    transport = FakeTransport(scripted)
+    client.transport = transport
     outcome = cast('dict[str, object]', record['outcome'])
 
     try:
         if outcome['kind'] == 'fault':
             assert outcome == {'kind': 'fault', 'exception': 'AuthenticationFault'}
             with pytest.raises(_errors.AuthenticationFault):
-                _REPLAY_RECIPES[label](client, request_body)
+                REPLAY_RECIPES[label](client, request_body)
         else:
-            result = _REPLAY_RECIPES[label](client, request_body)
+            result = REPLAY_RECIPES[label](client, request_body)
             expected = _replay_expected_result(label, response)
             assert result == expected
 
         sent = transport.requests[-1]
         assert isinstance(sent.body, bytes)
-        sent_body = probe_wire._sanitize(
+        sent_body = _sanitize(
             json.loads(sent.body),
             {'fixture-script', 'fixture-key', _fixture_session_token()},
         )
@@ -1930,35 +1871,27 @@ def test_published_fixture_replays_through_fake_transport(label: str) -> None:
     'label',
     ['nav_search_entity', 'nav_search_string', 'note_thread_read', 'user_subscriptions_read'],
 )
-async def test_new_published_fixture_replays_through_async_decoder(label: str) -> None:
-    record = probe_wire._load_fixture_directory(_FIXTURES)[label]
+async def test_published_fixture_replays_through_async_decoder(
+    label: str, validated_corpus: dict[str, dict[str, object]]
+) -> None:
+    record = copy.deepcopy(validated_corpus[label])
     request_record = cast('dict[str, object]', record['request'])
     request_body = cast('dict[str, object]', request_record['body'])
     response_record = cast('dict[str, object]', record['response'])
-    response = TransportResponse(
-        status=cast('int', response_record['status']),
-        reason=cast('str', response_record['reason']),
-        headers=cast('dict[str, str]', response_record['headers']),
-        content=base64.b64decode(cast('str', response_record['content_b64']), validate=True),
-    )
-    client = AsyncShotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _AsyncFakeTransport([_response(_READINESS_BODY), response])
+    response = _recorded_response(response_record)
+    client = _fixture_client(AsyncShotgun)
+    transport = AsyncFakeTransport([_response(_READINESS_BODY), response])
     client._transport = transport
     try:
-        assert await _ASYNC_REPLAY_RECIPES[label](client, request_body) == _replay_expected_result(
+        assert await ASYNC_REPLAY_RECIPES[label](client, request_body) == _replay_expected_result(
             label, response
         )
         sent = transport.requests[-1]
         assert isinstance(sent.body, bytes)
-        sent_body = probe_wire._sanitize(json.loads(sent.body), {'fixture-script', 'fixture-key'})
+        sent_body = _sanitize(json.loads(sent.body), {'fixture-script', 'fixture-key'})
         assert isinstance(sent_body, dict)
         assert sent_body == request_body
-        assert sent_body['method_name'] == probe_wire._CAPTURE_SPECS[label][0]
+        assert sent_body['method_name'] == probe_wire._CAPTURE_SPECS[label]['rpc_method']
         assert urlsplit(sent.url).path == request_record['path']
     finally:
         await client.close()
@@ -1981,53 +1914,3 @@ def test_secret_scan_blocks_exact_identifier_keys_and_values(content: bytes) -> 
         match=r'^info fixture final scan failed for script_name$',
     ):
         probe_wire._assert_no_secret_bytes(record, {'script_name': 'test'})
-
-
-def test_subscription_wire_capture_requires_results_envelope() -> None:
-    record = _wire_fixture('user_subscriptions_read', {}, {'77': 'private plan'})
-    response = cast('dict[str, object]', record['response'])
-    response['content_b64'] = base64.b64encode(b'{"77":"private plan"}').decode()
-
-    with pytest.raises(probe_wire._FixtureError, match='subscriptions response'):
-        probe_wire._normalize_fixture_record(record)
-
-
-def test_text_search_capture_and_replay_use_current_flat_wire_contract() -> None:
-    assert probe_wire._CAPTURE_SPECS['text_search'] == (
-        'query_display_name_cache',
-        'script',
-        'success',
-    )
-    client = Shotgun(
-        'https://fixture.invalid',
-        script_name='fixture-script',
-        api_key='fixture-key',
-        connect=False,
-    )
-    transport = _FakeTransport(
-        [
-            _response(_READINESS_BODY),
-            _response(b'{"results":{"matches":[]}}'),
-        ]
-    )
-    client._transport = transport
-
-    try:
-        assert _REPLAY_RECIPES['text_search'](client, None) == {'matches': []}
-    finally:
-        client.close()
-
-    request = transport.requests[-1]
-    assert isinstance(request.body, bytes)
-    payload = json.loads(request.body)
-    assert payload['method_name'] == 'query_display_name_cache'
-    params = payload['params']
-    assert isinstance(params, list)
-    assert params[-1] == {
-        'text': 'wire probe',
-        'entity_types': {
-            'Project': {'logical_operator': 'and', 'conditions': []},
-        },
-        'project_ids': [],
-        'max_results': None,
-    }

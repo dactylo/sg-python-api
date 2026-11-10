@@ -8,7 +8,6 @@ import os
 import tempfile
 import urllib.parse
 import urllib.request
-import uuid
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,7 +26,6 @@ SHARE_THUMBNAIL = '/upload/share_thumbnail'
 SHARE_THUMBNAIL_OPERATION = _protocol.OperationDescriptor(
     category='upload',
     replay_safe=False,
-    body_restartable=True,
     endpoint_role=None,
 )
 _FILE_SERVE_ATTACHMENT = '/file_serve/attachment/'
@@ -94,7 +92,7 @@ class UploadArguments:
 
     entity_type: str
     entity_id: int
-    path: str
+    path: str | bytes
     field_name: str | None = None
     display_name: str | None = None
     tag_list: str | None = None
@@ -180,6 +178,15 @@ class UploadOptions:
 
 
 @dataclasses.dataclass(frozen=True)
+class _DriverLeaseDecision:
+    """Describe the shared transport-generation transition for a driver lease."""
+
+    known_changed: bool
+    replace_owned_transport: bool
+    reset_driver: bool
+
+
+@dataclasses.dataclass(frozen=True)
 class PreparedUpload:
     """Carry validated file metadata with one upload call.
 
@@ -187,11 +194,13 @@ class PreparedUpload:
         filename: File basename used by upload endpoints.
         file_size: Positive file size captured before network I/O.
         options: Immutable public-call and thumbnail-routing options.
+        path: Text source path normalized during upload preparation.
     """
 
     filename: str
     file_size: int
     options: 'UploadOptions'
+    path: str
 
 
 class _ExactOriginCookiePolicy(http.cookiejar.DefaultCookiePolicy):
@@ -399,7 +408,6 @@ def build_download_request(
         headers=dict(request_headers),
         body=None,
         timeout=context.timeout,
-        token=uuid.uuid4().hex,
     )
 
 
@@ -626,6 +634,14 @@ def build_download_redirect(
     The `location` key is looked up in lowercase or in a case-insensitive
     response header mapping.
 
+    Args:
+        context: Captured request settings supplying the user-agent.
+        response_headers: Redirect response headers with a lowercase `location`
+            key or case-insensitive lookup.
+
+    Returns:
+        A credential-free download request for the validated redirect URL.
+
     Raises:
         ShotgunFileDownloadError: If the response has no valid redirect
             location.
@@ -673,6 +689,34 @@ def build_upload_endpoint_exchange(
     )
 
 
+def choose_driver_lease(
+    known_transport: object | None,
+    current_transport: object | None,
+    driver_generation: int | None,
+    transport_generation: int,
+    transport_owned: bool,
+) -> _DriverLeaseDecision:
+    """Choose the transport and driver changes for one captured generation.
+
+    Args:
+        known_transport: Previously observed transport.
+        current_transport: Currently configured transport.
+        driver_generation: Generation of the cached driver, if any.
+        transport_generation: Captured configuration generation.
+        transport_owned: Whether the client created its transport.
+
+    Returns:
+        Changes to apply while holding the client's transport lock.
+    """
+    known_changed = known_transport is not current_transport
+    stale = not known_changed and driver_generation not in {None, transport_generation}
+    return _DriverLeaseDecision(
+        known_changed=known_changed,
+        replace_owned_transport=stale and transport_owned,
+        reset_driver=known_changed or stale,
+    )
+
+
 def choose_upload_path(
     server_info: Mapping[str, object],
     entity_type: str,
@@ -697,18 +741,6 @@ def choose_upload_path(
     return 'multipart'
 
 
-@contextmanager
-def download_temporary(destination: Path) -> Generator[BinaryIO]:
-    """Yield an adjacent named binary temporary file without deleting it on close."""
-    with tempfile.NamedTemporaryFile(
-        dir=destination.parent,
-        prefix=f'.{destination.name}.',
-        suffix='.tmp',
-        delete=False,
-    ) as handle:
-        yield cast('BinaryIO', handle)
-
-
 def multipart_ranges(prepared: PreparedUpload) -> tuple[StorageRange, ...]:
     """Plan ordered storage ranges for one multipart upload.
 
@@ -718,7 +750,7 @@ def multipart_ranges(prepared: PreparedUpload) -> tuple[StorageRange, ...]:
     Returns:
         Ordered contiguous ranges covering the complete file.
     """
-    path = prepared.options.arguments.path
+    path = prepared.path
     return tuple(
         StorageRange(
             length=min(_MULTIPART_CHUNK_SIZE, prepared.file_size - offset),
@@ -746,11 +778,18 @@ def needs_session_cookie(url: str, origin: _Origin) -> bool:
     return candidate == origin
 
 
-def parse_link_completion(encoded: str) -> int:
+def parse_link_completion(
+    encoded: str,
+    *,
+    operation: str | None = None,
+    entities: Sequence[Mapping[str, object]] = (),
+) -> int:
     """Parse an Attachment ID from the observed link success envelope.
 
     Args:
         encoded: Link-completion response text.
+        operation: Client operation whose link or share failed.
+        entities: Target entities known to the client.
 
     Returns:
         Created Attachment ID.
@@ -760,6 +799,11 @@ def parse_link_completion(encoded: str) -> int:
     """
     marker, separator, payload = encoded.partition(':')
     parts = payload.split()
+    if marker == '0' and separator == ':' and parts and operation and entities:
+        targets = ', '.join(
+            f'entity_type={entity["type"]} entity_id={entity["id"]}' for entity in entities
+        )
+        raise ShotgunError(f'{operation} failed for {targets}')
     if marker != '1' or separator != ':' or not parts:
         raise ShotgunError('upload link returned an invalid response')
     try:
@@ -900,11 +944,12 @@ def prepare_upload(options: UploadOptions) -> PreparedUpload:
         raise ShotgunError('created_at must be a datetime.datetime instance')
     raw_path = options.arguments.path
     if isinstance(raw_path, bytes):
+        raw_path = os.fsdecode(raw_path)
         options = dataclasses.replace(
             options,
-            arguments=dataclasses.replace(options.arguments, path=os.fsdecode(raw_path)),
+            arguments=dataclasses.replace(options.arguments, path=raw_path),
         )
-    path = Path(options.arguments.path)
+    path = Path(raw_path)
     try:
         is_file = path.is_file()
         file_size = path.stat().st_size if is_file else 0
@@ -914,7 +959,12 @@ def prepare_upload(options: UploadOptions) -> PreparedUpload:
         raise ShotgunError(f"Path must be a valid file, got '{options.arguments.path}'")
     if file_size <= 0:
         raise ShotgunError(f"Path cannot be an empty file: '{options.arguments.path}'")
-    return PreparedUpload(filename=path.name, file_size=file_size, options=options)
+    return PreparedUpload(
+        filename=path.name,
+        file_size=file_size,
+        options=options,
+        path=raw_path,
+    )
 
 
 def require_supported_upload_path(
@@ -936,6 +986,79 @@ def require_supported_upload_path(
             'server requires legacy form uploads, which this client does not support'
         )
     return upload_path
+
+
+def choose_prepared_upload_path(
+    server_info: Mapping[str, object],
+    prepared: PreparedUpload,
+    *,
+    sharing_thumbnail: bool = False,
+) -> Literal['direct', 'multipart']:
+    """Choose a supported route for one prepared upload or thumbnail share.
+
+    Args:
+        server_info: Immutable server capability data.
+        prepared: Validated upload source and arguments.
+        sharing_thumbnail: Whether a local thumbnail share needs direct
+            storage.
+
+    Returns:
+        The supported direct or multipart route.
+
+    Raises:
+        ShotgunError: If the server requires legacy form uploads.
+    """
+    arguments = prepared.options.arguments
+    route = require_supported_upload_path(
+        choose_upload_path(
+            server_info,
+            arguments.entity_type,
+            arguments.field_name,
+            prepared.file_size,
+        )
+    )
+    return 'direct' if sharing_thumbnail else route
+
+
+@contextmanager
+def download_temporary(destination: Path) -> Generator[BinaryIO]:
+    """Yield an adjacent named binary temporary file without deleting it on close.
+
+    Args:
+        destination: Final destination whose directory and basename determine
+            the temporary file's location and prefix.
+
+    Yields:
+        An open binary file whose path is available through `name`. The handle
+        is closed on context exit, but the caller remains responsible for
+        removing or publishing the file.
+
+    Raises:
+        OSError: If creating or closing the temporary file fails.
+    """
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f'.{destination.name}.',
+        suffix='.tmp',
+        delete=False,
+    ) as handle:
+        yield cast('BinaryIO', handle)
+
+
+@contextmanager
+def download_destination_io(destination: Path) -> Generator[None]:
+    """Name the destination when its own filesystem operation fails.
+
+    Raises:
+        ShotgunFileDownloadError: If the enclosed operation raises `OSError`.
+    """
+    try:
+        yield
+    except OSError as error:
+        reason = error.strerror or str(error)
+        raise ShotgunFileDownloadError(
+            f'attachment download failed for destination {destination}: {reason}'
+        ) from None
 
 
 def resolve_attachment_url(attachment: object, base_url: str) -> str | None:
@@ -1008,6 +1131,22 @@ def split_thumbnail_uploads(
     return fields, {name: paths[name] for name in _THUMBNAIL_UPLOAD_FIELDS if name in paths}
 
 
+def thumbnail_fields(
+    filmstrip_thumbnail: bool,
+) -> tuple[Literal['filmstrip_thumb_image', 'thumb_image'], Literal['filmstrip_image', 'image']]:
+    """Map a thumbnail kind to its upload and visible entity fields.
+
+    Args:
+        filmstrip_thumbnail: Whether the thumbnail is a filmstrip.
+
+    Returns:
+        The upload field and corresponding visible entity field.
+    """
+    if filmstrip_thumbnail:
+        return 'filmstrip_thumb_image', 'filmstrip_image'
+    return 'thumb_image', 'image'
+
+
 def thumbnail_source_ready(
     result: object,
     field_name: Literal['filmstrip_image', 'image'],
@@ -1038,6 +1177,24 @@ def thumbnail_source_ready(
     return isinstance(value, str) and '/images/status/transient/' not in value
 
 
+def upload_options(arguments: UploadArguments) -> UploadOptions:
+    """Classify a file field for its upload protocol and filmstrip flag.
+
+    Args:
+        arguments: Bound public upload arguments.
+
+    Returns:
+        Upload endpoint options for the selected field class.
+    """
+    filmstrip = arguments.field_name in {'filmstrip_image', 'filmstrip_thumb_image'}
+    thumbnail = filmstrip or arguments.field_name in {'image', 'thumb_image'}
+    return UploadOptions(
+        arguments=arguments,
+        upload_type='Thumbnail' if thumbnail else 'Attachment',
+        filmstrip=filmstrip,
+    )
+
+
 def validate_download_url(url: str) -> None:
     """Reject unusable attachment URLs before download I/O.
 
@@ -1051,3 +1208,18 @@ def validate_download_url(url: str) -> None:
         canonical_origin(url)
     except ShotgunError:
         raise ShotgunFileDownloadError('attachment download failed') from None
+
+
+def write_download_chunk(destination: Path, handle: BinaryIO, chunk: bytes) -> None:
+    """Write one download chunk and describe destination I/O failures.
+
+    Args:
+        destination: Final destination named in a write failure.
+        handle: Open binary output handle for the current attempt.
+        chunk: Bytes to write.
+
+    Raises:
+        ShotgunFileDownloadError: If writing the chunk raises `OSError`.
+    """
+    with download_destination_io(destination):
+        handle.write(chunk)

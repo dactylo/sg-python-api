@@ -1,42 +1,13 @@
 import asyncio
-import os
 import runpy
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, ClassVar
 
 import pytest
 
-import shotgun_api3
-from tests._required_mode import REQUIRED_LIVE_ENV
+from tests.tooling._required_mode import configure_isolated_environment, install_plugin
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-class _FakeBootstrapClient:
-    instances: ClassVar[list['_FakeBootstrapClient']] = []
-    project: ClassVar[dict[str, object] | None] = None
-
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
-        self.closed = False
-        self.__class__.instances.append(self)
-
-    def close(self) -> None:
-        self.closed = True
-
-    def create(self, entity_type: str, data: dict[str, object]) -> dict[str, object]:
-        assert entity_type == 'Project'
-        self.__class__.project = {'type': 'Project', 'id': 17, **data}
-        return self.__class__.project
-
-    def find_one(
-        self,
-        entity_type: str,
-        filters: list[list[object]],
-    ) -> dict[str, object] | None:
-        assert entity_type == 'Project'
-        assert filters == [['name', 'is', 'sg-python-api live test project']]
-        return self.__class__.project
 
 
 class _FakeLiveClient:
@@ -45,16 +16,20 @@ class _FakeLiveClient:
         *,
         residual_ids: Iterable[int] = (),
         attachments: dict[int, str] | None = None,
+        namespace_entities: dict[tuple[str, int], str] | None = None,
     ) -> None:
         self.attachments = {} if attachments is None else attachments
+        self._namespace_entities = {} if namespace_entities is None else namespace_entities
         self.calls: list[tuple[object, ...]] = []
-        self.residual_ids = set(residual_ids)
+        self._residual_ids = set(residual_ids)
 
     def delete(self, entity_type: str, entity_id: int) -> bool:
         self.calls.append(('delete', entity_type, entity_id))
-        if entity_id not in self.residual_ids and entity_type == 'Attachment':
+        if entity_id not in self._residual_ids and entity_type == 'Attachment':
             self.attachments.pop(entity_id, None)
-        return entity_id not in self.residual_ids
+        if entity_id not in self._residual_ids:
+            self._namespace_entities.pop((entity_type, entity_id), None)
+        return entity_id not in self._residual_ids
 
     def find(
         self,
@@ -72,7 +47,25 @@ class _FakeLiveClient:
                 for identity, filename in self.attachments.items()
                 if filename.startswith(prefix)
             ]
-        return []
+        field_name = {
+            'Asset': 'code',
+            'Note': 'subject',
+            'Reply': 'content',
+            'Shot': 'code',
+        }[entity_type]
+        project = ['project', 'is', {'type': 'Project', 'id': 9}]
+        namespace_filter = filters[0] if entity_type == 'Reply' else filters[1]
+        assert filters == (
+            [namespace_filter] if entity_type == 'Reply' else [project, namespace_filter]
+        )
+        assert namespace_filter[:2] == [field_name, 'starts_with']
+        prefix = namespace_filter[2]
+        assert isinstance(prefix, str)
+        return [
+            {'type': found_type, 'id': identity}
+            for (found_type, identity), value in self._namespace_entities.items()
+            if found_type == entity_type and value.startswith(prefix)
+        ]
 
     def find_one(
         self,
@@ -82,36 +75,18 @@ class _FakeLiveClient:
         self.calls.append(('find_one', entity_type, filters))
         entity_id = filters[0][2]
         assert isinstance(entity_id, int)
-        if entity_id in self.residual_ids or (
+        if entity_id in self._residual_ids or (
             entity_type == 'Attachment' and entity_id in self.attachments
         ):
             return {'type': entity_type, 'id': entity_id}
         return None
 
 
-def _configure_isolated_environment(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    present: Iterable[str] = (),
-) -> None:
-    for name in REQUIRED_LIVE_ENV:
-        monkeypatch.delenv(name, raising=False)
-    for name in present:
-        monkeypatch.setenv(name, 'configured-for-isolated-test')
-    inherited = os.environ.get('PYTHONPATH')
-    pythonpath = str(_REPO_ROOT) if inherited is None else f'{_REPO_ROOT}{os.pathsep}{inherited}'
-    monkeypatch.setenv('PYTHONPATH', pythonpath)
-
-
-def _install_plugin(pytester: pytest.Pytester) -> None:
-    pytester.makeconftest("pytest_plugins = ('tests._required_mode',)")
-
-
 @pytest.mark.anyio
 @pytest.mark.async_required
 async def test_async_live_cleanup_propagates_delete_cancellation() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_async.py'))
-    resources_class = namespace['_AsyncLiveResources']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/_async_resources.py'))
+    resources_class = namespace['AsyncLiveResources']
     cancellation = asyncio.CancelledError('delete cancellation')
 
     class CancellingClient:
@@ -135,27 +110,30 @@ async def test_async_live_cleanup_propagates_delete_cancellation() -> None:
 @pytest.mark.anyio
 @pytest.mark.async_required
 async def test_async_live_cleanup_recovers_tracked_and_namespace_residuals() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_async.py'))
-    resources_class = namespace['_AsyncLiveResources']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/_async_resources.py'))
+    resources_class = namespace['AsyncLiveResources']
     project = {'type': 'Project', 'id': 9}
     run_name = 'sg-python-api-async-live-run'
 
     class FakeAsyncClient:
         def __init__(self) -> None:
             self.calls: list[tuple[object, ...]] = []
-            self.failed_deletes = {('Attachment', 11)}
+            self._failed_deletes = {('Attachment', 11)}
             self.present = {
                 ('Attachment', 11),
                 ('Attachment', 12),
                 ('Shot', 10),
                 ('Shot', 13),
+                ('Asset', 14),
+                ('Note', 15),
+                ('Reply', 16),
             }
 
         async def delete(self, entity_type: str, entity_id: int) -> bool:
             identity = (entity_type, entity_id)
             self.calls.append(('delete', *identity))
-            if identity in self.failed_deletes:
-                self.failed_deletes.remove(identity)
+            if identity in self._failed_deletes:
+                self._failed_deletes.remove(identity)
                 raise RuntimeError('credential-bearing server failure')
             if identity not in self.present:
                 return False
@@ -169,11 +147,19 @@ async def test_async_live_cleanup_recovers_tracked_and_namespace_residuals() -> 
             fields: list[str],
         ) -> list[dict[str, object]]:
             self.calls.append(('find', entity_type, filters, fields))
-            expected_field = 'filename' if entity_type == 'Attachment' else 'code'
-            assert filters == [
-                ['project', 'is', project],
-                [expected_field, 'starts_with', run_name],
-            ]
+            expected_field = {
+                'Attachment': 'filename',
+                'Asset': 'code',
+                'Note': 'subject',
+                'Reply': 'content',
+                'Shot': 'code',
+            }[entity_type]
+            namespace_filter = [expected_field, 'starts_with', run_name]
+            assert filters == (
+                [namespace_filter]
+                if entity_type == 'Reply'
+                else [['project', 'is', project], namespace_filter]
+            )
             return [
                 {'type': found_type, 'id': entity_id}
                 for found_type, entity_id in sorted(self.present)
@@ -207,6 +193,9 @@ async def test_async_live_cleanup_recovers_tracked_and_namespace_residuals() -> 
         ('delete', 'Attachment', 11),
         ('delete', 'Attachment', 12),
         ('delete', 'Shot', 13),
+        ('delete', 'Asset', 14),
+        ('delete', 'Note', 15),
+        ('delete', 'Reply', 16),
     ]
     assert client.present == set()
     attachment_scan = (
@@ -219,12 +208,14 @@ async def test_async_live_cleanup_recovers_tracked_and_namespace_residuals() -> 
         ['id'],
     )
     assert client.calls.count(attachment_scan) == 2
+    for entity_type in ('Asset', 'Note', 'Reply'):
+        assert len([call for call in client.calls if call[:2] == ('find', entity_type)]) == 2
 
 
 @pytest.mark.async_required
 def test_async_live_failure_capture_propagates_process_base_exceptions() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_async.py'))
-    capture_class = namespace['_FailureCapture']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/_async_resources.py'))
+    capture_class = namespace['FailureCapture']
     interrupt = KeyboardInterrupt('stop')
 
     with pytest.raises(KeyboardInterrupt) as raised, capture_class():
@@ -236,9 +227,9 @@ def test_async_live_failure_capture_propagates_process_base_exceptions() -> None
 @pytest.mark.anyio
 @pytest.mark.async_required
 async def test_async_live_finalizers_drain_and_aggregate_across_cancellation() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_async.py'))
-    assert '_finalize_live_test' in namespace
-    finalize = namespace['_finalize_live_test']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/_async_resources.py'))
+    assert 'finalize_live_test' in namespace
+    finalize = namespace['finalize_live_test']
     operation_failure = ValueError('operation failed')
 
     class BlockingResources:
@@ -298,8 +289,8 @@ async def test_async_live_finalizers_drain_and_aggregate_across_cancellation() -
 @pytest.mark.anyio
 @pytest.mark.async_required
 async def test_async_live_roundtrip_namespaces_uploaded_source(tmp_path: Path) -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_async.py'))
-    exercise_roundtrip = namespace['_exercise_roundtrip']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/_async_resources.py'))
+    exercise_roundtrip = namespace['exercise_roundtrip']
     project = {'type': 'Project', 'id': 9}
     run_name = 'sg-python-api-async-live-run'
     payload: bytes | None = None
@@ -373,108 +364,9 @@ async def test_async_live_roundtrip_namespaces_uploaded_source(tmp_path: Path) -
     await exercise_roundtrip(FakeClient(), project, FakeResources(), run_name, tmp_path)
 
 
-@pytest.mark.async_required
-def test_async_unit_selector_deselects_live_async_tests(
-    pytester: pytest.Pytester,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _configure_isolated_environment(monkeypatch)
-    _install_plugin(pytester)
-    pytester.makepyfile(
-        """
-        import pytest
-
-        @pytest.mark.async_required
-        def test_async_unit():
-            pass
-
-        @pytest.mark.async_required
-        @pytest.mark.live
-        def test_async_live():
-            raise AssertionError('live test was selected')
-        """
-    )
-
-    result = pytester.runpytest_subprocess(
-        '-q',
-        '-m',
-        'async_required and not live',
-        '--require-no-skips',
-    )
-
-    result.assert_outcomes(passed=1, deselected=1)
-    assert result.ret == pytest.ExitCode.OK
-
-
-def test_bootstrap_is_idempotent_and_closes_each_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    namespace = runpy.run_path(str(_REPO_ROOT / 'scripts/bootstrap_test_site.py'))
-    main = namespace['main']
-    _FakeBootstrapClient.instances = []
-    _FakeBootstrapClient.project = None
-    main.__globals__['_load_client_class'] = lambda: _FakeBootstrapClient
-    monkeypatch.setenv('SG_TEST_SITE', 'https://example.invalid')
-    monkeypatch.setenv('SG_TEST_SCRIPT', 'script')
-    monkeypatch.setenv('SG_TEST_KEY', 'secret')
-    monkeypatch.setenv('SG_TEST_PROJECT', 'sg-python-api live test project')
-
-    assert main() == 0
-    assert main() == 0
-
-    assert _FakeBootstrapClient.project == {
-        'type': 'Project',
-        'id': 17,
-        'name': 'sg-python-api live test project',
-    }
-    assert len(_FakeBootstrapClient.instances) == 2
-    assert all(client.closed for client in _FakeBootstrapClient.instances)
-
-
-def test_bootstrap_loads_client_from_this_checkout() -> None:
-    namespace = runpy.run_path(str(_REPO_ROOT / 'scripts/bootstrap_test_site.py'))
-
-    client_class = namespace['_load_client_class']()
-
-    client_module = Path(client_class.__module__.replace('.', '/'))
-    assert client_module == Path('shotgun_api3/_client')
-    assert Path(shotgun_api3.__file__).resolve().is_relative_to(_REPO_ROOT / 'src')
-
-
-def test_bootstrap_preserves_operation_and_close_failures(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    namespace = runpy.run_path(str(_REPO_ROOT / 'scripts/bootstrap_test_site.py'))
-    main = namespace['main']
-
-    class FailingClient(_FakeBootstrapClient):
-        def close(self) -> None:
-            raise RuntimeError('close failed')
-
-        def find_one(
-            self,
-            entity_type: str,
-            filters: list[list[object]],
-        ) -> dict[str, object] | None:
-            del entity_type, filters
-            raise RuntimeError('lookup failed')
-
-    main.__globals__['_load_client_class'] = lambda: FailingClient
-    for name in REQUIRED_LIVE_ENV:
-        monkeypatch.setenv(name, 'configured')
-
-    with pytest.raises(BaseExceptionGroup) as raised:
-        main()
-
-    assert [str(error) for error in raised.value.exceptions] == [
-        'lookup failed',
-        'close failed',
-    ]
-
-
 def test_live_resources_clean_in_reverse_order_and_scan_namespace() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
-    resources_class = namespace['_LiveResources']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    resources_class = namespace['LiveResources']
     client = _FakeLiveClient(
         attachments={12: 'sg-python-api-live-run-payload.bin', 13: 'another-run-payload.bin'}
     )
@@ -503,9 +395,32 @@ def test_live_resources_clean_in_reverse_order_and_scan_namespace() -> None:
     assert any(call[:2] == ('find', 'Note') for call in client.calls)
 
 
+def test_live_resources_report_all_namespace_leftovers() -> None:
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    resources_class = namespace['LiveResources']
+    run_name = 'sg-python-api-live-run'
+    client = _FakeLiveClient(
+        namespace_entities={
+            ('Asset', 14): f'{run_name}-asset',
+            ('Note', 15): f'{run_name}-note',
+            ('Reply', 16): f'{run_name}-reply',
+        }
+    )
+    resources = resources_class(client, {'type': 'Project', 'id': 9}, run_name)
+
+    with pytest.raises(RuntimeError) as raised:
+        resources.cleanup()
+
+    for identity in ('Asset:14', 'Note:15', 'Reply:16'):
+        assert identity in str(raised.value)
+    assert 'namespace verification raised' not in str(raised.value)
+    for entity_type in ('Asset', 'Note', 'Reply'):
+        assert len([call for call in client.calls if call[:2] == ('find', entity_type)]) == 1
+
+
 def test_live_resources_report_residuals_after_attempting_all_cleanup() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
-    resources_class = namespace['_LiveResources']
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    resources_class = namespace['LiveResources']
     client = _FakeLiveClient(residual_ids=(10, 11))
     resources = resources_class(client, {'type': 'Project', 'id': 9}, 'namespace')
     resources.track('Shot', 10)
@@ -521,22 +436,22 @@ def test_live_resources_report_residuals_after_attempting_all_cleanup() -> None:
 
 
 def test_live_run_names_are_unique_and_stable_prefix() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    for source in ('conftest.py', '_async_resources.py'):
+        namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live' / source))
+        first = namespace['new_run_namespace']()
+        second = namespace['new_run_namespace']()
 
-    first = namespace['_new_run_namespace']()
-    second = namespace['_new_run_namespace']()
-
-    assert first.startswith('sg-python-api-live-')
-    assert second.startswith('sg-python-api-live-')
-    assert first != second
+        assert first.startswith('sg-python-api-live-')
+        assert second.startswith('sg-python-api-live-')
+        assert first != second
 
 
 def test_optional_live_test_skips_without_configuration(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_isolated_environment(monkeypatch)
-    _install_plugin(pytester)
+    configure_isolated_environment(monkeypatch)
+    install_plugin(pytester)
     pytester.makepyfile(
         """
         import os
@@ -562,8 +477,8 @@ def test_require_live_fails_setup_when_configuration_is_missing(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_isolated_environment(monkeypatch)
-    _install_plugin(pytester)
+    configure_isolated_environment(monkeypatch)
+    install_plugin(pytester)
     pytester.makepyfile(
         """
         import pytest
@@ -586,8 +501,8 @@ def test_require_no_skips_fails_on_selected_skip(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_isolated_environment(monkeypatch)
-    _install_plugin(pytester)
+    configure_isolated_environment(monkeypatch)
+    install_plugin(pytester)
     pytester.makepyfile(
         """
         import pytest
@@ -608,8 +523,8 @@ def test_require_no_skips_preserves_zero_collection_exit(
     pytester: pytest.Pytester,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _configure_isolated_environment(monkeypatch)
-    _install_plugin(pytester)
+    configure_isolated_environment(monkeypatch)
+    install_plugin(pytester)
     pytester.makepyfile(helper='VALUE = 1')
 
     result = pytester.runpytest_subprocess('-q', '--require-no-skips')
@@ -618,14 +533,14 @@ def test_require_no_skips_preserves_zero_collection_exit(
 
 
 def test_sync_live_cleanup_collects_ordinary_failures() -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
 
     class FailingClient(_FakeLiveClient):
         def delete(self, entity_type: str, entity_id: int) -> bool:
             del entity_type, entity_id
             raise RuntimeError('sensitive cleanup error')
 
-    resources = namespace['_LiveResources'](
+    resources = namespace['LiveResources'](
         FailingClient(), {'type': 'Project', 'id': 9}, 'namespace'
     )
     resources.track('Shot', 10)
@@ -636,7 +551,7 @@ def test_sync_live_cleanup_collects_ordinary_failures() -> None:
 
 @pytest.mark.parametrize('error_type', [KeyboardInterrupt, SystemExit])
 def test_sync_live_cleanup_preserves_process_control(error_type: type[BaseException]) -> None:
-    namespace: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    namespace = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
     error = error_type('stop')
 
     class InterruptingClient(_FakeLiveClient):
@@ -644,7 +559,7 @@ def test_sync_live_cleanup_preserves_process_control(error_type: type[BaseExcept
             del entity_type, entity_id
             raise error
 
-    resources = namespace['_LiveResources'](
+    resources = namespace['LiveResources'](
         InterruptingClient(), {'type': 'Project', 'id': 9}, 'namespace'
     )
     resources.track('Shot', 10)
@@ -660,8 +575,8 @@ def test_sync_live_roundtrip_recovers_upload_with_lost_response(
     *,
     cleanup_fails: bool,
 ) -> None:
-    fixtures: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
-    tests: dict[str, Any] = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_roundtrip.py'))
+    fixtures = runpy.run_path(str(_REPO_ROOT / 'tests/live/conftest.py'))
+    tests = runpy.run_path(str(_REPO_ROOT / 'tests/live/test_roundtrip.py'))
     project = {'type': 'Project', 'id': 9}
     run_name = 'sg-python-api-live-run'
 
@@ -683,7 +598,7 @@ def test_sync_live_roundtrip_recovers_upload_with_lost_response(
             raise TimeoutError('upload response lost')
 
     client = Client(residual_ids=(12,) if cleanup_fails else ())
-    resources = fixtures['_LiveResources'](client, project, run_name)
+    resources = fixtures['LiveResources'](client, project, run_name)
     with pytest.raises(TimeoutError, match='upload response lost'):
         tests['test_upload_download_roundtrip'](client, project, run_name, resources, tmp_path)
 

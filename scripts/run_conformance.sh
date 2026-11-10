@@ -6,8 +6,8 @@ set -eu
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 RESULTS_FILE="$REPO_ROOT/dist/artifact-results.md"
 LEDGER_FILE="$REPO_ROOT/dist/conformance-results.md"
-OFFICIAL_COMMIT='6f56cf219152d0e8a8e92d7f0507b28f02f86905'
-OFFICIAL_REF='v3.10.3'
+OFFICIAL_COMMIT='cf5eb6a000d34f0ae0d447ff8725763d2692967a'
+OFFICIAL_REF='v3.10.5'
 OFFICIAL_REPOSITORY='https://github.com/shotgunsoftware/python-api'
 WORK_ROOT=''
 
@@ -125,6 +125,7 @@ python -I "$REPO_ROOT/scripts/_conformance_setup.py" "$SITE_PACKAGES" "$OFFICIAL
 cat >"$WORK_ROOT/conformance_driver.py" <<'PY'
 from __future__ import annotations
 
+import importlib.metadata
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -178,7 +179,14 @@ except Exception as error:
     _fail(f'Candidate import failed: {error}')
 
 _verify_loaded_modules(install_root)
-if shotgun_api3.__version__ != expected_version:
+# __version__ reports the compatibility target; the distribution names the release.
+installed_versions = [
+    distribution.version
+    for distribution in importlib.metadata.distributions(
+        name='sg-python-api', path=[str(site_packages)]
+    )
+]
+if installed_versions != [expected_version]:
     _fail('Installed candidate version does not match artifact validation evidence')
 
 pytest_status = pytest.main(

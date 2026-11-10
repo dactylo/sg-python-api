@@ -7,9 +7,10 @@ import pytest
 
 from shotgun_api3 import _errors
 from shotgun_api3._client import Shotgun
-from shotgun_api3._config import ObserverEvent, RequestEvent, ResponseEvent, RetryEvent
+from shotgun_api3._config import RequestEvent, ResponseEvent, RetryEvent, _ObserverEvent
 from shotgun_api3._transport import SendError
-from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
+from tests.client._payloads import rpc_params
+from tests.conftest import fake_client, fake_transport, make_response, sent_payload
 
 _PROJECT = {'type': 'Project', 'id': 2, 'name': 'P'}
 _SHOT = {'type': 'Shot', 'id': 3, 'code': 'X'}
@@ -48,11 +49,6 @@ if TYPE_CHECKING:
     _FOLLOWING: _FollowingCallable = _STATIC_CLIENT.following
     _NOTE_THREAD_READ: _NoteThreadReadCallable = _STATIC_CLIENT.note_thread_read
     _UNFOLLOW: _FollowCallable = _STATIC_CLIENT.unfollow
-
-
-def _params(sg: Shotgun, index: int = 0) -> dict[str, object]:
-    params = cast('list[object]', _sent_payload(sg, index)['params'])
-    return cast('dict[str, object]', params[1])
 
 
 def _run_dictionary_result_case(sg: Shotgun, method_name: str) -> object:
@@ -147,7 +143,7 @@ def test_activity_methods_expose_exact_signatures() -> None:
 
 
 def test_activity_reads_forward_annotated_out_values() -> None:
-    sg = _fake_client([_make_response({'updates': []}), _make_response([])])
+    sg = fake_client([make_response({'updates': []}), make_response([])])
     activity_stream_read = cast('Callable[..., object]', sg.activity_stream_read)
     note_thread_read = cast('Callable[..., object]', sg.note_thread_read)
 
@@ -161,7 +157,7 @@ def test_activity_reads_forward_annotated_out_values() -> None:
     )
     note_thread_read('41', {'Note': 'created_by'})
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': [],
         'id': True,
         'max_id': True,
@@ -169,29 +165,29 @@ def test_activity_reads_forward_annotated_out_values() -> None:
         'limit': '10',
         'entity_fields': {'Shot': 'code'},
     }
-    assert _params(sg, 1) == {
+    assert rpc_params(sg, 1) == {
         'note_id': '41',
         'entity_fields': {'Note': 'created_by'},
     }
 
 
 def test_activity_stream_read_binds_against_the_public_signature() -> None:
-    sg = _fake_client([])
+    sg = fake_client([])
     activity_stream_read = cast('Callable[..., object]', sg.activity_stream_read)
 
     with pytest.raises(TypeError, match=r'^Shotgun\.activity_stream_read\(\)'):
         activity_stream_read('Shot')
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_activity_stream_read_builds_exact_wire_payloads() -> None:
     entity_fields = {'Shot': ['code']}
     original = copy.deepcopy(entity_fields)
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'updates': []}),
-            _make_response({'updates': []}),
+            make_response({'updates': []}),
+            make_response({'updates': []}),
         ]
     )
 
@@ -206,11 +202,11 @@ def test_activity_stream_read_builds_exact_wire_payloads() -> None:
     sg.activity_stream_read('Shot', 3)
 
     expected_keys = ('type', 'id', 'max_id', 'min_id', 'limit', 'entity_fields')
-    assert _sent_payload(sg)['method_name'] == 'activity_stream'
-    assert _sent_payload(sg, 1)['method_name'] == 'activity_stream'
-    assert tuple(_params(sg)) == expected_keys
-    assert tuple(_params(sg, 1)) == expected_keys
-    assert _params(sg) == {
+    assert sent_payload(sg)['method_name'] == 'activity_stream'
+    assert sent_payload(sg, 1)['method_name'] == 'activity_stream'
+    assert tuple(rpc_params(sg)) == expected_keys
+    assert tuple(rpc_params(sg, 1)) == expected_keys
+    assert rpc_params(sg) == {
         'type': 'Shot',
         'id': 3,
         'max_id': 20,
@@ -218,7 +214,7 @@ def test_activity_stream_read_builds_exact_wire_payloads() -> None:
         'limit': 50,
         'entity_fields': {'Shot': ['code']},
     }
-    assert _params(sg, 1) == {
+    assert rpc_params(sg, 1) == {
         'type': 'Shot',
         'id': 3,
         'max_id': None,
@@ -234,7 +230,7 @@ def test_activity_stream_read_options_are_detached_before_readiness() -> None:
     min_id = ['original-min']
     max_id = ['original-max']
     limit = ['original-limit']
-    sg = _fake_client([_make_response({'updates': []})])
+    sg = fake_client([make_response({'updates': []})])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
@@ -255,7 +251,7 @@ def test_activity_stream_read_options_are_detached_before_readiness() -> None:
         limit=limit,
     )
 
-    params = _params(sg)
+    params = rpc_params(sg)
     assert params == {
         'type': 'Shot',
         'id': 3,
@@ -265,15 +261,15 @@ def test_activity_stream_read_options_are_detached_before_readiness() -> None:
         'entity_fields': {'Shot': ['code']},
     }
     assert tuple(params) == ('type', 'id', 'max_id', 'min_id', 'limit', 'entity_fields')
-    assert _sent_payload(sg)['method_name'] == 'activity_stream'
+    assert sent_payload(sg)['method_name'] == 'activity_stream'
 
 
 def test_activity_stream_read_preserves_zero_optional_values() -> None:
-    sg = _fake_client([_make_response({'updates': []})])
+    sg = fake_client([make_response({'updates': []})])
 
     sg.activity_stream_read('Shot', 3, min_id=0, max_id=0, limit=0)
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': 'Shot',
         'id': 3,
         'max_id': 0,
@@ -284,8 +280,9 @@ def test_activity_stream_read_preserves_zero_optional_values() -> None:
 
 
 def test_activity_stream_read_retries_as_logical_read_with_private_wire_name() -> None:
-    events: list[ObserverEvent] = []
-    sg = _fake_client([SendError('ambiguous'), _make_response({'updates': []})])
+    events: list[_ObserverEvent] = []
+    sg = fake_client([SendError('ambiguous'), make_response({'updates': []})])
+    sg.config.rpc_attempt_interval = 0
     sg.config.on_request = events.append
     sg.config.on_response = events.append
     sg.config.on_retry = events.append
@@ -301,13 +298,13 @@ def test_activity_stream_read_retries_as_logical_read_with_private_wire_name() -
     assert sum(isinstance(event, RequestEvent) for event in operation_events) == 3
     assert sum(isinstance(event, RetryEvent) for event in operation_events) == 1
     assert all(event.operation == 'read' for event in operation_events)
-    assert _sent_payload(sg)['method_name'] == 'activity_stream'
-    assert _sent_payload(sg, 1)['method_name'] == 'activity_stream'
+    assert sent_payload(sg)['method_name'] == 'activity_stream'
+    assert sent_payload(sg, 1)['method_name'] == 'activity_stream'
 
 
 @pytest.mark.parametrize('method_name', ['activity_stream_read', 'follow', 'unfollow'])
 def test_dictionary_activity_methods_require_dictionary_results(method_name: str) -> None:
-    sg = _fake_client([_make_response(['sensitive-result'])])
+    sg = fake_client([make_response(['sensitive-result'])])
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -322,7 +319,7 @@ def test_dictionary_activity_methods_require_dictionary_results(method_name: str
 def test_entity_fields_are_detached_before_readiness(method_name: str) -> None:
     entity_fields = {'Shot': ['code']}
     result: object = {'updates': []} if method_name == 'activity_stream_read' else []
-    sg = _fake_client([_make_response(result)])
+    sg = fake_client([make_response(result)])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
@@ -336,17 +333,17 @@ def test_entity_fields_are_detached_before_readiness(method_name: str) -> None:
     else:
         sg.note_thread_read(41, entity_fields=entity_fields)
 
-    assert _params(sg)['entity_fields'] == {'Shot': ['code']}
+    assert rpc_params(sg)['entity_fields'] == {'Shot': ['code']}
 
 
 def test_follow_and_unfollow_optimize_entities_without_mutation() -> None:
     user = {'type': 'HumanUser', 'id': 7, 'name': 'Me', 'login': 'me'}
     entity = {'type': 'Shot', 'id': 3, 'name': 'X', 'code': 'X'}
     original = copy.deepcopy((user, entity))
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'followed': True}),
-            _make_response({'followed': False}),
+            make_response({'followed': True}),
+            make_response({'followed': False}),
         ]
     )
 
@@ -357,10 +354,10 @@ def test_follow_and_unfollow_optimize_entities_without_mutation() -> None:
         'user': {'type': 'HumanUser', 'id': 7, 'name': 'Me'},
         'entity': {'type': 'Shot', 'id': 3, 'name': 'X'},
     }
-    assert _sent_payload(sg)['method_name'] == 'follow'
-    assert _sent_payload(sg, 1)['method_name'] == 'unfollow'
-    assert _params(sg) == expected
-    assert _params(sg, 1) == expected
+    assert sent_payload(sg)['method_name'] == 'follow'
+    assert sent_payload(sg, 1)['method_name'] == 'unfollow'
+    assert rpc_params(sg) == expected
+    assert rpc_params(sg, 1) == expected
     assert (user, entity) == original
 
 
@@ -368,7 +365,7 @@ def test_follow_and_unfollow_optimize_entities_without_mutation() -> None:
 def test_follow_mutable_entities_are_detached_before_readiness(method_name: str) -> None:
     user = {'type': 'HumanUser', 'id': 7, 'name': ['original-user']}
     entity = {'type': 'Shot', 'id': 3, 'name': ['original-entity']}
-    sg = _fake_client([_make_response({'followed': method_name == 'follow'})])
+    sg = fake_client([make_response({'followed': method_name == 'follow'})])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
@@ -380,7 +377,7 @@ def test_follow_mutable_entities_are_detached_before_readiness(method_name: str)
     method = cast('_FollowCallable', getattr(sg, method_name))
     method(user, entity)
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'user': {'type': 'HumanUser', 'id': 7, 'name': ['original-user']},
         'entity': {'type': 'Shot', 'id': 3, 'name': ['original-entity']},
     }
@@ -391,27 +388,27 @@ def test_followers_and_following_build_exact_payloads_and_omit_optionals() -> No
     entity = {'type': 'Shot', 'id': 3, 'code': 'X'}
     project = {'type': 'Project', 'id': 2, 'name': 'P', 'sg_status': 'Active'}
     original = copy.deepcopy((user, entity, project))
-    sg = _fake_client([_make_response([]), _make_response([]), _make_response([])])
+    sg = fake_client([make_response([]), make_response([]), make_response([])])
 
     sg.followers(entity)
     sg.following(user, project=project, entity_type='Shot')
     sg.following(user)
 
-    assert _sent_payload(sg)['method_name'] == 'followers'
-    assert _params(sg) == {'entity': {'type': 'Shot', 'id': 3}}
-    assert _sent_payload(sg, 1)['method_name'] == 'following'
-    assert _params(sg, 1) == {
+    assert sent_payload(sg)['method_name'] == 'followers'
+    assert rpc_params(sg) == {'entity': {'type': 'Shot', 'id': 3}}
+    assert sent_payload(sg, 1)['method_name'] == 'following'
+    assert rpc_params(sg, 1) == {
         'user': {'type': 'HumanUser', 'id': 7},
         'project': {'type': 'Project', 'id': 2, 'name': 'P'},
         'entity_type': 'Shot',
     }
-    assert _params(sg, 2) == {'user': {'type': 'HumanUser', 'id': 7}}
+    assert rpc_params(sg, 2) == {'user': {'type': 'HumanUser', 'id': 7}}
     assert (user, entity, project) == original
 
 
 def test_followers_entity_is_detached_before_readiness() -> None:
     entity = {'type': 'Shot', 'id': 3, 'name': ['original']}
-    sg = _fake_client([_make_response([])])
+    sg = fake_client([make_response([])])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
@@ -421,7 +418,7 @@ def test_followers_entity_is_detached_before_readiness() -> None:
 
     sg.followers(entity)
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'entity': {'type': 'Shot', 'id': 3, 'name': ['original']},
     }
 
@@ -429,7 +426,7 @@ def test_followers_entity_is_detached_before_readiness() -> None:
 def test_following_user_and_project_are_detached_before_readiness() -> None:
     user = {'type': 'HumanUser', 'id': 7, 'name': ['original-user']}
     project = {'type': 'Project', 'id': 2, 'name': ['original-project']}
-    sg = _fake_client([_make_response([])])
+    sg = fake_client([make_response([])])
 
     def mutate_after_readiness(event: object) -> None:
         if isinstance(event, ResponseEvent):
@@ -440,7 +437,7 @@ def test_following_user_and_project_are_detached_before_readiness() -> None:
 
     sg.following(user, project=project)
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'user': {'type': 'HumanUser', 'id': 7, 'name': ['original-user']},
         'project': {'type': 'Project', 'id': 2, 'name': ['original-project']},
     }
@@ -459,7 +456,7 @@ def test_list_activity_methods_require_lists_of_dictionaries(
     result: object,
     message_suffix: str,
 ) -> None:
-    sg = _fake_client([_make_response(result)])
+    sg = fake_client([make_response(result)])
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -473,24 +470,24 @@ def test_list_activity_methods_require_lists_of_dictionaries(
 def test_note_thread_read_builds_exact_payload_and_omits_entity_fields() -> None:
     entity_fields = {'Note': ['created_by']}
     original = copy.deepcopy(entity_fields)
-    sg = _fake_client([_make_response([]), _make_response([])])
+    sg = fake_client([make_response([]), make_response([])])
 
     sg.note_thread_read(41, entity_fields=entity_fields)
     sg.note_thread_read(41)
 
-    assert _sent_payload(sg)['method_name'] == 'note_thread_contents'
-    assert _params(sg) == {'note_id': 41, 'entity_fields': {'Note': ['created_by']}}
-    assert _params(sg, 1) == {'note_id': 41}
+    assert sent_payload(sg)['method_name'] == 'note_thread_contents'
+    assert rpc_params(sg) == {'note_id': 41, 'entity_fields': {'Note': ['created_by']}}
+    assert rpc_params(sg, 1) == {'note_id': 41}
     assert entity_fields == original
 
 
 def test_social_methods_forward_values_the_optimizer_cannot_project() -> None:
-    sg = _fake_client(
+    sg = fake_client(
         [
-            _make_response({'followed': True}),
-            _make_response({'followed': False}),
-            _make_response([]),
-            _make_response([]),
+            make_response({'followed': True}),
+            make_response({'followed': False}),
+            make_response([]),
+            make_response([]),
         ]
     )
     follow = cast('Callable[..., object]', sg.follow)
@@ -503,7 +500,7 @@ def test_social_methods_forward_values_the_optimizer_cannot_project() -> None:
     followers([])
     following([], project='', entity_type='')
 
-    assert _params(sg) == {'user': [], 'entity': ''}
-    assert _params(sg, 1) == {'user': '', 'entity': []}
-    assert _params(sg, 2) == {'entity': []}
-    assert _params(sg, 3) == {'user': [], 'project': '', 'entity_type': ''}
+    assert rpc_params(sg) == {'user': [], 'entity': ''}
+    assert rpc_params(sg, 1) == {'user': '', 'entity': []}
+    assert rpc_params(sg, 2) == {'entity': []}
+    assert rpc_params(sg, 3) == {'user': [], 'project': '', 'entity_type': ''}

@@ -1,5 +1,5 @@
 import json
-from typing import TYPE_CHECKING, NotRequired, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, Unpack, cast
 
 import pytest
 
@@ -12,12 +12,12 @@ from shotgun_api3._transport import (
     TransportError,
     TransportResponse,
 )
-from tests._transports import _AsyncFakeTransport, _FakeTransport
+from tests._transports import AsyncFakeTransport, FakeTransport
 
 pytest_plugins = ('pytester', 'tests._required_mode')
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Mapping
 
     from shotgun_api3._async_transport import AsyncTransport
 
@@ -36,19 +36,41 @@ class _AsyncClientKwargs(TypedDict):
     sudo_as_login: NotRequired[str | None]
 
 
-def _fake_async_transport(sg: 'AsyncShotgun') -> _AsyncFakeTransport:  # pyright: ignore[reportUnusedFunction]
+class FakeAsyncClient(Protocol):
+    def __call__(
+        self,
+        script: list[TransportResponse | TransportError],
+        *,
+        server_info: dict[str, object] | None = None,
+        preseed_readiness: bool = False,
+        **kwargs: Unpack[_AsyncClientKwargs],
+    ) -> AsyncShotgun: ...
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return 'asyncio'
+
+
+def entity_id(record: 'Mapping[str, object]') -> int:
+    identity = record['id']
+    assert isinstance(identity, int)
+    return identity
+
+
+def fake_async_transport(sg: 'AsyncShotgun') -> AsyncFakeTransport:
     transport = sg._transport
-    assert isinstance(transport, _AsyncFakeTransport)
+    assert isinstance(transport, AsyncFakeTransport)
     return transport
 
 
-def _fake_transport(sg: Shotgun) -> _FakeTransport:
-    transport = sg._transport
-    assert isinstance(transport, _FakeTransport)
+def fake_transport(sg: Shotgun) -> FakeTransport:
+    transport = sg.transport
+    assert isinstance(transport, FakeTransport)
     return transport
 
 
-def _make_response(obj: object) -> TransportResponse:
+def make_response(obj: object) -> TransportResponse:
     return TransportResponse(
         status=200,
         reason='OK',
@@ -57,17 +79,8 @@ def _make_response(obj: object) -> TransportResponse:
     )
 
 
-def _set_fake_async_transport(sg: 'AsyncShotgun', transport: 'AsyncTransport') -> None:  # pyright: ignore[reportUnusedFunction]
-    sg._transport = transport
-
-
 @pytest.fixture
-def anyio_backend() -> str:
-    return 'asyncio'
-
-
-@pytest.fixture
-def fake_async_client() -> 'Callable[..., AsyncShotgun]':
+def fake_async_client() -> FakeAsyncClient:
     def build(
         script: list[TransportResponse | TransportError],
         *,
@@ -86,8 +99,8 @@ def fake_async_client() -> 'Callable[..., AsyncShotgun]':
             kwargs.pop('script_name', None)
             kwargs.pop('api_key', None)
         sg = AsyncShotgun('https://x.example', **kwargs)
-        responses = script if preseed_readiness else [_make_response(info), *script]
-        sg._transport = _AsyncFakeTransport(responses)
+        responses = script if preseed_readiness else [make_response(info), *script]
+        sg._transport = AsyncFakeTransport(responses)
         if preseed_readiness:
             context = config_module.snapshot(sg.config)
             capabilities = ServerCapabilities('x.example', info)
@@ -103,7 +116,7 @@ def fake_async_client() -> 'Callable[..., AsyncShotgun]':
     return build
 
 
-def _fake_client(  # pyright: ignore[reportUnusedFunction]
+def fake_client(
     script: list[TransportResponse | TransportError],
     *,
     server_info: dict[str, object] | None = None,
@@ -114,11 +127,15 @@ def _fake_client(  # pyright: ignore[reportUnusedFunction]
         else server_info
     )
     sg = Shotgun('https://x.example', script_name='s', api_key='k', connect=False)
-    sg._transport = _FakeTransport([_make_response(info), *script])
+    sg.transport = FakeTransport([make_response(info), *script])
     return sg
 
 
-def _sent_payload(sg: Shotgun, index: int = 0) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-    request = _fake_transport(sg).requests[index + 1]
+def sent_payload(sg: Shotgun, index: int = 0) -> dict[str, object]:
+    request = fake_transport(sg).requests[index + 1]
     assert isinstance(request.body, bytes)
     return cast('dict[str, object]', json.loads(request.body))
+
+
+def set_fake_async_transport(sg: 'AsyncShotgun', transport: 'AsyncTransport') -> None:
+    sg._transport = transport

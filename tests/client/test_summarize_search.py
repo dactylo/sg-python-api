@@ -7,9 +7,10 @@ import pytest
 
 from shotgun_api3 import _errors
 from shotgun_api3._client import Shotgun
-from shotgun_api3._config import ObserverEvent, RequestEvent, ResponseEvent, RetryEvent
+from shotgun_api3._config import RequestEvent, ResponseEvent, RetryEvent, _ObserverEvent
 from shotgun_api3._transport import SendError
-from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
+from tests.client._payloads import rpc_params
+from tests.conftest import fake_client, fake_transport, make_response, sent_payload
 
 _SummarizeCallable: TypeAlias = Callable[
     [
@@ -31,11 +32,6 @@ if TYPE_CHECKING:
     _STATIC_CLIENT = cast('Shotgun', object())
     _SUMMARIZE: _SummarizeCallable = _STATIC_CLIENT.summarize
     _TEXT_SEARCH: _TextSearchCallable = _STATIC_CLIENT.text_search
-
-
-def _params(sg: Shotgun) -> dict[str, object]:
-    params = cast('list[object]', _sent_payload(sg)['params'])
-    return cast('dict[str, object]', params[1])
 
 
 def _run_result_contract_case(sg: Shotgun, method_name: str) -> object:
@@ -114,7 +110,7 @@ def test_summarize_and_text_search_expose_exact_signatures() -> None:
 
 @pytest.mark.parametrize('method_name', ['summarize', 'text_search'])
 def test_summarize_and_text_search_require_dictionary_results(method_name: str) -> None:
-    sg = _fake_client([_make_response([])])
+    sg = fake_client([make_response([])])
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -126,11 +122,11 @@ def test_summarize_and_text_search_require_dictionary_results(method_name: str) 
 def test_summarize_detaches_nested_data_before_readiness() -> None:
     entity_type = ['original-type']
     filter_value = {'nested': ['original-filter']}
-    summary_fields = [
-        {'field': 'id', 'type': 'count', 'options': {'nested': ['original-summary']}}
-    ]
-    grouping = [{'field': 'sg_status_list', 'type': 'exact', 'options': ['original-group']}]
-    sg = _fake_client([_make_response({'summaries': {'id': 3}, 'groups': []})])
+    summary_options = ['original-summary']
+    grouping_options = ['original-group']
+    summary_fields = [{'field': 'id', 'type': 'count', 'options': {'nested': summary_options}}]
+    grouping = [{'field': 'sg_status_list', 'type': 'exact', 'options': grouping_options}]
+    sg = fake_client([make_response({'summaries': {'id': 3}, 'groups': []})])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -141,8 +137,8 @@ def test_summarize_detaches_nested_data_before_readiness() -> None:
         if response_count == 1:
             entity_type[0] = 'changed-type'
             filter_value['nested'][0] = 'changed-filter'
-            cast('dict[str, Any]', summary_fields[0])['options']['nested'][0] = 'changed-summary'
-            cast('dict[str, Any]', grouping[0])['options'][0] = 'changed-group'
+            summary_options[0] = 'changed-summary'
+            grouping_options[0] = 'changed-group'
 
     sg.config.on_response = mutate_after_readiness
 
@@ -154,7 +150,7 @@ def test_summarize_detaches_nested_data_before_readiness() -> None:
         grouping=grouping,
     )
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': ['original-type'],
         'filters': {
             'logical_operator': 'and',
@@ -190,7 +186,7 @@ def test_summarize_docstring_documents_public_parameters() -> None:
 
 
 def test_summarize_forwards_filter_operator() -> None:
-    sg = _fake_client([_make_response({'summaries': {'id': 2}})])
+    sg = fake_client([make_response({'summaries': {'id': 2}})])
 
     sg.summarize(
         'Shot',
@@ -199,17 +195,17 @@ def test_summarize_forwards_filter_operator() -> None:
         filter_operator='any',
     )
 
-    filters = cast('dict[str, object]', _params(sg)['filters'])
+    filters = cast('dict[str, object]', rpc_params(sg)['filters'])
     assert filters['logical_operator'] == 'or'
 
 
 def test_summarize_omits_optional_params() -> None:
-    sg = _fake_client([_make_response({'summaries': {'id': 0}})])
+    sg = fake_client([make_response({'summaries': {'id': 0}})])
 
     sg.summarize('Shot', [], [{'field': 'id', 'type': 'count'}])
 
-    assert 'grouping' not in _params(sg)
-    assert 'include_archived_projects' not in _params(sg)
+    assert 'grouping' not in rpc_params(sg)
+    assert 'include_archived_projects' not in rpc_params(sg)
 
 
 def test_summarize_payload() -> None:
@@ -217,7 +213,7 @@ def test_summarize_payload() -> None:
     summary_fields = [{'field': 'id', 'type': 'count'}]
     grouping = [{'field': 'sg_status_list', 'type': 'exact', 'direction': 'asc'}]
     original = copy.deepcopy((filters, summary_fields, grouping))
-    sg = _fake_client([_make_response({'summaries': {'id': 3}, 'groups': []})])
+    sg = fake_client([make_response({'summaries': {'id': 3}, 'groups': []})])
 
     result = sg.summarize(
         'Shot',
@@ -228,7 +224,7 @@ def test_summarize_payload() -> None:
     )
 
     assert result['summaries'] == {'id': 3}
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': 'Shot',
         'filters': {
             'logical_operator': 'and',
@@ -248,10 +244,10 @@ def test_summarize_payload() -> None:
 
 
 def test_summarize_validates_inputs_before_readiness() -> None:
-    filters_sg = _fake_client([])
-    summaries_sg = _fake_client([])
-    summarize_filters = cast('Any', filters_sg.summarize)
-    summarize_fields = cast('Any', summaries_sg.summarize)
+    filters_sg = fake_client([])
+    summaries_sg = fake_client([])
+    summarize_filters = cast('Callable[..., object]', filters_sg.summarize)
+    summarize_fields = cast('Callable[..., object]', summaries_sg.summarize)
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -264,15 +260,15 @@ def test_summarize_validates_inputs_before_readiness() -> None:
     ):
         summarize_fields('Shot', [], 'not-a-list')
 
-    assert _fake_transport(filters_sg).requests == []
-    assert _fake_transport(summaries_sg).requests == []
+    assert fake_transport(filters_sg).requests == []
+    assert fake_transport(summaries_sg).requests == []
 
 
 def test_text_search_detaches_nested_data_before_readiness() -> None:
     filter_value = {'nested': ['original-filter']}
     entity_types = {'Shot': [['metadata', 'is', filter_value]]}
     project_ids = [1]
-    sg = _fake_client([_make_response({'matches': []})])
+    sg = fake_client([make_response({'matches': []})])
     response_count = 0
 
     def mutate_after_readiness(event: object) -> None:
@@ -289,7 +285,7 @@ def test_text_search_detaches_nested_data_before_readiness() -> None:
 
     sg.text_search('boat', entity_types, project_ids=project_ids)
 
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'text': 'boat',
         'entity_types': {
             'Shot': {
@@ -309,12 +305,12 @@ def test_text_search_detaches_nested_data_before_readiness() -> None:
 
 
 def test_text_search_includes_default_optional_params() -> None:
-    sg = _fake_client([_make_response({'matches': []})])
+    sg = fake_client([make_response({'matches': []})])
 
     sg.text_search('boat', {'Shot': []})
 
-    assert _sent_payload(sg)['method_name'] == 'query_display_name_cache'
-    assert _params(sg) == {
+    assert sent_payload(sg)['method_name'] == 'query_display_name_cache'
+    assert rpc_params(sg) == {
         'text': 'boat',
         'entity_types': {
             'Shot': {'logical_operator': 'and', 'conditions': []},
@@ -328,13 +324,13 @@ def test_text_search_payload() -> None:
     entity_types: dict[str, Any] = {'Shot': []}
     project_ids = [1, 2]
     original = copy.deepcopy((entity_types, project_ids))
-    sg = _fake_client([_make_response({'matches': []})])
+    sg = fake_client([make_response({'matches': []})])
 
     result = sg.text_search('boat', entity_types, project_ids=project_ids, limit=5)
 
     assert result == {'matches': []}
-    assert _sent_payload(sg)['method_name'] == 'query_display_name_cache'
-    assert _params(sg) == {
+    assert sent_payload(sg)['method_name'] == 'query_display_name_cache'
+    assert rpc_params(sg) == {
         'text': 'boat',
         'entity_types': {
             'Shot': {'logical_operator': 'and', 'conditions': []},
@@ -346,8 +342,8 @@ def test_text_search_payload() -> None:
 
 
 def test_text_search_requires_dict_before_readiness() -> None:
-    sg = _fake_client([])
-    text_search = cast('Any', sg.text_search)
+    sg = fake_client([])
+    text_search = cast('Callable[..., object]', sg.text_search)
 
     with pytest.raises(
         _errors.ShotgunError,
@@ -355,12 +351,13 @@ def test_text_search_requires_dict_before_readiness() -> None:
     ):
         text_search('boat', ['Shot'])
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_text_search_retries_as_logical_read_with_private_wire_name() -> None:
-    events: list[ObserverEvent] = []
-    sg = _fake_client([SendError('ambiguous'), _make_response({'matches': []})])
+    events: list[_ObserverEvent] = []
+    sg = fake_client([SendError('ambiguous'), make_response({'matches': []})])
+    sg.config.rpc_attempt_interval = 0
     sg.config.on_request = events.append
     sg.config.on_response = events.append
     sg.config.on_retry = events.append
@@ -376,5 +373,5 @@ def test_text_search_retries_as_logical_read_with_private_wire_name() -> None:
     assert sum(isinstance(event, RequestEvent) for event in operation_events) == 3
     assert sum(isinstance(event, RetryEvent) for event in operation_events) == 1
     assert all(event.operation == 'read' for event in operation_events)
-    assert _sent_payload(sg)['method_name'] == 'query_display_name_cache'
-    assert _sent_payload(sg, 1)['method_name'] == 'query_display_name_cache'
+    assert sent_payload(sg)['method_name'] == 'query_display_name_cache'
+    assert sent_payload(sg, 1)['method_name'] == 'query_display_name_cache'

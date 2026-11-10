@@ -5,22 +5,21 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import Never, TypeVar, cast
+from typing import cast
 
 import pytest
 
 from shotgun_api3 import _config as config_module
-from shotgun_api3 import _driver as driver_module
 from shotgun_api3 import _errors, _protocol
 from shotgun_api3 import _transport as transport_module
 from shotgun_api3._config import (
     CompatibilityWarningEvent,
     Config,
-    ObserverEvent,
     ProgressEvent,
     RequestEvent,
     ResponseEvent,
     RetryEvent,
+    _ObserverEvent,
 )
 from shotgun_api3._driver import (
     AttemptControl,
@@ -30,7 +29,6 @@ from shotgun_api3._driver import (
     _DriverTiming,
 )
 from shotgun_api3._transport import (
-    AbortedError,
     CaseInsensitiveHeaders,
     ConnectError,
     ProxyError,
@@ -43,11 +41,10 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _FakeTransport
+from tests._exceptions import call_inside_except
+from tests._transports import FakeTransport
 
-_AmbientResult = TypeVar('_AmbientResult')
 _AUTH_VALUE = 'one-use'
-_BODY_CLOSE_FAILURE_REQUEST_ID = 'body-close-failure'
 _CREDENTIAL = 'credential'
 _GATEWAY = TransportResponse(status=502, reason='Bad Gateway', headers={}, content=b'')
 _INFO = TransportResponse(
@@ -88,9 +85,6 @@ class _ChunkedTransport:
         self.requests: list[TransportRequest] = []
         self.response = response
 
-    def abort(self, token: str) -> None:
-        del token
-
     def close(self) -> None:
         pass
 
@@ -119,7 +113,7 @@ class _SendCallVisitor(ast.NodeVisitor):
         return (
             isinstance(node, ast.Name)
             and any(node.id in names for names in reversed(self._transport_names))
-        ) or (isinstance(node, ast.Attribute) and node.attr == '_transport')
+        ) or (isinstance(node, ast.Attribute) and node.attr in {'_transport', 'transport'})
 
     def _visit_function(
         self,
@@ -189,8 +183,8 @@ class _TrackedRequestBody:
         failure: BaseException | None = None,
         close_failure: BaseException | None = None,
     ) -> None:
-        self.chunks = iter(chunks)
-        self.failure = failure
+        self._chunks = iter(chunks)
+        self._failure = failure
         self.close_failure = close_failure
         self.close_failure_raised = False
         self.pulls = 0
@@ -202,10 +196,10 @@ class _TrackedRequestBody:
     def __next__(self) -> bytes:
         self.pulls += 1
         try:
-            return next(self.chunks)
+            return next(self._chunks)
         except StopIteration:
-            if self.failure is not None:
-                raise self.failure from None
+            if self._failure is not None:
+                raise self._failure from None
             raise
 
     def close(self) -> None:
@@ -226,20 +220,8 @@ def _config() -> Config:
     return config
 
 
-def _raise_ambient_exception() -> Never:
-    raise RuntimeError('ambient exception state')
-
-
-def _call_inside_except(function: Callable[[], _AmbientResult]) -> _AmbientResult:
-    try:
-        _raise_ambient_exception()
-    except RuntimeError:
-        return function()
-
-
 def _request(
     context_timeout: TimeoutConfig,
-    request_id: str,
     url: str = 'https://x.example:443/file',
 ) -> TransportRequest:
     return TransportRequest(
@@ -248,7 +230,6 @@ def _request(
         headers={},
         body=None,
         timeout=context_timeout,
-        token=request_id,
     )
 
 
@@ -280,20 +261,13 @@ def _response_with_close_error(
 
 @pytest.mark.parametrize('chunks', [(), (b'', b'a', b'', b'bc')])
 def test_attempt_control_collects_empty_and_multiple_chunks(chunks: tuple[bytes, ...]) -> None:
-    clock_calls = 0
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
 
-    def clock() -> float:
-        nonlocal clock_calls
-        clock_calls += 1
-        return 1.0
-
-    control = AttemptControl(2, clock, 2.0, events.append, 'read', 'rpc')
+    control = AttemptControl(2, events.append, 'read', 'rpc')
     consumed = control.consume(chunks, total_bytes=3)
 
     assert type(consumed) is bytes
     assert consumed == b''.join(chunks)
-    assert clock_calls == len(chunks)
     progress = [event for event in events if isinstance(event, ProgressEvent)]
     assert [event.bytes_transferred for event in progress] == ([1, 3] if chunks else [])
     assert [event.total_bytes for event in progress] == ([3, 3] if chunks else [])
@@ -301,27 +275,18 @@ def test_attempt_control_collects_empty_and_multiple_chunks(chunks: tuple[bytes,
 
 @pytest.mark.parametrize('body', [b'data', b''])
 def test_attempt_control_consumes_buffered_body_without_copy(body: bytes) -> None:
-    clock_calls = 0
-    events: list[ObserverEvent] = []
-
-    def clock() -> float:
-        nonlocal clock_calls
-        clock_calls += 1
-        return 1.0
+    events: list[_ObserverEvent] = []
 
     control = AttemptControl(
         _attempt=2,
-        _clock=clock,
-        _deadline=2.0,
         _observer=events.append,
         _operation='read',
         _route='rpc',
     )
 
-    consumed = control._consume_buffered(body, total_bytes=len(body))
+    consumed = control.consume_buffered(body, total_bytes=len(body))
 
     assert consumed is body
-    assert clock_calls == 1
     progress = [event for event in events if isinstance(event, ProgressEvent)]
     assert [event.bytes_transferred for event in progress] == ([len(body)] if body else [])
     assert [event.total_bytes for event in progress] == ([len(body)] if body else [])
@@ -333,7 +298,7 @@ def test_call_detaches_nested_input_before_request_and_retry_observers() -> None
     config = _config()
     config.on_request = lambda _event: values.append('request mutation')
     config.on_retry = lambda _event: values.append('retry mutation')
-    fake = _FakeTransport([_GATEWAY, _OK])
+    fake = FakeTransport([_GATEWAY, _OK])
     driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
 
     assert driver.call('read', params, config_module.snapshot(config)) == {'id': 7}
@@ -350,11 +315,11 @@ def test_call_detaches_nested_input_before_request_and_retry_observers() -> None
         }
     assert attempts[0].body == attempts[1].body
     assert attempts[0].body is not attempts[1].body
-    assert attempts[0].token != attempts[1].token
+    assert attempts[0] is not attempts[1]
 
 
 def test_call_extracts_results_with_fresh_rpc_request() -> None:
-    fake = _FakeTransport([_OK])
+    fake = FakeTransport([_OK])
     config = _config()
 
     assert _call(Driver(fake, _DriverTiming(sleep=lambda _delay: None)), config) == {'id': 7}
@@ -408,7 +373,7 @@ def test_call_routes_original_body_through_one_response_decode(
     )
 
     assert Driver(
-        _FakeTransport([response]),
+        FakeTransport([response]),
         _DriverTiming(sleep=lambda _delay: None),
     ).call('info', {}, config_module.snapshot(_config())) == {'id': 7}
     assert decoded_bodies == [body]
@@ -419,7 +384,7 @@ def test_callbacks_and_sleep_run_without_configuration_lock() -> None:
     config = _config()
     transitions: list[str] = []
 
-    def observe(_event: ObserverEvent) -> None:
+    def observe(_event: _ObserverEvent) -> None:
         config.update_fields(page_prefetch=1)
         transitions.append('observe')
 
@@ -428,7 +393,7 @@ def test_callbacks_and_sleep_run_without_configuration_lock() -> None:
         transitions.append('sleep')
 
     config.update_fields(on_request=observe, on_retry=observe)
-    fake = _FakeTransport([_GATEWAY, _OK])
+    fake = FakeTransport([_GATEWAY, _OK])
 
     assert _call(Driver(fake, _DriverTiming(sleep=sleep)), config) == {'id': 7}
     assert 'sleep' in transitions
@@ -437,7 +402,7 @@ def test_callbacks_and_sleep_run_without_configuration_lock() -> None:
 
 def test_consumer_base_exception_closes_once_then_emits_terminal_response() -> None:
     order: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     response = TransportResponse(
         status=200,
         reason='OK',
@@ -447,14 +412,14 @@ def test_consumer_base_exception_closes_once_then_emits_terminal_response() -> N
     )
     config = _config()
 
-    def observe(event: ObserverEvent) -> None:
+    def observe(event: _ObserverEvent) -> None:
         events.append(event)
         if isinstance(event, ResponseEvent):
             order.append('response')
 
     config.on_response = observe
     context = config_module.snapshot(config)
-    driver = Driver(_FakeTransport([response]), _DriverTiming(sleep=lambda _delay: None))
+    driver = Driver(FakeTransport([response]), _DriverTiming(sleep=lambda _delay: None))
 
     def cancel(_response: object, _control: AttemptControl) -> object:
         raise _CancellationSignal
@@ -463,7 +428,7 @@ def test_consumer_base_exception_closes_once_then_emits_terminal_response() -> N
         driver.execute(
             _protocol.classify_endpoint('download'),
             context,
-            lambda attempt: _request(context.timeout, request_id=f'cancel-{attempt}'),
+            lambda _attempt: _request(context.timeout),
             cancel,
         )
 
@@ -471,55 +436,6 @@ def test_consumer_base_exception_closes_once_then_emits_terminal_response() -> N
     assert order == ['close', 'response']
     assert len(response_events) == 1
     assert response_events[0].outcome == 'error'
-
-
-def test_deadline_retry_preserves_received_response_metadata() -> None:
-    events: list[ObserverEvent] = []
-    first = TransportResponse(
-        status=200,
-        reason='OK',
-        headers={'x-sg-correlation-id': 'deadline-response'},
-        content=b'',
-    )
-    second = TransportResponse(
-        status=200,
-        reason='OK',
-        headers={'x-sg-correlation-id': 'success-response'},
-        content=b'',
-    )
-    config = _config()
-    config.update_fields(
-        max_rpc_attempts=2,
-        on_response=events.append,
-        on_retry=events.append,
-        rpc_attempt_interval=0,
-    )
-    context = dataclasses.replace(
-        config_module.snapshot(config),
-        timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0),
-    )
-    ticks = iter((0.0, 2.0, 2.0, 3.0, 3.5, 3.5))
-
-    result = Driver(
-        _FakeTransport([first, second]),
-        _DriverTiming(clock=lambda: next(ticks), sleep=lambda _delay: None),
-    ).execute(
-        _protocol.classify_endpoint('download', body_restartable=True),
-        context,
-        lambda attempt: _request(context.timeout, request_id=f'deadline-{attempt}'),
-        lambda _response, _control: {'ok': True},
-    )
-
-    assert result == {'ok': True}
-    response_events = [event for event in events if isinstance(event, ResponseEvent)]
-    assert [event.outcome for event in response_events] == ['retry', 'success']
-    assert [event.status for event in response_events] == [200, 200]
-    assert [event.correlation_id for event in response_events] == [
-        'deadline-response',
-        'success-response',
-    ]
-    retry_events = [event for event in events if isinstance(event, RetryEvent)]
-    assert [event.status for event in retry_events] == [200]
 
 
 def test_executor_accepts_live_response_without_buffered_content() -> None:
@@ -536,7 +452,7 @@ def test_executor_accepts_live_response_without_buffered_content() -> None:
     result = driver.execute(
         _protocol.classify_endpoint('download'),
         context,
-        lambda attempt: _request(context.timeout, request_id=f'live-{attempt}'),
+        lambda _attempt: _request(context.timeout),
         consume,
     )
 
@@ -546,13 +462,18 @@ def test_executor_accepts_live_response_without_buffered_content() -> None:
 
 
 def test_exhausted_http_attempts_raise_after_exact_budget() -> None:
+    retries: list[_ObserverEvent] = []
+    sleeps: list[float] = []
     config = _config()
-    fake = _FakeTransport([_GATEWAY, _GATEWAY, _GATEWAY])
+    config.on_retry = retries.append
+    fake = FakeTransport([_GATEWAY, _GATEWAY, _GATEWAY])
 
     with pytest.raises(_errors.ProtocolError):
-        _call(Driver(fake, _DriverTiming(sleep=lambda _delay: None)), config)
+        _call(Driver(fake, _DriverTiming(sleep=sleeps.append)), config)
 
     assert len(fake.requests) == 3
+    assert len(sleeps) == len(retries) == 2
+    assert [event.attempt for event in retries if isinstance(event, RetryEvent)] == [1, 2]
 
 
 def test_fault_closes_response_and_raises_after_success_status() -> None:
@@ -564,7 +485,7 @@ def test_fault_closes_response_and_raises_after_success_status() -> None:
         content=b'{"exception": true, "error_code": 102, "message": "no"}',
         on_close=lambda: closed.append(True),
     )
-    fake = _FakeTransport([fault])
+    fake = FakeTransport([fault])
 
     with pytest.raises(_errors.AuthenticationFault):
         _call(Driver(fake, _DriverTiming(sleep=lambda _delay: None)), _config())
@@ -572,42 +493,41 @@ def test_fault_closes_response_and_raises_after_success_status() -> None:
     assert closed == [True]
 
 
-def test_generic_consumer_reports_progress_and_enforces_cumulative_total_deadline() -> None:
-    ticks = iter((0.0, 0.2, 0.4, 0.8, 1.2, 1.4))
-    events: list[ObserverEvent] = []
+def test_generic_consumer_reports_progress() -> None:
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_progress = events.append
     context = dataclasses.replace(
         config_module.snapshot(config),
-        timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0),
+        timeout=TimeoutConfig(connect=1.0, read=1.0),
         max_rpc_attempts=1,
     )
-    fake = _FakeTransport([_OK])
-    timing = _DriverTiming(clock=lambda: next(ticks), sleep=lambda _delay: None)
+    fake = FakeTransport([_OK])
+    timing = _DriverTiming(sleep=lambda _delay: None)
     driver = Driver(fake, timing)
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     def consume(_response: LiveResponse, control: AttemptControl) -> bytes:
         return control.consume((b'a', b'b', b'c'), total_bytes=3)
 
-    with pytest.raises(ReadTimeoutError):
-        driver.execute(
-            operation,
-            context,
-            lambda attempt: _request(context.timeout, request_id=f'attempt-{attempt}'),
-            consume,
-        )
+    result = driver.execute(
+        operation,
+        context,
+        lambda _attempt: _request(context.timeout),
+        consume,
+    )
 
+    assert result == b'abc'
     progress = [event for event in events if isinstance(event, ProgressEvent)]
-    assert [event.bytes_transferred for event in progress] == [1, 2]
+    assert [event.bytes_transferred for event in progress] == [1, 2, 3]
     assert len(fake.requests) == 1
 
 
 def test_infinite_timeout_publishes_sanitized_compatibility_warning() -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.update_fields(timeout_secs=None, on_compatibility_warning=events.append)
-    fake = _FakeTransport([_INFO])
+    fake = FakeTransport([_INFO])
 
     result = Driver(fake, _DriverTiming(sleep=lambda _delay: None)).call(
         'info',
@@ -616,7 +536,9 @@ def test_infinite_timeout_publishes_sanitized_compatibility_warning() -> None:
     )
 
     assert result == {'version': [8, 0]}
-    assert [cast('CompatibilityWarningEvent', event).code for event in events] == [
+    warnings = [event for event in events if isinstance(event, CompatibilityWarningEvent)]
+    assert len(warnings) == len(events)
+    assert [event.code for event in warnings] == [
         'legacy-infinite-timeout',
     ]
     assert 'script' not in repr(events)
@@ -625,7 +547,7 @@ def test_infinite_timeout_publishes_sanitized_compatibility_warning() -> None:
 
 def test_info_retries_without_changing_protocol_classification() -> None:
     config = _config()
-    fake = _FakeTransport([_GATEWAY, _INFO])
+    fake = FakeTransport([_GATEWAY, _INFO])
     sleeps: list[float] = []
 
     assert _call(Driver(fake, _DriverTiming(sleep=sleeps.append)), config, 'info') == {
@@ -637,7 +559,7 @@ def test_info_retries_without_changing_protocol_classification() -> None:
 
 def test_localized_header_is_absent_when_false_and_auto_when_true() -> None:
     config = _config()
-    fake = _FakeTransport([_OK, _OK])
+    fake = FakeTransport([_OK, _OK])
     driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
 
     assert _call(driver, config) == {'id': 7}
@@ -648,16 +570,86 @@ def test_localized_header_is_absent_when_false_and_auto_when_true() -> None:
     assert fake.requests[1].headers['locale'] == 'auto'
 
 
-def test_merged_one_use_session_exchange_is_not_retried_after_ambiguous_send() -> None:
+def test_observer_events_are_ordered_frozen_and_redacted() -> None:
+    events: list[_ObserverEvent] = []
+    config = _config()
+    fake = FakeTransport([_INFO, _GATEWAY, _OK])
+    driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
+    assert driver.call('info', {}, config_module.snapshot(config)) == {'version': [8, 0]}
+    config.update_fields(
+        on_progress=events.append,
+        on_request=events.append,
+        on_response=events.append,
+        on_retry=events.append,
+    )
+
+    assert _call(driver, config) == {'id': 7}
+
+    assert [type(event) for event in events] == [
+        RequestEvent,
+        ResponseEvent,
+        RetryEvent,
+        RequestEvent,
+        ProgressEvent,
+        ResponseEvent,
+    ]
+    request_events = [event for event in events if isinstance(event, RequestEvent)]
+    assert [event.http_method for event in request_events] == ['POST', 'POST']
+    retry_response = events[1]
+    assert isinstance(retry_response, ResponseEvent)
+    success_response = events[-1]
+    assert isinstance(success_response, ResponseEvent)
+    assert retry_response.outcome == 'retry'
+    assert success_response.correlation_id == 'correlation-1'
+    assert success_response.outcome == 'success'
+    assert all(dataclasses.is_dataclass(event) for event in events)
+    serialized = repr(events)
+    assert 'script' not in serialized
+    assert 'key' not in serialized
+    assert 'authorization' not in serialized
+    assert 'secret-response-header' not in serialized
+    assert 'https://' not in serialized
+
+
+def test_observer_failures_are_sanitized_and_non_invasive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail(_event: _ObserverEvent) -> None:
+        raise RuntimeError('observer-secret')
+
+    config = _config()
+    config.update_fields(
+        on_progress=fail,
+        on_request=fail,
+        on_response=fail,
+        on_retry=fail,
+    )
+    fake = FakeTransport([_GATEWAY, _OK])
+
+    with caplog.at_level(logging.WARNING, logger='shotgun_api3'):
+        timing = _DriverTiming(sleep=lambda _delay: None)
+        assert _call(Driver(fake, timing), config) == {'id': 7}
+
+    assert len(fake.requests) == 2
+    assert 'observer-secret' not in caplog.text
+
+
+@pytest.mark.parametrize('auth_field', ['extra_auth_params', 'auth_token'])
+def test_one_use_session_exchange_is_not_retried_after_ambiguous_send(auth_field: str) -> None:
     config = Config()
     config.set_server_params('https://x.example')
+    auth_fields: dict[str, object] = (
+        {'extra_auth_params': {'auth_token': _AUTH_VALUE}}
+        if auth_field == 'extra_auth_params'
+        else {'auth_token': _AUTH_VALUE}
+    )
     config.update_fields(
-        extra_auth_params={'auth_token': _AUTH_VALUE},
+        **auth_fields,
         max_rpc_attempts=3,
         user_login='artist',
         user_password=_CREDENTIAL,
     )
-    fake = _FakeTransport([SendError('ambiguous'), _OK])
+    fake = FakeTransport([SendError('ambiguous'), _OK])
     driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
 
     with pytest.raises(SendError, match='ambiguous'):
@@ -692,7 +684,7 @@ def test_observed_request_body_closes_source_once_without_eager_pull(
         if consumption == 'failure'
         else None,
     )
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     progress_at_pull: list[list[int]] = []
 
     def progress() -> list[int]:
@@ -729,10 +721,10 @@ def test_observed_request_body_closes_source_once_without_eager_pull(
 
     def execute() -> bytes:
         return Driver(transport).execute(
-            _protocol.classify_endpoint('object_put', body_restartable=True),
+            _protocol.classify_endpoint('object_put'),
             context,
             lambda _attempt: dataclasses.replace(
-                _request(context.timeout, request_id='observed-body'),
+                _request(context.timeout),
                 body=source,
                 headers={'content-length': '3'},
             ),
@@ -768,98 +760,6 @@ def test_observed_request_body_closes_source_once_without_eager_pull(
     assert source.closes == 1
 
 
-def test_observer_events_are_ordered_frozen_and_redacted() -> None:
-    events: list[ObserverEvent] = []
-    config = _config()
-    fake = _FakeTransport([_INFO, _GATEWAY, _OK])
-    driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
-    assert driver.call('info', {}, config_module.snapshot(config)) == {'version': [8, 0]}
-    config.update_fields(
-        on_progress=events.append,
-        on_request=events.append,
-        on_response=events.append,
-        on_retry=events.append,
-    )
-
-    assert _call(driver, config) == {'id': 7}
-
-    assert [type(event) for event in events] == [
-        RequestEvent,
-        ResponseEvent,
-        RetryEvent,
-        RequestEvent,
-        ProgressEvent,
-        ResponseEvent,
-    ]
-    request_events = [event for event in events if isinstance(event, RequestEvent)]
-    assert [event.http_method for event in request_events] == ['POST', 'POST']
-    retry_response = cast('ResponseEvent', events[1])
-    success_response = cast('ResponseEvent', events[-1])
-    assert retry_response.outcome == 'retry'
-    assert success_response.correlation_id == 'correlation-1'
-    assert success_response.outcome == 'success'
-    assert all(dataclasses.is_dataclass(event) for event in events)
-    serialized = repr(events)
-    assert 'script' not in serialized
-    assert 'key' not in serialized
-    assert 'authorization' not in serialized
-    assert 'secret-response-header' not in serialized
-    assert 'https://' not in serialized
-
-
-def test_observer_failures_are_sanitized_and_non_invasive(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    def fail(_event: ObserverEvent) -> None:
-        raise RuntimeError('observer-secret')
-
-    config = _config()
-    config.update_fields(
-        on_progress=fail,
-        on_request=fail,
-        on_response=fail,
-        on_retry=fail,
-    )
-    fake = _FakeTransport([_GATEWAY, _OK])
-
-    with caplog.at_level(logging.WARNING, logger='shotgun_api3'):
-        timing = _DriverTiming(sleep=lambda _delay: None)
-        assert _call(Driver(fake, timing), config) == {'id': 7}
-
-    assert len(fake.requests) == 2
-    assert 'observer-secret' not in caplog.text
-
-
-def test_one_use_session_exchange_is_not_retried_after_ambiguous_send() -> None:
-    config = Config()
-    config.set_server_params('https://x.example')
-    config.update_fields(
-        auth_token=_AUTH_VALUE,
-        max_rpc_attempts=3,
-        user_login='artist',
-        user_password=_CREDENTIAL,
-    )
-    fake = _FakeTransport([SendError('ambiguous'), _OK])
-    driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
-
-    with pytest.raises(SendError, match='ambiguous'):
-        driver.call('get_session_token', None, config_module.snapshot(config))
-
-    assert len(fake.requests) == 1
-    body = fake.requests[0].body
-    assert isinstance(body, bytes)
-    assert json.loads(body) == {
-        'method_name': 'get_session_token',
-        'params': [
-            {
-                'user_login': 'artist',
-                'user_password': _CREDENTIAL,
-                'auth_token': _AUTH_VALUE,
-            }
-        ],
-    }
-
-
 def test_only_attempt_boundaries_call_transport_send_in_production() -> None:
     package = Path(__file__).parents[2] / 'src' / 'shotgun_api3'
     calls: set[tuple[str, str]] = set()
@@ -888,7 +788,7 @@ def test_post_response_body_close_failure_preserves_primary_and_closes_response(
     primary = error_type('secret backend body close text')
     body_closes: list[str] = []
     response_closes: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sleeps: list[float] = []
     consumer_calls: list[str] = []
 
@@ -929,7 +829,7 @@ def test_post_response_body_close_failure_preserves_primary_and_closes_response(
 
     with pytest.raises(error_type) as caught:
         Driver(transport, _DriverTiming(sleep=sleeps.append)).execute(
-            _protocol.classify_endpoint('object_put', body_restartable=True),
+            _protocol.classify_endpoint('object_put'),
             context,
             lambda _attempt: TransportRequest(
                 method='PUT',
@@ -937,7 +837,6 @@ def test_post_response_body_close_failure_preserves_primary_and_closes_response(
                 headers={},
                 body=body_chunks(),
                 timeout=context.timeout,
-                token=_BODY_CLOSE_FAILURE_REQUEST_ID,
             ),
             consume,
             options=ExecutionOptions(streaming=streaming),
@@ -979,12 +878,12 @@ def test_primary_consumer_error_survives_response_close_failure() -> None:
 
     with pytest.raises(_errors.ShotgunError) as caught:
         Driver(
-            _FakeTransport([response]),
+            FakeTransport([response]),
             _DriverTiming(sleep=lambda _delay: None),
         ).execute(
             _protocol.classify_endpoint('download'),
             context,
-            lambda attempt: _request(context.timeout, request_id=f'error-{attempt}'),
+            lambda _attempt: _request(context.timeout),
             consume,
         )
 
@@ -992,9 +891,62 @@ def test_primary_consumer_error_survives_response_close_failure() -> None:
     assert close_calls == ['close']
 
 
+def test_read_failure_retry_preserves_received_response_metadata() -> None:
+    events: list[_ObserverEvent] = []
+    first = TransportResponse(
+        status=200,
+        reason='OK',
+        headers={'x-sg-correlation-id': 'read-failure-response'},
+        content=b'',
+    )
+    second = TransportResponse(
+        status=200,
+        reason='OK',
+        headers={'x-sg-correlation-id': 'success-response'},
+        content=b'',
+    )
+    config = _config()
+    config.update_fields(
+        max_rpc_attempts=2,
+        on_response=events.append,
+        on_retry=events.append,
+        rpc_attempt_interval=0,
+    )
+    context = dataclasses.replace(
+        config_module.snapshot(config),
+        timeout=TimeoutConfig(connect=1.0, read=1.0),
+    )
+
+    def consume(response: LiveResponse, _control: AttemptControl) -> object:
+        if response is first:
+            raise ReadTimeoutError('body read failed')
+        return {'ok': True}
+
+    result = Driver(
+        FakeTransport([first, second]),
+        _DriverTiming(sleep=lambda _delay: None),
+    ).execute(
+        _protocol.classify_endpoint('download'),
+        context,
+        lambda _attempt: _request(context.timeout),
+        consume,
+    )
+
+    assert result == {'ok': True}
+    response_events = [event for event in events if isinstance(event, ResponseEvent)]
+    assert [event.outcome for event in response_events] == ['retry', 'success']
+    assert [event.status for event in response_events] == [200, 200]
+    assert [event.correlation_id for event in response_events] == [
+        'read-failure-response',
+        'success-response',
+    ]
+    retry_events = [event for event in events if isinstance(event, RetryEvent)]
+    assert [event.status for event in retry_events] == [200]
+
+
 def test_read_retries_exact_attempts_with_fresh_bodies() -> None:
     config = _config()
-    fake = _FakeTransport([_GATEWAY, _GATEWAY, _OK])
+    fake = FakeTransport([_GATEWAY, _GATEWAY, _OK])
     sleeps: list[float] = []
 
     timing = _DriverTiming(sleep=sleeps.append, jitter_seed=lambda: 1000.25)
@@ -1003,14 +955,14 @@ def test_read_retries_exact_attempts_with_fresh_bodies() -> None:
     attempts = fake.requests
     assert len(attempts) == config.max_rpc_attempts
     assert len(sleeps) == 2
-    assert len({request.token for request in attempts}) == 3
+    assert len({id(request) for request in attempts}) == 3
     assert attempts[0].body == attempts[1].body == attempts[2].body
     assert attempts[0].body is not attempts[1].body
 
 
 def test_redirect_close_failure_inside_except_preserves_redirect_and_observer() -> None:
     close_calls: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     redirect = _response_with_close_error(
         RuntimeError('secret backend close text'),
         close_calls,
@@ -1028,21 +980,20 @@ def test_redirect_close_failure_inside_except_preserves_redirect_and_observer() 
         headers={},
         content=b'data',
     )
-    transport = _FakeTransport([redirect, final])
+    transport = FakeTransport([redirect, final])
     config = _config()
     config.on_response = events.append
     context = dataclasses.replace(config_module.snapshot(config), max_rpc_attempts=1)
 
-    result = _call_inside_except(
+    result = call_inside_except(
         lambda: Driver(transport, _DriverTiming(sleep=lambda _delay: None)).execute(
-            _protocol.classify_endpoint('download', body_restartable=True),
+            _protocol.classify_endpoint('download'),
             context,
-            lambda _attempt: _request(context.timeout, request_id='original'),
+            lambda _attempt: _request(context.timeout),
             lambda response, _control: cast('TransportResponse', response).content,
             options=ExecutionOptions(
                 redirect_factory=lambda response: _request(
                     context.timeout,
-                    request_id='redirect',
                     url=response.headers['location'],
                 ),
             ),
@@ -1070,7 +1021,7 @@ def test_request_body_cleanup_uses_shared_decision_inline(
     close_threads: list[int] = []
     context = dataclasses.replace(config_module.snapshot(_config()), max_rpc_attempts=1)
     request = dataclasses.replace(
-        _request(context.timeout, request_id='shared-body-close'),
+        _request(context.timeout),
         body=body,
     )
 
@@ -1079,8 +1030,8 @@ def test_request_body_cleanup_uses_shared_decision_inline(
 
     monkeypatch.setattr(transport_module, 'body_close', selected_close)
 
-    result = Driver(_FakeTransport([_OK])).execute(
-        _protocol.classify_endpoint('object_put', body_restartable=True),
+    result = Driver(FakeTransport([_OK])).execute(
+        _protocol.classify_endpoint('object_put'),
         context,
         lambda _attempt: request,
         lambda response, _control: cast('TransportResponse', response).content,
@@ -1090,35 +1041,9 @@ def test_request_body_cleanup_uses_shared_decision_inline(
     assert close_threads == [threading.get_ident()]
 
 
-def test_response_cleanup_only_failure_inside_except_is_redacted() -> None:
-    events: list[ObserverEvent] = []
-    response = _response_with_close_error(
-        RuntimeError(
-            'secret backend close text for https://x.example/file?session_token=request-secret'
-        ),
-        [],
-    )
-
-    with pytest.raises(SendError) as caught:
-        _call_inside_except(
-            lambda: driver_module._close_response(
-                response,
-                has_primary=False,
-            )
-        )
-
-    assert type(caught.value) is SendError
-    assert str(caught.value) == 'response cleanup failed'
-    assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__ is True
-    exposed = repr((caught.value, events))
-    assert 'secret backend close text' not in exposed
-    assert 'request-secret' not in exposed
-
-
 def test_response_close_failure_inside_except_preserves_retries_and_observers() -> None:
     close_calls: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     responses: list[TransportResponse | TransportError] = [
         _response_with_close_error(
             RuntimeError('secret backend close text'),
@@ -1135,13 +1060,13 @@ def test_response_close_failure_inside_except_preserves_retries_and_observers() 
         rpc_attempt_interval=0,
     )
     context = config_module.snapshot(config)
-    transport = _FakeTransport(responses)
+    transport = FakeTransport(responses)
 
-    result = _call_inside_except(
+    result = call_inside_except(
         lambda: Driver(transport, _DriverTiming(sleep=lambda _delay: None)).execute(
-            _protocol.classify_endpoint('download', body_restartable=True),
+            _protocol.classify_endpoint('download'),
             context,
-            lambda attempt: _request(context.timeout, request_id=f'retry-{attempt}'),
+            lambda _attempt: _request(context.timeout),
             lambda _response, _control: {'ok': True},
         )
     )
@@ -1160,7 +1085,7 @@ def test_response_close_failure_inside_except_preserves_retries_and_observers() 
 
 def test_response_close_failure_inside_except_preserves_success_and_observer() -> None:
     close_calls: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     response = _response_with_close_error(
         RuntimeError('secret backend close text'),
         close_calls,
@@ -1170,14 +1095,14 @@ def test_response_close_failure_inside_except_preserves_success_and_observer() -
     config.on_response = events.append
     context = config_module.snapshot(config)
 
-    result = _call_inside_except(
+    result = call_inside_except(
         lambda: Driver(
-            _FakeTransport([response]),
+            FakeTransport([response]),
             _DriverTiming(sleep=lambda _delay: None),
         ).execute(
             _protocol.classify_endpoint('download'),
             context,
-            lambda attempt: _request(context.timeout, request_id=f'success-{attempt}'),
+            lambda _attempt: _request(context.timeout),
             lambda _response, _control: {'ok': True},
         )
     )
@@ -1198,13 +1123,42 @@ def test_response_is_closed_before_retry_observer_and_sleep() -> None:
         content=b'error body',
         on_close=lambda: order.append('close'),
     )
-    fake = _FakeTransport([gateway, _OK])
+    fake = FakeTransport([gateway, _OK])
     config = _config()
     config.on_retry = lambda _event: order.append('retry')
 
     timing = _DriverTiming(sleep=lambda _delay: order.append('sleep'))
     assert _call(Driver(fake, timing), config) == {'id': 7}
     assert order == ['close', 'retry', 'sleep']
+
+
+def test_retry_after_never_sleeps_above_backoff_cap() -> None:
+    retries: list[_ObserverEvent] = []
+    sleeps: list[float] = []
+    config = _config()
+    config.update_fields(rpc_attempt_interval=4000)
+    config.on_retry = retries.append
+    retry = TransportResponse(
+        status=429,
+        reason='Retry Later',
+        headers={'retry-after': 'Wed, 01 Jan 2025 00:00:30 GMT'},
+        content=b'',
+    )
+    transport = FakeTransport([retry, _OK])
+    driver = Driver(
+        transport,
+        _DriverTiming(
+            jitter_seed=lambda: 1000.25,
+            sleep=sleeps.append,
+            wall_clock=lambda: 1_735_689_600.0,
+        ),
+    )
+
+    assert driver.call('info', {}, config_module.snapshot(config)) == {'id': 7}
+    assert sleeps == [30.0]
+    assert all(delay <= 30.0 for delay in sleeps)
+    assert [type(event) for event in retries] == [RetryEvent]
+    assert len(transport.requests) == 2
 
 
 @pytest.mark.parametrize(
@@ -1215,11 +1169,11 @@ def test_rpc_observers_use_operation_category(
     method_name: str,
     category: _protocol.OperationCategory,
 ) -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_request = events.append
     config.on_response = events.append
-    fake = _FakeTransport([_OK])
+    fake = FakeTransport([_OK])
 
     _call(Driver(fake, _DriverTiming(sleep=lambda _delay: None)), config, method_name)
 
@@ -1227,80 +1181,11 @@ def test_rpc_observers_use_operation_category(
     assert [event.operation for event in rpc_events] == [category, category]
 
 
-@pytest.mark.parametrize(
-    ('retry_after', 'expected_delay', 'should_retry'),
-    [
-        pytest.param('0', 0.0, True, id='delta-zero'),
-        pytest.param('30', 30.0, True, id='delta-cap'),
-        pytest.param('31', None, False, id='delta-oversized'),
-        pytest.param('9' * 5_000, None, False, id='delta-very-long-oversized'),
-        pytest.param('Wed, 01 Jan 2025 00:00:00 GMT', 0.0, True, id='date-zero'),
-        pytest.param('Wed, 01 Jan 2025 00:00:30 GMT', 30.0, True, id='date-cap'),
-        pytest.param('Wed, 01 Jan 2025 00:00:31 GMT', None, False, id='date-oversized'),
-        pytest.param('tomorrow', None, True, id='malformed'),
-        pytest.param('-1', None, True, id='negative'),
-        pytest.param('NaN', None, True, id='nan'),
-        pytest.param('Infinity', None, True, id='positive-infinity'),
-        pytest.param('-Infinity', None, True, id='negative-infinity'),
-    ],
-)
-def test_retry_after_never_sleeps_above_backoff_cap(
-    retry_after: str,
-    expected_delay: float | None,
-    should_retry: bool,
-) -> None:
-    retries: list[ObserverEvent] = []
-    sleeps: list[float] = []
-    config = _config()
-    config.update_fields(rpc_attempt_interval=4000)
-    config.on_retry = retries.append
-    retry = TransportResponse(
-        status=429,
-        reason='Retry Later',
-        headers={'retry-after': retry_after},
-        content=b'',
-    )
-    transport = _FakeTransport([retry, _OK])
-    driver = Driver(
-        transport,
-        _DriverTiming(
-            jitter_seed=lambda: 1000.25,
-            sleep=sleeps.append,
-            wall_clock=lambda: 1_735_689_600.0,
-        ),
-    )
-
-    if not should_retry:
-        with pytest.raises(_errors.ProtocolError):
-            driver.call('info', {}, config_module.snapshot(config))
-        assert sleeps == []
-        assert retries == []
-        assert len(transport.requests) == 1
-        return
-
-    assert driver.call('info', {}, config_module.snapshot(config)) == {'id': 7}
-    if expected_delay is None:
-        fallback_delay = _protocol.decide(
-            _protocol.classify('read', {}),
-            1,
-            _protocol.Failure('http_status', 'rate_limit', 429, None),
-            max_attempts=config.max_rpc_attempts,
-            base_interval=config.rpc_attempt_interval / 1000.0,
-            now=1000.25,
-        )
-        assert fallback_delay is not None
-        assert sleeps == [fallback_delay]
-    else:
-        assert sleeps == [expected_delay]
-    assert all(delay <= 30.0 for delay in sleeps)
-    assert [type(event) for event in retries] == [RetryEvent]
-    assert len(transport.requests) == 2
-
-
 @pytest.mark.parametrize('streaming', [False, True])
-def test_redirect_budget_includes_request_observer_time(streaming: bool) -> None:
+def test_redirect_latency_includes_cleanup_and_request_observer_time(streaming: bool) -> None:
     now = 0.0
     requests: list[RequestEvent] = []
+    responses: list[_ObserverEvent] = []
     redirect = TransportResponse(
         status=302,
         reason='Found',
@@ -1309,24 +1194,25 @@ def test_redirect_budget_includes_request_observer_time(streaming: bool) -> None
         on_close=lambda: advance(3.0),
     )
     final = TransportResponse(status=200, reason='OK', headers={}, content=b'data')
-    fake = _FakeTransport([redirect, final])
+    fake = FakeTransport([redirect, final])
     config = _config()
 
     def advance(value: float) -> None:
         nonlocal now
         now = value
 
-    def observe(event: ObserverEvent) -> None:
+    def observe(event: _ObserverEvent) -> None:
         assert isinstance(event, RequestEvent)
         requests.append(event)
         if len(requests) == 2:
             advance(5.0)
 
     config.on_request = observe
+    config.on_response = responses.append
     context = dataclasses.replace(
         config_module.snapshot(config),
         max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
+        timeout=TimeoutConfig(connect=10.0, read=10.0),
     )
 
     def consume(response: LiveResponse, control: AttemptControl) -> bytes:
@@ -1339,12 +1225,11 @@ def test_redirect_budget_includes_request_observer_time(streaming: bool) -> None
     result = Driver(fake, _DriverTiming(clock=lambda: now)).execute(
         _protocol.classify_endpoint('download'),
         context,
-        lambda _attempt: _request(context.timeout, request_id='original'),
+        lambda _attempt: _request(context.timeout),
         consume,
         options=ExecutionOptions(
             redirect_factory=lambda response: _request(
                 context.timeout,
-                request_id='redirected',
                 url=response.headers['location'],
             ),
             streaming=streaming,
@@ -1353,15 +1238,18 @@ def test_redirect_budget_includes_request_observer_time(streaming: bool) -> None
 
     assert result == b'data'
     assert len(requests) == 2
-    assert [request.timeout.total for request in fake.requests] == [10.0, 5.0]
+    assert [event.latency for event in responses if isinstance(event, ResponseEvent)] == [
+        3.0,
+        5.0,
+    ]
 
 
 @pytest.mark.parametrize('replay_safe', [False, True])
 def test_observed_request_body_preserves_send_failure_and_retry(replay_safe: bool) -> None:
     primary = SendError('send failed')
-    transport = _FakeTransport([primary, _OK])
+    transport = FakeTransport([primary, _OK])
     sources: list[_TrackedRequestBody] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.update_fields(max_rpc_attempts=2, on_retry=events.append)
     context = config_module.snapshot(config)
@@ -1373,7 +1261,7 @@ def test_observed_request_body_preserves_send_failure_and_retry(replay_safe: boo
         )
         sources.append(source)
         return dataclasses.replace(
-            _request(context.timeout, request_id=f'send-failure-{attempt}'),
+            _request(context.timeout),
             body=source,
         )
 
@@ -1400,15 +1288,12 @@ def test_observed_request_body_preserves_send_failure_and_retry(replay_safe: boo
 
 
 @pytest.mark.parametrize('streaming', [False, True])
-@pytest.mark.parametrize('expiry', ['cleanup', 'observer'])
 @pytest.mark.parametrize('policy', ['one_attempt', 'replay_safe', 'unsafe'])
-def test_redirect_deadline_expiry_uses_attempt_retry_policy(
+def test_redirect_read_failure_uses_attempt_retry_policy(
     streaming: bool,
-    expiry: str,
     policy: str,
 ) -> None:
-    now = 0.0
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sleeps: list[float] = []
     response_closes: list[str] = []
     consumer_calls: list[str] = []
@@ -1431,28 +1316,20 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
         content=b'data',
         on_close=lambda: response_closes.append('final'),
     )
-    fake = _FakeTransport([redirects[0], redirects[1], final])
+    fake = FakeTransport(
+        [redirects[0], ReadTimeoutError('redirect read failed'), redirects[1], final]
+    )
     config = _config()
 
     def close_redirect(attempt: int) -> None:
-        nonlocal now
         response_closes.append(f'redirect-{attempt}')
-        now = (11.0 if expiry == 'cleanup' else 3.0) if attempt == 1 else 23.0
 
-    def observe_request(event: ObserverEvent) -> None:
-        nonlocal now
+    def observe_request(event: _ObserverEvent) -> None:
         assert isinstance(event, RequestEvent)
         events.append(event)
-        request_count = len([item for item in events if isinstance(item, RequestEvent)])
-        if request_count == 2 and expiry == 'observer':
-            now = 11.0
-        if request_count == 4:
-            now = 25.0
 
     def sleep(delay: float) -> None:
-        nonlocal now
         sleeps.append(delay)
-        now = 20.0
 
     config.update_fields(
         on_request=observe_request,
@@ -1462,7 +1339,7 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
     )
     context = dataclasses.replace(
         config_module.snapshot(config),
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
+        timeout=TimeoutConfig(connect=10.0, read=10.0),
     )
 
     def redirect_factory(response: LiveResponse) -> TransportRequest:
@@ -1473,9 +1350,7 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
         )
         redirect_bodies.append(body)
         return dataclasses.replace(
-            _request(
-                context.timeout, request_id=f'redirect-{attempt}', url=response.headers['location']
-            ),
+            _request(context.timeout, url=response.headers['location']),
             body=body,
             headers={'authorization': 'secret-request-header'},
         )
@@ -1484,13 +1359,13 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
         consumer_calls.append('consume')
         return cast('TransportResponse', response).content if not streaming else b'data'
 
-    driver = Driver(fake, _DriverTiming(clock=lambda: now, sleep=sleep))
+    driver = Driver(fake, _DriverTiming(sleep=sleep))
 
     def call() -> bytes:
         return driver.execute(
             _protocol.classify_endpoint('allocation' if policy == 'unsafe' else 'download'),
             context,
-            lambda attempt: _request(context.timeout, request_id=f'original-{attempt}'),
+            lambda _attempt: _request(context.timeout),
             consume,
             options=ExecutionOptions(redirect_factory=redirect_factory, streaming=streaming),
         )
@@ -1501,9 +1376,7 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
         with pytest.raises(ReadTimeoutError):
             call()
 
-    assert [request.timeout.total for request in fake.requests] == (
-        [10.0, 10.0, 5.0] if retry else [10.0]
-    )
+    assert len(fake.requests) == (4 if retry else 2)
     assert len([event for event in events if isinstance(event, RequestEvent)]) == (
         4 if retry else 2
     )
@@ -1544,7 +1417,7 @@ def test_redirect_deadline_expiry_uses_attempt_retry_policy(
 
 
 def test_safe_read_retries_ambiguous_send() -> None:
-    fake = _FakeTransport([SendError('ambiguous'), _OK])
+    fake = FakeTransport([SendError('ambiguous'), _OK])
 
     result = _call(
         Driver(fake, _DriverTiming(sleep=lambda _delay: None)),
@@ -1587,10 +1460,24 @@ def exchange(transport, request):
     assert visitor.calls == [('exchange', 'send_streaming')]
 
 
-def test_send_call_visitor_detects_transport_identity_alias() -> None:
-    source = """
+@pytest.mark.parametrize('field', ['_transport', 'transport'])
+def test_send_call_visitor_detects_transport_field_direct_send(field: str) -> None:
+    source = f"""
 def exchange(self, request):
-    backend = self._transport
+    return self.{field}.send(request)
+"""
+    visitor = _SendCallVisitor()
+
+    visitor.visit(ast.parse(source))
+
+    assert visitor.calls == [('exchange', 'send')]
+
+
+@pytest.mark.parametrize('field', ['_transport', 'transport'])
+def test_send_call_visitor_detects_transport_identity_alias(field: str) -> None:
+    source = f"""
+def exchange(self, request):
+    backend = self.{field}
     return backend.send(request)
 """
     visitor = _SendCallVisitor()
@@ -1630,15 +1517,14 @@ def test_streaming_redirect_is_one_executor_owned_attempt() -> None:
         content=b'data',
         on_close=lambda: releases.append('final'),
     )
-    fake = _FakeTransport([redirect, final])
+    fake = FakeTransport([redirect, final])
     context = dataclasses.replace(config_module.snapshot(_config()), max_rpc_attempts=1)
     driver = Driver(fake, _DriverTiming(sleep=lambda _delay: None))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     def redirect_factory(response: LiveResponse) -> TransportRequest:
         return _request(
             context.timeout,
-            request_id='redirect',
             url=response.headers['location'],
         )
 
@@ -1651,7 +1537,6 @@ def test_streaming_redirect_is_one_executor_owned_attempt() -> None:
         context,
         lambda _attempt: _request(
             context.timeout,
-            request_id='original',
             url='https://x.example/file_serve/attachment/41',
         ),
         consume,
@@ -1669,65 +1554,13 @@ def test_streaming_redirect_is_one_executor_owned_attempt() -> None:
     assert releases == ['redirect', 'final']
 
 
-def test_streaming_redirect_uses_only_remaining_total_timeout() -> None:
-    ticks = iter((0.0, 2.0, 3.0, 4.0, 5.0, 6.0))
-    redirect = TransportResponse(
-        status=302,
-        reason='Found',
-        headers={'location': 'https://storage.example/signed'},
-        content=b'',
-    )
-    final = TransportResponse(
-        status=200,
-        reason='OK',
-        headers={},
-        content=b'data',
-    )
-    fake = _FakeTransport([redirect, final])
-    context = dataclasses.replace(
-        config_module.snapshot(_config()),
-        max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
-    )
-    driver = Driver(fake, _DriverTiming(clock=lambda: next(ticks)))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
-
-    def redirect_factory(response: LiveResponse) -> TransportRequest:
-        return _request(
-            context.timeout,
-            request_id='redirect',
-            url=response.headers['location'],
-        )
-
-    def consume(response: LiveResponse, control: AttemptControl) -> bytes:
-        streaming = cast('StreamingResponse', response)
-        return control.consume(streaming.iter_chunks(), total_bytes=4)
-
-    assert (
-        driver.execute(
-            operation,
-            context,
-            lambda _attempt: _request(context.timeout, request_id='original'),
-            consume,
-            options=ExecutionOptions(
-                redirect_factory=redirect_factory,
-                streaming=True,
-            ),
-        )
-        == b'data'
-    )
-
-    assert fake.requests[0].timeout.total == 10.0
-    assert fake.requests[1].timeout.total == 7.0
-
-
 @pytest.mark.parametrize(
     'error',
-    [AbortedError('abort-token'), ProxyError('proxy auth'), TLSError('certificate')],
+    [ProxyError('proxy auth'), TLSError('certificate')],
 )
 def test_terminal_transport_categories_never_retry(error: TransportError) -> None:
     config = _config()
-    fake = _FakeTransport([error])
+    fake = FakeTransport([error])
 
     with pytest.raises(type(error)):
         _call(Driver(fake, _DriverTiming(sleep=lambda _delay: None)), config)
@@ -1737,19 +1570,19 @@ def test_terminal_transport_categories_never_retry(error: TransportError) -> Non
 
 def test_unsafe_write_retries_pre_send_but_not_ambiguous_send() -> None:
     config = _config()
-    pre_send = _FakeTransport([ConnectError('refused'), _OK])
+    pre_send = FakeTransport([ConnectError('refused'), _OK])
     no_sleep = _DriverTiming(sleep=lambda _delay: None)
     assert _call(Driver(pre_send, no_sleep), config, method='create') == {'id': 7}
     assert len(pre_send.requests) == 2
 
-    ambiguous = _FakeTransport([SendError('connection lost mid-body')])
+    ambiguous = FakeTransport([SendError('connection lost mid-body')])
     with pytest.raises(SendError):
         _call(Driver(ambiguous, no_sleep), config, method='create')
     assert len(ambiguous.requests) == 1
 
 
 def test_write_does_not_retry_ambiguous_send() -> None:
-    fake = _FakeTransport([SendError('ambiguous'), _OK])
+    fake = FakeTransport([SendError('ambiguous'), _OK])
 
     with pytest.raises(SendError, match='ambiguous'):
         _call(

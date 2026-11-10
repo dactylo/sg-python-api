@@ -1,26 +1,19 @@
 import copy
-import importlib
 import inspect
 import pickle
 import socket
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import cast
 
 import pytest
 
+from shotgun_api3 import Fault
 from shotgun_api3 import Shotgun as ClientShotgun
 from shotgun_api3.lib import mockgun
+from shotgun_api3.lib.mockgun._errors import ServerFaultError
+from shotgun_api3.lib.mockgun._schema import SiteSchema
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-_CREDENTIAL = 'test-credential'
-
-
-def _client_state(
-    client: mockgun.Shotgun,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[int, dict[str, Any]]]]:
-    return client._schema, client._schema_entity, client._db
+from .conftest import SCHEMA
 
 
 def test_constructor_accepts_compatibility_arguments_without_network_io(
@@ -40,56 +33,13 @@ def test_constructor_accepts_compatibility_arguments_without_network_io(
         http_proxy='proxy.example:8080',
         connect=True,
         ca_certs='/not/read/ca.pem',
-        login='person',
-        password=_CREDENTIAL,
         sudo_as_login='delegate',
-        session_token=_CREDENTIAL,
-        auth_token=_CREDENTIAL,
     )
 
     assert mockgun_client.base_url == 'https://mockgun.example'
-    assert client.base_url == 'HTTPS://Mockgun.Example/path/'
+    assert client.base_url == 'HTTPS://Mockgun.Example/path'
     assert client.config.scheme == 'https'
     assert client.config.records_per_page == 500
-
-
-def test_constructor_has_exact_compatibility_parameter_shape() -> None:
-    parameters = inspect.signature(mockgun.Shotgun).parameters
-    method_parameters = inspect.signature(mockgun.Shotgun.__init__).parameters
-    expected = (
-        ('base_url', inspect.Parameter.empty),
-        ('script_name', None),
-        ('api_key', None),
-        ('convert_datetimes_to_utc', True),
-        ('http_proxy', None),
-        ('connect', True),
-        ('ca_certs', None),
-        ('login', None),
-        ('password', None),
-        ('sudo_as_login', None),
-        ('session_token', None),
-        ('auth_token', None),
-    )
-
-    assert (
-        tuple((parameter.name, parameter.default) for parameter in parameters.values()) == expected
-    )
-    assert all(
-        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-        for parameter in parameters.values()
-    )
-    assert tuple(method_parameters) == ('self', *(name for name, _default in expected))
-    assert (
-        tuple(
-            (parameter.name, parameter.default)
-            for parameter in tuple(method_parameters.values())[1:]
-        )
-        == expected
-    )
-    assert all(
-        parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-        for parameter in tuple(method_parameters.values())[1:]
-    )
 
 
 @pytest.mark.usefixtures('mockgun_client')
@@ -101,7 +51,7 @@ def test_constructor_has_exact_compatibility_parameter_shape() -> None:
         (
             'HTTPS://Mockgun.Example/path/',
             'https',
-            'Mockgun.Example',
+            'mockgun.example',
             '/path/api3/json',
         ),
     ],
@@ -112,9 +62,9 @@ def test_constructor_publishes_parsed_server_fields(
     expected_server: str,
     expected_api_path: str,
 ) -> None:
-    client = mockgun.Shotgun(base_url)
+    client = mockgun.Shotgun(base_url, script_name='fixture', api_key='secret')
 
-    assert client.base_url == base_url
+    assert client.base_url == base_url.rstrip('/')
     assert client.config.scheme == expected_scheme
     assert client.config.server == expected_server
     assert client.config.api_path == expected_api_path
@@ -147,8 +97,9 @@ def test_constructor_reads_existing_pickle_protocols(
     monkeypatch.setattr(mockgun.Shotgun, '_schema_entity_path', None)
     mockgun.Shotgun.set_schema_paths(str(schema_path), str(schema_entity_path))
 
-    client = mockgun.Shotgun('https://existing.example')
-    loaded_schema, loaded_schema_entity, _database = _client_state(client)
+    client = mockgun.Shotgun('https://existing.example', script_name='fixture', api_key='secret')
+    loaded_schema = client.schema_read()
+    loaded_schema_entity = client.schema_entity_read()
 
     assert loaded_schema == schema
     assert loaded_schema_entity == schema_entity
@@ -188,20 +139,20 @@ def test_constructor_reports_unset_schema_paths_with_mockgun_error(
     assert type(caught.value) is mockgun.MockgunError
 
 
-def test_constructor_seeds_tables_and_initial_event_log(
-    mockgun_client: mockgun.Shotgun,
-) -> None:
-    database = _client_state(mockgun_client)[2]
-
+def test_constructor_seeds_tables_and_initial_event_log(mockgun_client: mockgun.Shotgun) -> None:
     assert mockgun_client.finds == 0
-    assert set(database) == {'EventLogEntry', 'HumanUser', 'Project', 'ScalarTypes', 'Shot'}
-    assert database['HumanUser'] == {}
-    assert database['Project'] == {}
-    assert database['ScalarTypes'] == {}
-    assert database['Shot'] == {}
-    assert database['EventLogEntry'] == {
-        1: {
-            '__retired': False,
+    assert set(mockgun_client.schema_read()) == {
+        'EventLogEntry',
+        'HumanUser',
+        'Project',
+        'ScalarTypes',
+        'Shot',
+    }
+    for entity_type in ('HumanUser', 'Project', 'ScalarTypes', 'Shot'):
+        assert mockgun_client.find(entity_type, []) == []
+    fields = list(mockgun_client.schema_field_read('EventLogEntry'))
+    assert mockgun_client.find('EventLogEntry', [], fields) == [
+        {
             'description': 'Mockgun was born. Yay.',
             'event_type': 'Hello_Mockgun_World',
             'id': 1,
@@ -209,40 +160,7 @@ def test_constructor_seeds_tables_and_initial_event_log(
             'related_entities': [],
             'type': 'EventLogEntry',
         }
-    }
-
-
-@pytest.mark.parametrize(
-    ('args', 'kwargs', 'message'),
-    [
-        ((), {}, "Mockgun Shotgun.__init__() missing a required argument: 'base_url'"),
-        (
-            ('https://x.example',) * 13,
-            {},
-            'Mockgun Shotgun.__init__() too many positional arguments',
-        ),
-        (
-            ('https://x.example',),
-            {'unexpected': True},
-            "Mockgun Shotgun.__init__() got an unexpected keyword argument 'unexpected'",
-        ),
-        (
-            ('https://x.example', 's'),
-            {'script_name': 'other'},
-            "Mockgun Shotgun.__init__() multiple values for argument 'script_name'",
-        ),
-    ],
-)
-def test_constructor_type_errors_identify_mockgun_shotgun(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    message: str,
-) -> None:
-    constructor = cast('Callable[..., mockgun.Shotgun]', mockgun.Shotgun)
-    with pytest.raises(TypeError) as caught:
-        constructor(*args, **kwargs)
-
-    assert str(caught.value) == message
+    ]
 
 
 def test_generate_schema_writes_bare_protocol_two_pickles_without_mutation(tmp_path: Path) -> None:
@@ -281,60 +199,57 @@ def test_generate_schema_writes_bare_protocol_two_pickles_without_mutation(tmp_p
 def test_loaded_schema_and_database_are_independent_per_instance(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
-    second = mockgun.Shotgun('https://second.example')
-    first_schema, first_schema_entity, first_db = _client_state(mockgun_client)
-    second_schema, second_schema_entity, second_db = _client_state(second)
-
-    assert second_schema is not first_schema
-    assert second_schema_entity is not first_schema_entity
-    assert second_db is not first_db
-    assert all(second_db[name] is not first_db[name] for name in second_db)
-    first_event = first_db['EventLogEntry'][1]
-    first_metadata_default = first_schema['EventLogEntry']['metadata']['properties'][
-        'default_value'
-    ]['value']
-    second_event = second_db['EventLogEntry'][1]
-    assert (
-        first_event['metadata']
-        == first_metadata_default
-        == second_event['metadata']
-        == {'source': 'schema'}
-    )
-    assert first_event['metadata'] is not first_metadata_default
-    assert first_event['metadata'] is not second_event['metadata']
-    assert first_event['related_entities'] == second_event['related_entities'] == []
-    assert first_event['related_entities'] is not second_event['related_entities']
-
+    second = mockgun.Shotgun('https://second.example', script_name='fixture', api_key='secret')
+    first_schema = mockgun_client.schema_read()
+    second_schema = second.schema_read()
+    assert first_schema == second_schema
+    assert first_schema is not second_schema
     first_schema['OnlyFirst'] = {}
-    first_schema_entity['OnlyFirst'] = {}
-    first_db['Shot'][99] = {'type': 'Shot', 'id': 99}
-    first_event['metadata']['source'] = 'first-only'
-    first_event['related_entities'].append({'type': 'Shot', 'id': 99})
-    mockgun_client.config.records_per_page = 25
+    mockgun_client.update(
+        'EventLogEntry',
+        1,
+        {
+            'metadata': {'source': 'first-only'},
+        },
+    )
+    mockgun_client.create(
+        'Shot',
+        {'code': 'first-only', 'reviewers': [{'type': 'HumanUser', 'id': 1}]},
+    )
+    mockgun_client.site.update_server_metadata({'api_max_entities_per_page': 25})
+    mockgun_client.info()
 
-    assert 'OnlyFirst' not in second_schema
-    assert 'OnlyFirst' not in second_schema_entity
-    assert second_db['Shot'] == {}
-    assert first_metadata_default == {'source': 'schema'}
-    assert second_event['metadata'] == {'source': 'schema'}
-    assert second_event['related_entities'] == []
-    assert mockgun_client.config.scheme == 'https'
-    assert second.config.scheme == 'https'
+    assert 'OnlyFirst' not in second.schema_read()
+    assert second.find('Shot', []) == []
+    assert second.find_one('EventLogEntry', [], ['metadata', 'related_entities']) == {
+        'type': 'EventLogEntry',
+        'id': 1,
+        'metadata': {'source': 'schema'},
+        'related_entities': [],
+    }
     assert mockgun_client.config.records_per_page == 25
     assert second.config.records_per_page == 500
 
 
-def test_public_exports_include_the_approved_async_extension() -> None:
-    assert mockgun.__all__ == ['AsyncShotgun', 'MockgunError', 'Shotgun', 'generate_schema']
-
-    async_implementation = importlib.import_module('shotgun_api3.lib.mockgun._async')
-    implementation = importlib.import_module('shotgun_api3.lib.mockgun._mockgun')
-
-    assert mockgun.AsyncShotgun is async_implementation.AsyncShotgun
-    assert mockgun.MockgunError is implementation.MockgunError
-    assert mockgun.Shotgun is implementation.Shotgun
-    assert mockgun.generate_schema is implementation.generate_schema
+def test_mockgun_error_has_exception_base() -> None:
     assert mockgun.MockgunError.__bases__ == (Exception,)
+
+
+def test_schema_field_types_resolve_links_and_identity() -> None:
+    schema = SiteSchema(cast('dict[str, dict[str, object]]', SCHEMA), {})
+    assert schema.declares('Project')
+    assert schema.declares('Shot', 'project')
+    assert not schema.declares('Missing')
+    assert not schema.declares('Shot', 'missing')
+    assert schema.field_type('Shot', 'project.Project.name') == 'text'
+    assert schema.field_type('Shot', 'project.Project.id') == 'number'
+    assert schema.field_type('Shot', 'type') == 'entity_type'
+    with pytest.raises(ServerFaultError, match='code is not a valid linked field for entity Shot'):
+        schema.field_type('Shot', 'code.Project.name')
+    with pytest.raises(ServerFaultError, match='Missing is not a valid entity'):
+        schema.field_type('Missing', 'id')
+    with pytest.raises(ServerFaultError, match='missing is not a valid field for entity Shot'):
+        schema.field_type('Shot', 'missing')
 
 
 def test_schema_path_methods_are_bound_classmethods_with_exact_signatures() -> None:
@@ -372,23 +287,53 @@ def test_schema_reads_have_project_compatible_signatures(
     )
 
 
-def test_schema_reads_preserve_source_aliases_shapes_and_errors(
+@pytest.mark.parametrize('project', [None, {'type': 'Project', 'id': 1}])
+def test_schema_field_read_detaches_nested_metadata(
+    mockgun_client: mockgun.Shotgun, project: dict[str, object] | None
+) -> None:
+    fields = mockgun_client.schema_field_read('Shot', project_entity=project)
+    original = copy.deepcopy(fields['code'])
+    metadata = cast('dict[str, object]', fields['code'])
+    cast('dict[str, object]', metadata['data_type'])['value'] = 'changed'
+    assert mockgun_client.schema_field_read('Shot', project_entity=project)['code'] == original
+    schema = cast('dict[str, object]', mockgun_client.schema_read(project)['Shot'])
+    assert schema['code'] == original
+
+
+@pytest.mark.parametrize('path', ['missing.Project', 'project.Project'])
+def test_partial_link_paths_report_the_original_invalid_field(path: str) -> None:
+    schema = SiteSchema(cast('dict[str, dict[str, object]]', SCHEMA), {})
+    with pytest.raises(ServerFaultError) as raised:
+        schema.field_type('Shot', path)
+    assert str(raised.value) == f'{path} is not a valid field for entity Shot'
+
+
+def test_schema_reads_return_independent_copies_and_preserve_shapes(
     mockgun_client: mockgun.Shotgun,
 ) -> None:
     project = {'type': 'Project', 'id': 1, 'nested': {'value': True}}
     original_project = copy.deepcopy(project)
 
     schema = mockgun_client.schema_read(project)
-    entities = mockgun_client.schema_entity_read(project)
+    entities = mockgun_client.schema_entity_read()
+    with pytest.raises(mockgun.MockgunError, match='schema_entity_read'):
+        mockgun_client.schema_entity_read(project)
     shot_fields = mockgun_client.schema_field_read('Shot', project_entity=project)
     code_field = mockgun_client.schema_field_read('Shot', 'code', project)
 
-    assert schema is mockgun_client._schema
-    assert entities is mockgun_client._schema_entity
-    assert shot_fields is schema['Shot']
+    assert schema == mockgun_client.schema_read()
+    assert entities == mockgun_client.schema_entity_read()
+    assert shot_fields == schema['Shot']
+    assert shot_fields is not schema['Shot']
     assert code_field == {'code': shot_fields['code']}
-    assert code_field['code'] is shot_fields['code']
-    assert mockgun_client.schema_field_read('Shot', 'missing') == {}
-    with pytest.raises(KeyError, match='MissingEntity'):
+    assert code_field['code'] is not shot_fields['code']
+    code_field['code'] = {}
+    schema['Shot'] = {}
+    entities['Shot'] = {}
+    assert mockgun_client.schema_field_read('Shot', 'code') == {'code': shot_fields['code']}
+    assert mockgun_client.schema_entity_read()['Shot'] != {}
+    with pytest.raises(Fault, match=r'Shot\.missing'):
+        mockgun_client.schema_field_read('Shot', 'missing')
+    with pytest.raises(Fault, match='MissingEntity'):
         mockgun_client.schema_field_read('MissingEntity')
     assert project == original_project

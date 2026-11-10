@@ -126,6 +126,77 @@ _EXCLUSIONS: dict[str, dict[str, str]] = {
             'MockTestBase.setUp requires unsupported httplib2.Http and private connection mocks'
         ),
     },
+    'test_mockgun.py': {
+        'TestFilterOperator.test_invalid_operator': (
+            'mockgun preserves Fault class, not exact legacy message text'
+        ),
+        'TestFilterOperator.test_ordered_filter_operator': (
+            'mockgun null values sort last in both directions'
+        ),
+        'TestMultiEntityFieldComparison.test_find_by_sub_entity_field': (
+            'mockgun requires a modeled HumanUser display name in linked results'
+        ),
+        'TestMultiEntityFieldComparison.test_find_with_none': (
+            'mockgun requires a modeled HumanUser display name in linked results'
+        ),
+        'TestMultiEntityFieldUpdate.test_batch_update': (
+            'mockgun link results include display names'
+        ),
+        'TestMultiEntityFieldUpdate.test_update_add': (
+            'mockgun link results include display names'
+        ),
+        'TestMultiEntityFieldUpdate.test_update_remove': (
+            'mockgun link results include display names'
+        ),
+        'TestMultiEntityFieldUpdate.test_update_set': (
+            'mockgun link results include display names'
+        ),
+        'TestTextFieldOperators.test_operator_contains': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_contains_case_sensitivity': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_ends_with': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_ends_with_case_sensitivity': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_in': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_in_case_sensitivity': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_in_none': (
+            'mockgun null membership is rejected; use is None'
+        ),
+        'TestTextFieldOperators.test_operator_is': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_is_case_sensitivity': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_is_not_none': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_not_in': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_not_in_none': (
+            'mockgun null membership is rejected; use is None'
+        ),
+        'TestTextFieldOperators.test_operator_starts_with': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestTextFieldOperators.test_operator_starts_with_case_sensitivity': (
+            'mockgun login actor adds a visible HumanUser to this fixture'
+        ),
+        'TestValidateFilterSyntax.test_filter_array_or_dict': (
+            'mockgun preserves Fault class, not exact legacy message text'
+        ),
+    },
     'test_unit.py': {
         'TestCerts.test_found_correct_cert': 'bundled certifi, httplib2, or private opener',
         'TestCerts.test_httplib': 'bundled certifi, httplib2, or private opener',
@@ -184,6 +255,90 @@ _EXCLUSIONS: dict[str, dict[str, str]] = {
         'TestShotgunSummarize.test_grouping': (
             'private Shotgun._call_rpc patch helper; candidate has no such method'
         ),
+        'TestConnectionIdleExpiry.test_stale_connection_is_replaced': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_fresh_connection_is_reused': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_expiry_is_measured_from_last_use_not_creation': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_unused_connection_is_not_expired': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_failed_request_does_not_refresh_idle_clock': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_expiry_can_be_disabled': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestConnectionIdleExpiry.test_expiry_preserves_proxy_configuration': (
+            'private legacy connection cache and request methods'
+        ),
+        'TestSocketKeepalive.test_keepalive_enabled_on_socket': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_unsupported_options_are_ignored': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_windows_timers_tuned_via_ioctl': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_windows_ioctl_failure_is_ignored': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_timers_tuned_via_socket_options': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_rejected_timer_options_are_ignored': (
+            'private keepalive helper in the legacy transport'
+        ),
+        'TestSocketKeepalive.test_http_connection_enables_keepalive': (
+            'bundled httplib2 connection subclass and private keepalive helper'
+        ),
+        'TestSocketKeepalive.test_https_connection_enables_keepalive': (
+            'bundled httplib2 connection subclass and private keepalive helper'
+        ),
+        'TestSocketKeepalive.test_proxied_socket_enables_keepalive': (
+            'bundled httplib2 proxy and connection subclass'
+        ),
+        'TestSocketKeepalive.test_keepalive_failure_does_not_break_connect': (
+            'bundled httplib2 connection subclass and private keepalive helper'
+        ),
+        'TestKeepaliveConnectionType.test_https_uses_keepalive_connection': (
+            'bundled httplib2 connection subclass'
+        ),
+        'TestKeepaliveConnectionType.test_http_uses_keepalive_connection': (
+            'bundled httplib2 connection subclass'
+        ),
+        'TestKeepaliveConnectionType.test_unknown_scheme_is_left_to_httplib2': (
+            'bundled httplib2 request path'
+        ),
+        'TestKeepaliveConnectionType.test_explicit_connection_type_is_respected': (
+            'bundled httplib2 request path'
+        ),
+        'TestKeepaliveConnectionType.test_shotgun_uses_keepalive_http': (
+            'private legacy connection cache and bundled httplib2 type'
+        ),
+        'TestKeepaliveConnectionType.test_connection_classes_are_httplib2_subclasses': (
+            'bundled httplib2 connection subclasses'
+        ),
+        'TestMaxConnectionIdleEnvVar.test_env_var_overrides_default': (
+            'environment override is outside the candidate configuration contract'
+        ),
+        'TestMaxConnectionIdleEnvVar.test_env_var_zero_disables_expiry': (
+            'environment override is outside the candidate configuration contract'
+        ),
+        'TestMaxConnectionIdleEnvVar.test_non_integer_env_var_raises': (
+            'environment override is outside the candidate configuration contract'
+        ),
+        'TestMaxConnectionIdleEnvVar.test_negative_env_var_raises': (
+            'environment override is outside the candidate configuration contract'
+        ),
+        'TestKeepaliveAcrossRedirects.test_redirected_connection_is_keepalive_enabled': (
+            'bundled httplib2 redirect and private keepalive connection class'
+        ),
     },
 }
 _EXPECTATIONS = {
@@ -211,11 +366,16 @@ _SCHEMA_INPUTS = {
     ),
 }
 _UPSTREAM_HASHES = {
+    '__init__.py': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     'base.py': 'deffb01512c86df313b4ba82f63e3409b6ff024b11dc0607ecf17c4257b7d949',
     'test_api.py': '29aa14a0fff6f1d3e858f7ed9309d9085e61cceb34f7f9b7feea897d4bc1cc1c',
+    'test_api_long.py': '21003781a40b9c99adfa5491adbdd5cc191a8e8f11c1b049182401becddcf4b3',
     'test_client.py': '61feca77a92245d7ac96265e5f52e9ea971d94d7b9ae0e71c9e56d0cacc2ffc3',
-    'test_unit.py': 'ed35e0ff5bd20e32b8d19227159a453fa23428b0c0e10546ea3c9e5b3e3a732c',
+    'test_mockgun.py': '989e9b14bf82ec280c4a9bad75fb99afe0bede47dcff76e8428716e2d2309e83',
+    'test_proxy.py': '8500d29b7207682d7d5ccb9dbee751dd1c6f178f4beb9be85711a03b812a0c21',
+    'test_unit.py': '9eb636b57169cecdb672825e15eb4dcbe31bad52b900d531144e0f9e817e40bc',
 }
+_ADAPTED_MODULES = {'base.py', 'test_api.py', 'test_client.py', 'test_mockgun.py', 'test_unit.py'}
 
 
 class _SetupFailure:
@@ -474,6 +634,9 @@ def _prepare_sources(tests_root: Path) -> None:
     """Verify pinned sources before adapting disposable test files."""
     if (tests_root / 'conftest.py').exists():
         raise RuntimeError('Unexpected upstream conformance fixtures')
+    modules = {path.relative_to(tests_root).as_posix() for path in tests_root.rglob('*.py')}
+    if modules != set(_UPSTREAM_HASHES):
+        raise RuntimeError('Unpinned upstream conformance module or missing pinned module')
     sources: dict[str, str] = {}
     for module, digest in _UPSTREAM_HASHES.items():
         content = (tests_root / module).read_bytes()
@@ -481,6 +644,8 @@ def _prepare_sources(tests_root: Path) -> None:
             raise RuntimeError('Pinned conformance source digest mismatch')
         sources[module] = content.decode('utf-8')
     for module, source in sources.items():
+        if module not in _ADAPTED_MODULES:
+            continue
         tree = _adapt_module(source, _EXCLUSIONS.get(module, {}))
         _adapt_fixtures(module, tree)
         if module == 'test_api.py':
@@ -492,12 +657,8 @@ def _prepare_sources(tests_root: Path) -> None:
     (tests_root / 'conftest.py').write_bytes(runtime.read_bytes())
 
 
-def main() -> int:
-    """Prepare the isolated suite without printing user data or server errors.
-
-    Returns:
-        Zero after setup, or one with a sanitized failure message.
-    """
+def _main() -> int:
+    """Prepare the isolated suite without printing user data or server errors."""
     site_packages = Path(sys.argv[1]).resolve()
     tests_root = Path(sys.argv[2]).resolve()
     sys.path.insert(0, str(site_packages))
@@ -529,4 +690,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

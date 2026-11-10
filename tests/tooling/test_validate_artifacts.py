@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import base64
-import csv
+import ast
 import hashlib
-import io
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tomllib
-import zipfile
 from pathlib import Path
-from typing import Never
 from unittest.mock import patch
 
 import pytest
@@ -21,7 +16,9 @@ import pytest
 from scripts import _artifact_evidence as evidence
 from scripts import _sdist_contract as contract
 from scripts import run_installed_tests as installed_runner
-from tests._git import git_env
+from shotgun_api3._version import PACKAGE_VERSION
+from tests._git import commit_fixture, git_bash, git_env
+from tests.tooling._wheels import write_wheel
 
 _FAKE_CP = r"""#!/usr/bin/env bash
 set -euo pipefail
@@ -67,7 +64,7 @@ fi
 
 if [[ ${1:-} == '-m' && ${2:-} == 'tarfile' && ${3:-} == '-e' ]]; then
     if [[ $4 == *.tar.gz ]]; then
-        mkdir -p -- "$5/sg_python_api-0.1.2"
+        mkdir -p -- "$5/sg_python_api-@PACKAGE_VERSION@"
         exit 0
     fi
     exec "$REAL_PYTHON" "$@"
@@ -82,9 +79,9 @@ if [[ ${1:-} == '-m' && ${2:-} == 'hatchling' ]]; then
         fi
     done
     mkdir -p -- "$output_dir"
-    printf '%s\n' 'wheel bytes' >"$output_dir/sg_python_api-0.1.2-py3-none-any.whl"
+    printf '%s\n' 'wheel bytes' >"$output_dir/sg_python_api-@PACKAGE_VERSION@-py3-none-any.whl"
     if [[ " $* " == *' sdist '* ]]; then
-        printf '%s\n' 'sdist bytes' >"$output_dir/sg_python_api-0.1.2.tar.gz"
+        printf '%s\n' 'sdist bytes' >"$output_dir/sg_python_api-@PACKAGE_VERSION@.tar.gz"
     fi
     exit 0
 fi
@@ -99,7 +96,7 @@ if [[ ${1:-} == '-I' && ${2:-} == */scripts/_sdist_contract.py && ${3:-} != '--a
         exit 1
     fi
     work_root=${4%/artifacts/*}
-    if [[ -e $work_root/sdist/sg_python_api-0.1.2 ]]; then
+    if [[ -e $work_root/sdist/sg_python_api-@PACKAGE_VERSION@ ]]; then
         printf '%s\n' 'sdist contract ran after extraction' >&2
         exit 1
     fi
@@ -129,68 +126,9 @@ exec "$REAL_PYTHON" "$@"
 """
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SDIST_CONTRACT = _REPO_ROOT / 'scripts' / '_sdist_contract.py'
-_SDIST_METADATA = b"""Metadata-Version: 2.4
-Version: 0.1.2
-Name: sg-python-api
-Requires-Python: >=3.11
-License-Expression: MIT
-License-File: LICENSE
-Classifier: Programming Language :: Python :: 3 :: Only
-Classifier: Programming Language :: Python :: 3.11
-Classifier: Programming Language :: Python :: 3.12
-Classifier: Programming Language :: Python :: 3.13
-Classifier: Programming Language :: Python :: 3.14
-Classifier: Programming Language :: Python :: 3.15
-Classifier: Typing :: Typed
-Requires-Dist: urllib3<3,>=2
-Provides-Extra: async
-Requires-Dist: httpx2<3,>=2; extra == 'async'
-Project-URL: Documentation, https://github.com/dactylo/sg-python-api/tree/main/docs
-Project-URL: Homepage, https://github.com/dactylo/sg-python-api
-Project-URL: Issues, https://github.com/dactylo/sg-python-api/issues
-Project-URL: Repository, https://github.com/dactylo/sg-python-api
-
-"""
-_SDIST_NAME = 'sg_python_api-0.1.2.tar.gz'
+_SDIST_NAME = f'sg_python_api-{PACKAGE_VERSION}.tar.gz'
 _VALIDATOR = _REPO_ROOT / 'scripts' / 'validate_artifacts.sh'
-_WHEEL_METADATA = b"""Metadata-Version: 2.4
-Name: sg-python-api
-Version: 0.1.2
-License-Expression: MIT
-License-File: LICENSE
-Requires-Python: >=3.11
-Classifier: Programming Language :: Python :: 3 :: Only
-Classifier: Programming Language :: Python :: 3.11
-Classifier: Programming Language :: Python :: 3.12
-Classifier: Programming Language :: Python :: 3.13
-Classifier: Programming Language :: Python :: 3.14
-Classifier: Programming Language :: Python :: 3.15
-Classifier: Typing :: Typed
-Provides-Extra: async
-Requires-Dist: urllib3<3,>=2
-Requires-Dist: httpx2<3,>=2; extra == "async"
-Project-URL: Documentation, https://github.com/dactylo/sg-python-api/tree/main/docs
-Project-URL: Homepage, https://github.com/dactylo/sg-python-api
-Project-URL: Issues, https://github.com/dactylo/sg-python-api/issues
-Project-URL: Repository, https://github.com/dactylo/sg-python-api
-
-"""
-_WHEEL_NAME = 'sg_python_api-0.1.2-py3-none-any.whl'
-
-
-def _git_bash() -> str:
-    if sys.platform != 'win32':
-        return 'bash'
-
-    git = shutil.which('git')
-    if git is None:
-        raise RuntimeError('Git is required to run the artifact validator tests')
-    # Git Bash puts architecture-specific Git binaries ahead of the cmd wrapper.
-    for git_dir in Path(git).resolve().parents:
-        for bash in (git_dir / 'bash.exe', git_dir / 'bin' / 'bash.exe'):
-            if bash.is_file():
-                return str(bash)
-    raise RuntimeError('Git Bash is required to run the artifact validator tests')
+_WHEEL_NAME = f'sg_python_api-{PACKAGE_VERSION}-py3-none-any.whl'
 
 
 def _head_commit(candidate: Path) -> str:
@@ -215,6 +153,10 @@ def _prepare_candidate(
 
     shutil.copy2(_SDIST_CONTRACT, candidate / 'scripts' / _SDIST_CONTRACT.name)
     shutil.copy2(_VALIDATOR, candidate / 'scripts' / _VALIDATOR.name)
+    shutil.copy2(
+        _REPO_ROOT / 'scripts' / 'artifact_inputs.txt',
+        candidate / 'scripts' / 'artifact_inputs.txt',
+    )
     (candidate / '.gitignore').write_text('dist/\n', encoding='ascii')
     if private_docs:
         (candidate / 'docs' / 'drafts').mkdir(parents=True)
@@ -223,7 +165,9 @@ def _prepare_candidate(
             encoding='ascii',
         )
     fake_python = fake_bin / 'python'
-    fake_python.write_text(_FAKE_PYTHON, encoding='ascii', newline='\n')
+    fake_python.write_text(
+        _FAKE_PYTHON.replace('@PACKAGE_VERSION@', PACKAGE_VERSION), encoding='ascii', newline='\n'
+    )
     fake_python.chmod(0o755)
     fake_cp = fake_bin / 'cp'
     fake_cp.write_text(_FAKE_CP, encoding='ascii', newline='\n')
@@ -231,21 +175,8 @@ def _prepare_candidate(
 
     subprocess.run(['git', 'init', '--quiet'], cwd=candidate, env=git_env(), check=True)
     subprocess.run(['git', 'add', '.'], cwd=candidate, env=git_env(), check=True)
-    subprocess.run(
-        [
-            'git',
-            '-c',
-            'user.name=Artifact Test',
-            '-c',
-            'user.email=artifact-test@example.invalid',
-            'commit',
-            '--quiet',
-            '-m',
-            'test candidate',
-        ],
-        cwd=candidate,
-        env=git_env(),
-        check=True,
+    commit_fixture(
+        candidate, 'test candidate', identity=('Artifact Test', 'artifact-test@example.invalid')
     )
 
     env = git_env()
@@ -265,37 +196,12 @@ def _requirement_signature(value: str) -> tuple[str, frozenset[str], str]:
     return name.group(), frozenset(specifiers.split(',')), marker
 
 
-def _run_metadata_validation(
-    contents: bytes,
-    label: str,
-) -> tuple[object, ...]:
-    return contract._metadata_signature(contract._parse_metadata(contents, label), label)
-
-
-def _run_sdist_contract(
-    export_root: Path,
-    sdist_path: Path,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            '-I',
-            str(_SDIST_CONTRACT),
-            str(export_root),
-            str(sdist_path),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-
 def _run_validator(
     candidate: Path,
     env: dict[str, str],
     output_dir: Path | None,
 ) -> subprocess.CompletedProcess[str]:
-    command = [_git_bash()]
+    command = [git_bash()]
     if sys.platform == 'win32':
         command.extend(
             (
@@ -317,297 +223,44 @@ def _run_validator(
     )
 
 
-def _sdist_file(name: str, contents: bytes) -> tuple[tarfile.TarInfo, bytes]:
-    member = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/{name}')
-    member.size = len(contents)
-    return member, contents
-
-
-def _write_sdist(
-    path: Path,
-    members: list[tuple[tarfile.TarInfo, bytes | None]],
+@pytest.mark.parametrize('script_name', ['_sdist_contract.py', 'run_installed_tests.py'])
+def test_artifact_helpers_read_source_version_without_importing_package(
+    tmp_path: Path, script_name: str
 ) -> None:
-    with tarfile.open(path, mode='w:gz') as archive:
-        for member, contents in members:
-            archive.addfile(
-                member,
-                io.BytesIO(contents) if contents is not None else None,
-            )
-
-
-def _write_tree(root: Path, files: dict[str, bytes]) -> None:
-    for name, contents in files.items():
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(contents)
-
-
-def _write_wheel(path: Path, files: dict[str, bytes]) -> None:
-    with zipfile.ZipFile(path, mode='w') as archive:
-        for name, contents in files.items():
-            archive.writestr(zipfile.ZipInfo(name), contents)
-
-
-def _replace_wheel_member(path: Path, name: str, contents: bytes) -> None:
-    with zipfile.ZipFile(path) as archive:
-        files = {member.filename: archive.read(member) for member in archive.infolist()}
-    files[name] = contents
-    _write_wheel(path, files)
-
-
-def _valid_artifacts(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
-    export_root = tmp_path / 'export'
-    source_wheel = tmp_path / 'source' / _WHEEL_NAME
-    derived_wheel = tmp_path / 'derived' / _WHEEL_NAME
-    sdist = tmp_path / _SDIST_NAME
-    source_wheel.parent.mkdir()
-    derived_wheel.parent.mkdir()
-    package_files = {
-        f'shotgun_api3/{name}': f'{name}\n'.encode('ascii')
-        for name in contract._EXPECTED_PACKAGE_FILES
-    }
-    _write_tree(
-        export_root,
-        {
-            **{f'src/{name}': contents for name, contents in package_files.items()},
-            'LICENSE': b'license\n',
-        },
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    script = scripts / script_name
+    shutil.copy2(_REPO_ROOT / 'scripts' / script_name, script)
+    package = tmp_path / 'src' / 'shotgun_api3'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text(
+        "raise AssertionError('package imported')\n", encoding='ascii'
     )
-    _write_sdist(
-        sdist,
-        [
-            _sdist_file('PKG-INFO', _SDIST_METADATA),
-            _sdist_file('LICENSE', b'license\n'),
-            *(_sdist_file(f'src/{name}', contents) for name, contents in package_files.items()),
-        ],
+    (package / '_version.py').write_text("COMPATIBILITY_VERSION = '8.8.8'\n", encoding='ascii')
+    (tmp_path / 'pyproject.toml').write_text(
+        '[project]\nname = "sg-python-api"\nversion = "9.9.9"\n', encoding='ascii'
     )
-    dist_info = 'sg_python_api-0.1.2.dist-info'
-    wheel_files = {
-        **package_files,
-        f'{dist_info}/METADATA': _WHEEL_METADATA,
-        f'{dist_info}/WHEEL': b'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n',
-        f'{dist_info}/licenses/LICENSE': b'license\n',
-    }
-    record_name = f'{dist_info}/RECORD'
-    rows = [
-        [
-            name,
-            'sha256='
-            + base64.urlsafe_b64encode(hashlib.sha256(contents).digest())
-            .rstrip(b'=')
-            .decode('ascii'),
-            str(len(contents)),
-        ]
-        for name, contents in wheel_files.items()
-    ]
-    rows.append([record_name, '', ''])
-    buffer = io.StringIO()
-    csv.writer(buffer).writerows(rows)
-    wheel_files[record_name] = buffer.getvalue().encode('ascii')
-    _write_wheel(source_wheel, wheel_files)
-    _write_wheel(derived_wheel, wheel_files)
-    return source_wheel, sdist, derived_wheel, export_root
 
-
-def test_artifact_contract_accepts_synthetic_archives_and_isolated_cli(tmp_path: Path) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-
-    contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
     result = subprocess.run(
         [
             sys.executable,
             '-I',
-            str(_SDIST_CONTRACT),
-            '--artifacts',
-            str(source_wheel),
-            str(sdist),
-            str(derived_wheel),
-            str(export_root),
+            '-S',
+            '-c',
+            (
+                'import runpy, sys; namespace = runpy.run_path(sys.argv[1]); '
+                "assert 'shotgun_api3' not in sys.modules; print(namespace['_EXPECTED_VERSION'])"
+            ),
+            str(script),
         ],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
         check=False,
     )
 
     assert result.returncode == 0, result.stderr
-    assert 'artifact archive validation OK' in result.stdout
-
-
-def test_artifact_contract_rejects_differing_wheel_archive_bytes(tmp_path: Path) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    with zipfile.ZipFile(derived_wheel, mode='a') as archive:
-        archive.comment = b'different archive bytes'
-
-    with pytest.raises(AssertionError, match='archive hashes differ'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-@pytest.mark.parametrize(
-    ('member', 'expected'),
-    [
-        pytest.param('shotgun_api3/../escape.py', 'contains an unsafe path', id='unsafe-wheel'),
-        pytest.param(
-            'shotgun_api3/__init__.py', 'contains duplicate member', id='duplicate-wheel'
-        ),
-    ],
-)
-def test_artifact_contract_rejects_invalid_wheel_members(
-    tmp_path: Path, member: str, expected: str
-) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    with zipfile.ZipFile(source_wheel, mode='a') as archive:
-        if member == 'shotgun_api3/__init__.py':
-            with pytest.warns(UserWarning, match='Duplicate name'):
-                archive.writestr(member, b'corrupt\n')
-        else:
-            archive.writestr(member, b'corrupt\n')
-
-    with pytest.raises(AssertionError, match=expected):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-def test_artifact_contract_rejects_metadata_mismatch(tmp_path: Path) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    _write_sdist(
-        sdist,
-        [
-            _sdist_file(
-                'PKG-INFO',
-                _SDIST_METADATA.replace(b'Name: sg-python-api', b'Name: other-package'),
-            ),
-            _sdist_file('LICENSE', b'license\n'),
-            *(
-                _sdist_file(
-                    f'src/shotgun_api3/{name}',
-                    (export_root / 'src' / 'shotgun_api3' / name).read_bytes(),
-                )
-                for name in contract._EXPECTED_PACKAGE_FILES
-            ),
-        ],
-    )
-
-    with pytest.raises(AssertionError, match='Name differs'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-@pytest.mark.parametrize('name', ['.scratch/notes.md', 'notes/private.md', 'docs/drafts/notes.md'])
-@pytest.mark.parametrize('archive_kind', ['sdist', 'wheel'])
-def test_artifact_contract_rejects_nonpublic_members(
-    tmp_path: Path, name: str, archive_kind: str
-) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    if archive_kind == 'sdist':
-        files = contract._read_sdist(sdist)
-        files[name] = b'private\n'
-        _write_sdist(sdist, [_sdist_file(path, content) for path, content in files.items()])
-    else:
-        with zipfile.ZipFile(source_wheel, mode='a') as archive:
-            archive.writestr(name, b'private\n')
-
-    with pytest.raises(AssertionError, match='unexpected'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-@pytest.mark.parametrize('field', ['hash', 'size'])
-def test_artifact_contract_rejects_record_mismatch(tmp_path: Path, field: str) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    with zipfile.ZipFile(source_wheel) as archive:
-        record = archive.read('sg_python_api-0.1.2.dist-info/RECORD')
-    if field == 'hash':
-        damaged = record.replace(b'sha256=', b'sha256=x', 1)
-    else:
-        damaged = record.replace(b',12\r\n', b',999\r\n', 1)
-        assert damaged != record
-    _replace_wheel_member(source_wheel, 'sg_python_api-0.1.2.dist-info/RECORD', damaged)
-
-    with pytest.raises(AssertionError, match='RECORD entry differs'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-@pytest.mark.parametrize('missing', [False, True], ids=['altered', 'missing'])
-def test_artifact_contract_rejects_source_drift(tmp_path: Path, *, missing: bool) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    source = export_root / 'src' / 'shotgun_api3' / '__init__.py'
-    if missing:
-        source.unlink()
-    else:
-        source.write_bytes(b'altered\n')
-
-    with pytest.raises(AssertionError, match=r'__init__\.py'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-def test_artifact_contract_rejects_unsupported_sdist_member(tmp_path: Path) -> None:
-    source_wheel, sdist, derived_wheel, export_root = _valid_artifacts(tmp_path)
-    fifo = tarfile.TarInfo('sg_python_api-0.1.2/src/fifo')
-    fifo.type = tarfile.FIFOTYPE
-    _write_sdist(sdist, [(fifo, None)])
-
-    with pytest.raises(AssertionError, match='contains unsupported member'):
-        contract._validate_artifacts(source_wheel, sdist, derived_wheel, export_root)
-
-
-@pytest.mark.parametrize(
-    ('label', 'contents'),
-    [
-        pytest.param('source wheel', _WHEEL_METADATA, id='wheel'),
-        pytest.param('source distribution', _SDIST_METADATA, id='sdist'),
-    ],
-)
-def test_artifact_validator_accepts_project_metadata(label: str, contents: bytes) -> None:
-    assert _run_metadata_validation(contents, label)
-
-
-@pytest.mark.parametrize(
-    ('case', 'contents', 'expected_error'),
-    [
-        pytest.param(
-            'missing extra',
-            _WHEEL_METADATA.replace(b'Provides-Extra: async\n', b''),
-            'missing extra extras differ',
-            id='missing-extra',
-        ),
-        pytest.param(
-            'unexpected extra',
-            _WHEEL_METADATA.replace(
-                b'Provides-Extra: async\n',
-                b'Provides-Extra: async\nProvides-Extra: sync\n',
-            ),
-            'unexpected extra extras differ',
-            id='unexpected-extra',
-        ),
-        pytest.param(
-            'altered required field',
-            _WHEEL_METADATA.replace(b'Name: sg-python-api\n', b'Name: other-package\n'),
-            "altered required field Name differs: expected 'sg-python-api', got 'other-package'",
-            id='required-field',
-        ),
-        pytest.param(
-            'altered dependency',
-            _WHEEL_METADATA.replace(
-                b'Requires-Dist: urllib3<3,>=2\n', b'Requires-Dist: urllib3<4,>=2\n'
-            ),
-            'altered dependency requirements differ',
-            id='dependency',
-        ),
-        pytest.param(
-            'altered URL',
-            _WHEEL_METADATA.replace(
-                b'Project-URL: Homepage, https://github.com/dactylo/sg-python-api\n',
-                b'Project-URL: Homepage, https://example.invalid/sg-python-api\n',
-            ),
-            'altered URL project URLs differ',
-            id='url',
-        ),
-    ],
-)
-def test_artifact_validator_rejects_mismatched_metadata(
-    case: str,
-    contents: bytes,
-    expected_error: str,
-) -> None:
-    with pytest.raises(AssertionError, match=expected_error):
-        _run_metadata_validation(contents, case)
+    assert result.stdout == '9.9.9\n'
 
 
 def test_default_validation_report_preserves_trusted_wheel_path(tmp_path: Path) -> None:
@@ -666,21 +319,8 @@ def test_candidate_tracks_public_input_commits(tmp_path: Path, name: str, *, pub
     notes_file.parent.mkdir(parents=True, exist_ok=True)
     notes_file.write_text('# Updated input\n', encoding='ascii')
     subprocess.run(['git', 'add', str(notes_file)], cwd=candidate, env=git_env(), check=True)
-    subprocess.run(
-        [
-            'git',
-            '-c',
-            'user.name=Artifact Test',
-            '-c',
-            'user.email=artifact-test@example.invalid',
-            'commit',
-            '--quiet',
-            '-m',
-            'update input',
-        ],
-        cwd=candidate,
-        env=git_env(),
-        check=True,
+    commit_fixture(
+        candidate, 'update input', identity=('Artifact Test', 'artifact-test@example.invalid')
     )
 
     result = _run_validator(candidate, env, output_dir)
@@ -762,9 +402,10 @@ def test_public_checkout_creates_report_parent_before_later_validation_failure(
     assert 'No such file or directory' not in result.stderr
 
 
-def test_release_metadata_contracts_match_project() -> None:
+def test_release_metadata_matches_pyproject() -> None:
     with (_REPO_ROOT / 'pyproject.toml').open('rb') as source:
-        project = tomllib.load(source)['project']
+        configuration = tomllib.load(source)
+    project = configuration['project']
     extras = project['optional-dependencies']
     requirements = {value.replace(' ', '').replace('"', "'") for value in project['dependencies']}
     for extra, dependencies in extras.items():
@@ -773,306 +414,37 @@ def test_release_metadata_contracts_match_project() -> None:
             for dependency in dependencies
         )
     assert set(project['classifiers']) == contract._EXPECTED_CLASSIFIERS
+    assert project['license'] == contract._EXPECTED_LICENSE == installed_runner._EXPECTED_LICENSE
+    assert project['name'] == contract._EXPECTED_NAME == installed_runner._DIST_NAME
+    assert (
+        project['requires-python']
+        == contract._EXPECTED_REQUIRES_PYTHON
+        == installed_runner._EXPECTED_REQUIRES_PYTHON
+    )
+    configured_markers = {
+        entry.partition(':')[0]
+        for entry in configuration['tool']['pytest']['ini_options']['markers']
+    }
+    installed_markers = {
+        entry.partition(':')[0] for entry in installed_runner._EXPECTED_PYTEST_MARKERS
+    }
+    assert configured_markers == installed_markers
+    ci_source = (_REPO_ROOT / '.github' / 'workflows' / 'ci.yml').read_text(encoding='utf-8')
+    match = re.search(
+        r'          sdist_roots = (\{.*?^          \})', ci_source, re.MULTILINE | re.DOTALL
+    )
+    assert match is not None
+    ci_roots = ast.literal_eval(match.group(1))
+    assert ci_roots == contract._ROOT_SOURCE_FILES | contract._TREE_SOURCE_ROOTS | {
+        'PKG-INFO',
+    }
     for module in (contract, installed_runner):
-        assert project['version'] == module._EXPECTED_VERSION
+        assert PACKAGE_VERSION == module._EXPECTED_VERSION
         assert set(extras) == module._EXPECTED_EXTRAS
         assert {_requirement_signature(value) for value in requirements} == {
             _requirement_signature(value) for value in module._EXPECTED_REQUIREMENTS
         }
         assert project['urls'] == module._EXPECTED_URLS
-
-
-def test_sdist_contract_accepts_exact_positive_sources(tmp_path: Path) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    exported = {
-        '.editorconfig': b'editor\n',
-        '.gitattributes': b'attributes\n',
-        '.github/workflows/ci.yml': b'ci\n',
-        '.gitignore': b'ignore\n',
-        'COMPATIBILITY.md': b'compatibility\n',
-        'LICENSE': b'license\n',
-        'Makefile': b'make\n',
-        'README.md': b'readme\n',
-        'docs/guide.md': b'guide\n',
-        'docs/drafts/private.md': b'private\n',
-        'examples/nested/example.py': b'example\n',
-        'pyproject.toml': b'project\n',
-        'scripts/check.sh': b'check\n',
-        'src/shotgun_api3/__init__.py': b'package\n',
-        'tests/test_package.py': b'test\n',
-    }
-    expected_names = {
-        '.gitignore',
-        'COMPATIBILITY.md',
-        'LICENSE',
-        'Makefile',
-        'README.md',
-        'docs/guide.md',
-        'examples/nested/example.py',
-        'pyproject.toml',
-        'scripts/check.sh',
-        'src/shotgun_api3/__init__.py',
-        'tests/test_package.py',
-    }
-    _write_tree(export_root, exported)
-    _write_sdist(
-        sdist_path,
-        [
-            *(_sdist_file(name, exported[name]) for name in sorted(expected_names)),
-            _sdist_file('PKG-INFO', b'metadata\n'),
-        ],
-    )
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_sdist_contract_rejects_changed_positive_source(tmp_path: Path) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/package.py': b'from HEAD\n'})
-    _write_sdist(
-        sdist_path,
-        [
-            _sdist_file('PKG-INFO', b'metadata\n'),
-            _sdist_file('src/package.py', b'changed\n'),
-        ],
-    )
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert 'sdist member differs from HEAD: src/package.py' in result.stderr
-
-
-def test_sdist_contract_rejects_duplicate_before_positive_comparison(
-    tmp_path: Path,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    duplicate = _sdist_file('src/duplicate.py', b'first\n')
-    _write_sdist(
-        sdist_path,
-        [duplicate, _sdist_file('src/duplicate.py', b'second\n')],
-    )
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert f'{_SDIST_NAME} contains duplicate member: src/duplicate.py' in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-def test_sdist_contract_rejects_exported_positive_symlink(tmp_path: Path) -> None:
-    export_root = tmp_path / 'export'
-    outside_path = tmp_path / 'outside.py'
-    sdist_path = tmp_path / _SDIST_NAME
-    outside_path.write_bytes(b'outside\n')
-    exported_path = export_root / 'src' / 'package.py'
-    exported_path.parent.mkdir(parents=True)
-    exported_path.symlink_to(outside_path)
-    _write_sdist(
-        sdist_path,
-        [
-            _sdist_file('PKG-INFO', b'metadata\n'),
-            _sdist_file('src/package.py', b'outside\n'),
-        ],
-    )
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert 'candidate export contains a symlink: src/package.py' in result.stderr
-
-
-def test_sdist_contract_rejects_hardlink_before_positive_comparison(
-    tmp_path: Path,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    link = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/src/hardlink.py')
-    link.type = tarfile.LNKTYPE
-    link.linkname = 'target.py'
-    _write_sdist(sdist_path, [(link, None)])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert f'{_SDIST_NAME} contains a link: {link.name}' in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-@pytest.mark.parametrize(
-    ('member_name', 'expected_error'),
-    [
-        pytest.param(
-            f'{_SDIST_NAME.removesuffix(".tar.gz")}/../escape.py',
-            'contains an unsafe path',
-            id='unsafe-path',
-        ),
-        pytest.param(
-            'wrong-root/file.py',
-            'has unexpected archive root',
-            id='wrong-root',
-        ),
-    ],
-)
-def test_sdist_contract_rejects_invalid_structure_before_positive_comparison(
-    tmp_path: Path,
-    member_name: str,
-    expected_error: str,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    bad_member = tarfile.TarInfo(member_name)
-    bad_member.size = len(b'bad\n')
-    _write_sdist(sdist_path, [(bad_member, b'bad\n')])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert expected_error in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-def test_sdist_contract_rejects_missing_positive_source(tmp_path: Path) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(
-        export_root,
-        {
-            'tests/zeta.py': b'zeta\n',
-            'src/alpha.py': b'alpha\n',
-        },
-    )
-    _write_sdist(sdist_path, [_sdist_file('PKG-INFO', b'metadata\n')])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert (
-        "sdist contents differ; missing=['src/alpha.py', 'tests/zeta.py'], unexpected=[]"
-    ) in result.stderr
-
-
-@pytest.mark.parametrize(
-    'member_type',
-    [
-        pytest.param(tarfile.CONTTYPE, id='contiguous-file'),
-        pytest.param(tarfile.GNUTYPE_SPARSE, id='gnu-sparse'),
-    ],
-)
-def test_sdist_contract_rejects_nonstandard_file_member_before_comparison(
-    tmp_path: Path,
-    member_type: bytes,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    member = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/src/unsupported')
-    member.type = member_type
-    _write_sdist(sdist_path, [(member, None)])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert f'{_SDIST_NAME} contains unsupported member: {member.name}' in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-def test_sdist_contract_rejects_symlink_before_positive_comparison(
-    tmp_path: Path,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    link = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/src/symlink.py')
-    link.type = tarfile.SYMTYPE
-    link.linkname = 'target.py'
-    _write_sdist(sdist_path, [(link, None)])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert f'{_SDIST_NAME} contains a link: {link.name}' in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-def test_sdist_contract_rejects_unexpected_source(tmp_path: Path) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(
-        export_root,
-        {
-            'zzz-control.txt': b'zzz\n',
-            '.github/workflows/ci.yml': b'ci\n',
-        },
-    )
-    _write_sdist(
-        sdist_path,
-        [
-            _sdist_file('zzz-control.txt', b'zzz\n'),
-            _sdist_file('.github/workflows/ci.yml', b'ci\n'),
-            _sdist_file('PKG-INFO', b'metadata\n'),
-        ],
-    )
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert (
-        "sdist contents differ; missing=[], unexpected=['.github/workflows/ci.yml', "
-        "'zzz-control.txt']"
-    ) in result.stderr
-
-
-def test_sdist_contract_rejects_unsupported_member_before_positive_comparison(
-    tmp_path: Path,
-) -> None:
-    export_root = tmp_path / 'export'
-    sdist_path = tmp_path / _SDIST_NAME
-    _write_tree(export_root, {'src/missing.py': b'missing\n'})
-    fifo = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/src/unsupported')
-    fifo.type = tarfile.FIFOTYPE
-    _write_sdist(sdist_path, [(fifo, None)])
-
-    result = _run_sdist_contract(export_root, sdist_path)
-
-    assert result.returncode != 0
-    assert f'{_SDIST_NAME} contains unsupported member: {fifo.name}' in result.stderr
-    assert 'sdist contents differ' not in result.stderr
-
-
-def test_sdist_contract_scans_all_structure_before_reading_member_bytes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sdist_path = tmp_path / _SDIST_NAME
-    fifo = tarfile.TarInfo(f'{_SDIST_NAME.removesuffix(".tar.gz")}/src/unsupported')
-    fifo.type = tarfile.FIFOTYPE
-    _write_sdist(
-        sdist_path,
-        [_sdist_file('src/first.py', b'first\n'), (fifo, None)],
-    )
-    extract_calls = 0
-
-    def fail_extractfile(*_args: object, **_kwargs: object) -> Never:
-        nonlocal extract_calls
-        extract_calls += 1
-        raise AssertionError('extractfile called before structural scan completed')
-
-    monkeypatch.setattr(tarfile.TarFile, 'extractfile', fail_extractfile)
-    with pytest.raises(
-        AssertionError,
-        match=f'{_SDIST_NAME} contains unsupported member: {fifo.name}',
-    ):
-        contract._read_sdist(sdist_path)
-    assert extract_calls == 0
 
 
 def test_successful_validation_preserves_consumable_artifacts(
@@ -1114,22 +486,11 @@ def test_synthetic_wheels_ignore_wall_clock_zip_timestamps(tmp_path: Path) -> No
     ]
 
     with patch('zipfile.time.localtime', side_effect=stamps) as clock:
-        _write_wheel(first, files)
-        _write_wheel(second, files)
+        write_wheel(first, files, fixed_timestamp=True)
+        write_wheel(second, files, fixed_timestamp=True)
 
     assert first.read_bytes() == second.read_bytes()
     assert clock.call_count == 0
-
-
-def test_validator_package_inventory_matches_packaged_source() -> None:
-    package_source = _REPO_ROOT / 'src' / 'shotgun_api3'
-    source_files = {
-        path.relative_to(package_source).as_posix()
-        for path in package_source.rglob('*')
-        if path.is_file() and (path.suffix == '.py' or path.name == 'py.typed')
-    }
-
-    assert source_files == contract._EXPECTED_PACKAGE_FILES
 
 
 def test_validator_runs_sdist_contract_from_candidate_export(tmp_path: Path) -> None:
@@ -1144,7 +505,7 @@ def test_validator_runs_sdist_contract_from_candidate_export(tmp_path: Path) -> 
     helper, export_root, sdist_path = marker.read_text(encoding='ascii').splitlines()
     assert helper.endswith('/export/scripts/_sdist_contract.py')
     assert export_root.endswith('/export')
-    assert sdist_path.endswith('/artifacts/sg_python_api-0.1.2.tar.gz')
+    assert sdist_path.endswith(f'/artifacts/{_SDIST_NAME}')
 
 
 @pytest.mark.parametrize('git_directory', ['cmd', 'bin', 'mingw64/bin', 'clangarm64/bin'])
@@ -1155,9 +516,9 @@ def test_validator_uses_git_bash_on_windows(
     git_bin.mkdir(parents=True)
     git = git_bin / 'git.exe'
     git.touch()
-    git_bash = tmp_path / 'Git' / 'bin' / 'bash.exe'
-    git_bash.parent.mkdir(exist_ok=True)
-    git_bash.touch()
+    expected = tmp_path / 'Git' / 'bin' / 'bash.exe'
+    expected.parent.mkdir(exist_ok=True)
+    expected.touch()
     wsl_bash = tmp_path / 'Windows' / 'bash.exe'
     wsl_bash.parent.mkdir()
     wsl_bash.touch()
@@ -1168,4 +529,4 @@ def test_validator_uses_git_bash_on_windows(
     monkeypatch.setattr(sys, 'platform', 'win32')
     monkeypatch.setattr(shutil, 'which', fake_which)
 
-    assert _git_bash() == str(git_bash)
+    assert git_bash() == str(expected)

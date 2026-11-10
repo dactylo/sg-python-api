@@ -1,15 +1,13 @@
 import asyncio
 import dataclasses
-import inspect
 import json
 import os
 import re
 import tempfile
 import threading
 import traceback
-import urllib.parse
 import urllib.request
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, ParamSpec, Self, TypeAlias, TypeVar, cast
 from unittest.mock import patch
@@ -18,35 +16,48 @@ import pytest
 
 from shotgun_api3 import (
     AsyncShotgun,
-    Shotgun,
     _errors,
     _files,
 )
-from shotgun_api3._async_transport import AsyncStreamingResponse
 from shotgun_api3._config import ProgressEvent
 from shotgun_api3._errors import ShotgunError
 from shotgun_api3._transport import (
     CaseInsensitiveHeaders,
     ReadTimeoutError,
     SendError,
-    TransportError,
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _AsyncFakeTransport
-from tests.conftest import _fake_async_transport, _make_response, _set_fake_async_transport
+from tests.conftest import (
+    FakeAsyncClient,
+    fake_async_transport,
+    make_response,
+    set_fake_async_transport,
+)
+from tests.files._async_client import (
+    DIRECT_INFO,
+    AsyncFileTransport,
+    PartialUploadFailure,
+    ScriptItem,
+    StreamItem,
+    StreamScript,
+    async_file_client,
+)
+from tests.files._responses import (
+    failed_text_response,
+    form_fields,
+    raw_upload_transcript,
+    read_response,
+    upload_headers,
+)
+from tests.files._upload_cases import (
+    UPLOAD_METHOD_NAMES,
+)
 
 pytestmark = pytest.mark.async_required
 
 _CREDENTIAL_VALUE = 'credential-value'
-_DIRECT_INFO: dict[str, object] = {
-    'version': [9, 0, 0],
-    'api_max_entities_per_page': 500,
-    's3_direct_uploads_enabled': True,
-    's3_enabled_upload_types': {'*': ['*']},
-}
 _FILE_BATCH_SIZE = 1024 * 1024
-_FILE_FINAL_BATCH_SIZE = 77_057
 _FILE_TRANSFER_SIZE = 20_000_001
 _FORM_INFO: dict[str, object] = {
     'version': [9, 0, 0],
@@ -59,13 +70,8 @@ _ONE_USE_VALUE = 'one-use-value'
 _SESSION_VALUE = 'session-one'
 _TRANSIENT_IMAGE = 'https://x.example/images/status/transient/thumbnail_pending.png'
 
-FakeAsyncClient = Callable[..., AsyncShotgun]
 _CallParams = ParamSpec('_CallParams')
 _CallResult = TypeVar('_CallResult')
-_ScriptItem: TypeAlias = (
-    'TransportResponse | TransportError | _PartialUploadFailure | _StreamScript'
-)
-_StreamItem: TypeAlias = bytes | TransportError
 _WorkerPhase: TypeAlias = Literal['close', 'flush', 'open', 'replace', 'write']
 
 
@@ -254,102 +260,11 @@ class _FilesystemBarrier:
 
 
 @dataclasses.dataclass(frozen=True)
-class _PartialUploadFailure:
-    error: TransportError
-
-
-@dataclasses.dataclass(frozen=True)
 class _StreamOptions:
     headers: Mapping[str, str] = dataclasses.field(default_factory=dict[str, str])
     status: int = 200
     blocker: asyncio.Event | None = None
     started: asyncio.Event | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class _StreamScript:
-    chunks: tuple[_StreamItem, ...]
-    label: str
-    releases: list[str]
-    requested_sizes: list[int] = dataclasses.field(default_factory=list[int])
-    headers: Mapping[str, str] = dataclasses.field(default_factory=dict[str, str])
-    status: int = 200
-    blocker: asyncio.Event | None = None
-    started: asyncio.Event | None = None
-
-
-class _AsyncFileTransport(_AsyncFakeTransport):
-    def __init__(
-        self,
-        responses: list[_ScriptItem],
-        on_send: Callable[[TransportRequest], None] | None = None,
-    ) -> None:
-        super().__init__([])
-        self._on_send = on_send
-        self._file_responses = list(responses)
-        self.bodies: list[bytes | None] = []
-        self.body_ids: list[int | None] = []
-
-    @staticmethod
-    def _consume_body(body: bytes | Iterator[bytes] | None) -> bytes | None:
-        if body is None or isinstance(body, bytes):
-            return body
-        return b''.join(body)
-
-    def _next(self, request: TransportRequest) -> _ScriptItem:
-        self.requests.append(request)
-        if self._on_send is not None:
-            self._on_send(request)
-        if not self._file_responses:
-            raise AssertionError('async file transport responses exhausted')
-        return self._file_responses.pop(0)
-
-    async def send(self, request: TransportRequest) -> TransportResponse:
-        outcome = self._next(request)
-        body = request.body
-        self.body_ids.append(None if body is None else id(body))
-        if isinstance(outcome, _PartialUploadFailure):
-            assert body is not None
-            assert not isinstance(body, bytes)
-            self.bodies.append(await asyncio.to_thread(next, body))
-            raise outcome.error
-        self.bodies.append(await asyncio.to_thread(self._consume_body, body))
-        if isinstance(outcome, TransportError):
-            raise outcome
-        assert isinstance(outcome, TransportResponse)
-        return outcome
-
-    async def send_streaming(self, request: TransportRequest) -> AsyncStreamingResponse:
-        outcome = self._next(request)
-        self.body_ids.append(None)
-        self.bodies.append(None)
-        if isinstance(outcome, TransportError):
-            raise outcome
-        assert isinstance(outcome, _StreamScript)
-
-        async def stream(size: int) -> AsyncIterator[bytes]:
-            outcome.requested_sizes.append(size)
-            for item in outcome.chunks:
-                if isinstance(item, bytes):
-                    for offset in range(0, len(item), size):
-                        yield item[offset : offset + size]
-                else:
-                    raise item
-            if outcome.started is not None:
-                outcome.started.set()
-            if outcome.blocker is not None:
-                await outcome.blocker.wait()
-
-        async def close_fn() -> None:
-            outcome.releases.append(outcome.label)
-
-        return AsyncStreamingResponse(
-            status=outcome.status,
-            reason='OK' if outcome.status == 200 else 'Request failed',
-            headers=CaseInsensitiveHeaders(outcome.headers),
-            stream=stream,
-            close_fn=close_fn,
-        )
 
 
 class _BarrierFile:
@@ -420,28 +335,6 @@ class _ObservedFile:
         return cast('str', self.__getattr__('name'))
 
 
-def _client(
-    responses: list[_ScriptItem],
-    *,
-    base_url: str = 'https://x.example',
-    on_send: Callable[[TransportRequest], None] | None = None,
-    server_info: dict[str, object] | None = _DIRECT_INFO,
-    session_token: str | None = None,
-) -> tuple[AsyncShotgun, _AsyncFileTransport]:
-    sg = AsyncShotgun(
-        base_url,
-        script_name=None if session_token is not None else 'script',
-        api_key=None if session_token is not None else 'key',
-        session_token=session_token,
-        connect=False,
-    )
-    scripted = responses if server_info is None else [_make_response(server_info), *responses]
-    transport = _AsyncFileTransport(scripted, on_send)
-    _set_fake_async_transport(sg, transport)
-    sg.config.rpc_attempt_interval = 0
-    return sg, transport
-
-
 def _fault_response(code: int) -> TransportResponse:
     return TransportResponse(
         status=200,
@@ -457,10 +350,6 @@ def _fault_response(code: int) -> TransportResponse:
     )
 
 
-def _form_fields(body: bytes) -> dict[str, str]:
-    return dict(urllib.parse.parse_qsl(body.decode(), keep_blank_values=True))
-
-
 def _method_name(request: TransportRequest) -> str | None:
     if request.url.endswith('/api3/json') and isinstance(request.body, bytes):
         payload = cast('dict[str, object]', json.loads(request.body))
@@ -469,8 +358,8 @@ def _method_name(request: TransportRequest) -> str | None:
 
 
 def _one_use_client(
-    responses: list[_ScriptItem],
-) -> tuple[AsyncShotgun, _AsyncFileTransport]:
+    responses: list[ScriptItem],
+) -> tuple[AsyncShotgun, AsyncFileTransport]:
     sg = AsyncShotgun(
         'https://x.example',
         login='artist',
@@ -478,46 +367,32 @@ def _one_use_client(
         auth_token=_ONE_USE_VALUE,
         connect=False,
     )
-    transport = _AsyncFileTransport([_make_response(_DIRECT_INFO), *responses])
-    _set_fake_async_transport(sg, transport)
+    transport = AsyncFileTransport([make_response(DIRECT_INFO), *responses])
+    set_fake_async_transport(sg, transport)
     sg.config.rpc_attempt_interval = 0
     return sg, transport
 
 
-def _raw_upload_transcript(
-    requests: list[TransportRequest],
-    bodies: list[bytes | None],
-) -> list[tuple[str, str, dict[str, str], bytes | None]]:
-    return [
-        (request.method, request.url, dict(request.headers), body)
-        for request, body in zip(requests, bodies, strict=True)
-    ]
-
-
-def _read_response(entity: dict[str, object]) -> TransportResponse:
-    return _make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})
-
-
-def _rpc_call(transport: '_AsyncFileTransport', index: int) -> tuple[str, dict[str, Any]]:
+def _rpc_call(transport: 'AsyncFileTransport', index: int) -> tuple[str, dict[str, Any]]:
     payload = cast('dict[str, Any]', json.loads(cast('bytes', transport.bodies[index])))
     return cast('str', payload['method_name']), cast('dict[str, Any]', payload['params'][1])
 
 
 def _session_only_fields(body: bytes) -> None:
-    fields = _form_fields(body)
+    fields = form_fields(body)
     assert fields['session_token'] == _SESSION_VALUE
     assert not {'auth_token', 'user_login', 'user_password'} & fields.keys()
 
 
 def _stream(
-    chunks: tuple[_StreamItem, ...],
+    chunks: tuple[StreamItem, ...],
     label: str,
     releases: list[str],
     *,
     options: _StreamOptions | None = None,
-) -> _StreamScript:
+) -> StreamScript:
     controls = options or _StreamOptions()
-    return _StreamScript(
+    return StreamScript(
         chunks=chunks,
         label=label,
         releases=releases,
@@ -528,31 +403,6 @@ def _stream(
     )
 
 
-def _text(
-    content: str = '',
-    *,
-    headers: Mapping[str, str] | None = None,
-    status: int = 200,
-) -> TransportResponse:
-    return TransportResponse(
-        status=status,
-        reason='OK' if status == 200 else 'Request failed',
-        headers=CaseInsensitiveHeaders(headers or {'content-type': 'text/plain'}),
-        content=content.encode(),
-    )
-
-
-def _upload_headers(
-    body: bytes,
-    content_type: str,
-) -> dict[str, str]:
-    return {
-        'content-length': str(len(body)),
-        'content-type': content_type,
-        'user-agent': 'upload-transcript',
-    }
-
-
 @pytest.mark.anyio
 async def test_auth_cookie_handler_is_exact_origin_and_generation_bound() -> None:
     cached = AsyncShotgun(
@@ -560,8 +410,8 @@ async def test_auth_cookie_handler_is_exact_origin_and_generation_bound() -> Non
         session_token=_SESSION_VALUE,
         connect=False,
     )
-    cached_transport = _AsyncFileTransport([])
-    _set_fake_async_transport(cached, cached_transport)
+    cached_transport = AsyncFileTransport([])
+    set_fake_async_transport(cached, cached_transport)
     cached_handler = await cached.get_auth_cookie_handler()
     cookies = list(cached_handler.cookiejar)
     assert len(cookies) == 1
@@ -581,8 +431,8 @@ async def test_auth_cookie_handler_is_exact_origin_and_generation_bound() -> Non
         session_token=_SESSION_VALUE,
         connect=False,
     )
-    http_transport = _AsyncFileTransport([])
-    _set_fake_async_transport(http, http_transport)
+    http_transport = AsyncFileTransport([])
+    set_fake_async_transport(http, http_transport)
     http_handler = await http.get_auth_cookie_handler()
     assert not next(iter(http_handler.cookiejar)).secure
     assert http_transport.requests == []
@@ -593,8 +443,8 @@ async def test_auth_cookie_handler_is_exact_origin_and_generation_bound() -> Non
         if _method_name(request) == 'get_session_token':
             changed.config.set_server_params('http://new.example:8080')
 
-    changed, changed_transport = _client(
-        [_make_response({'session_id': 'old-origin-token'})],
+    changed, changed_transport = async_file_client(
+        [make_response({'session_id': 'old-origin-token'})],
         on_send=change_origin,
     )
     changed_handler = await changed.get_auth_cookie_handler()
@@ -632,7 +482,7 @@ async def test_attachment_urls_use_current_site_without_auth_io(
     expected_url: str,
 ) -> None:
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         base_url='https://old.example',
         session_token=_SESSION_VALUE,
@@ -662,7 +512,7 @@ async def test_attachment_urls_use_current_site_without_auth_io(
 async def test_download_rejects_invalid_url_before_io(url: str, tmp_path: Path) -> None:
     destination = tmp_path / 'download.bin'
     destination.write_bytes(b'existing')
-    sg, transport = _client([], session_token=_SESSION_VALUE)
+    sg, transport = async_file_client([], session_token=_SESSION_VALUE)
     events: list[object] = []
     sg.config.on_request = events.append
     sg.config.on_response = events.append
@@ -696,16 +546,16 @@ async def test_create_uploads_file_fields_after_create_and_returns_current_value
     image.write_bytes(b'image')
     strip = tmp_path / 'strip.png'
     strip.write_bytes(b'strip')
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _make_response({'type': 'Version', 'id': 5, 'code': 'v001'}),
-            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
-            _text(),
-            _text('1:7 thumb.png'),
-            _text('1 https://storage.example/strip timestamp Thumbnail upload-2'),
-            _text(),
-            _text('1:8 strip.png'),
-            _read_response(
+            make_response({'type': 'Version', 'id': 5, 'code': 'v001'}),
+            failed_text_response('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+            failed_text_response(),
+            failed_text_response('1:7 thumb.png'),
+            failed_text_response('1 https://storage.example/strip timestamp Thumbnail upload-2'),
+            failed_text_response(),
+            failed_text_response('1:8 strip.png'),
+            read_response(
                 {
                     'type': 'Version',
                     'id': 5,
@@ -731,8 +581,8 @@ async def test_create_uploads_file_fields_after_create_and_returns_current_value
     method_name, params = _rpc_call(transport, 1)
     assert method_name == 'create'
     assert [field['field_name'] for field in params['fields']] == ['code', 'sg_x']
-    assert 'filmstrip' not in _form_fields(cast('bytes', transport.bodies[4]))
-    assert _form_fields(cast('bytes', transport.bodies[7]))['filmstrip'] == 'true'
+    assert 'filmstrip' not in form_fields(cast('bytes', transport.bodies[4]))
+    assert form_fields(cast('bytes', transport.bodies[7]))['filmstrip'] == 'true'
     read_name, read_params = _rpc_call(transport, 8)
     assert (read_name, read_params['return_fields']) == ('read', ['image', 'filmstrip_image'])
 
@@ -748,15 +598,15 @@ async def test_default_multipart_upload_batches_each_storage_range(
     audit = _FilesystemAudit(threading.get_ident())
     audit.install(monkeypatch)
     encoded = '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _text(encoded),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
-            _text('17'),
-            _text('1:9 linked'),
+            failed_text_response(encoded),
+            failed_text_response('1 https://storage.example/part-1'),
+            failed_text_response(headers={'etag': 'etag-1'}),
+            failed_text_response('1 https://storage.example/part-2'),
+            failed_text_response(headers={'etag': 'etag-2'}),
+            failed_text_response('17'),
+            failed_text_response('1:9 linked'),
         ]
     )
 
@@ -781,12 +631,12 @@ async def test_direct_upload_replays_fresh_complete_body(tmp_path: Path) -> None
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'restartable')
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _text(encoded),
-            _PartialUploadFailure(SendError('ambiguous object PUT')),
-            _text(),
-            _text('1:9 linked'),
+            failed_text_response(encoded),
+            PartialUploadFailure(SendError('ambiguous object PUT')),
+            failed_text_response(),
+            failed_text_response('1:9 linked'),
         ]
     )
 
@@ -816,7 +666,9 @@ async def test_direct_upload_uses_allocation_storage_and_link_routes(
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(b'clip-data')
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg, transport = _client([_text(encoded), _text(), _text('1:9 linked')])
+    sg, transport = async_file_client(
+        [failed_text_response(encoded), failed_text_response(), failed_text_response('1:9 linked')]
+    )
     sg.config.user_agents = ('upload-transcript',)
 
     assert await sg.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 9
@@ -862,14 +714,15 @@ async def test_direct_upload_batches_worker_file_pulls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', _FILE_TRANSFER_SIZE + 1)
-    content = b'a' * (_FILE_TRANSFER_SIZE - 1) + b'b'
+    content = b'a' * (2 * _FILE_BATCH_SIZE) + b'tail'
     movie = tmp_path / 'clip.mov'
     movie.write_bytes(content)
     audit = _FilesystemAudit(threading.get_ident())
     audit.install(monkeypatch)
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg, transport = _client([_text(encoded), _text(), _text('1:9 linked')])
+    sg, transport = async_file_client(
+        [failed_text_response(encoded), failed_text_response(), failed_text_response('1:9 linked')]
+    )
     events: list[object] = []
     sg.config.on_progress = events.append
 
@@ -881,15 +734,14 @@ async def test_direct_upload_batches_worker_file_pulls(
         if request.url == 'https://storage.example/object'
     )
     assert uploaded == content
-    assert len(audit.read_sizes) <= 21
-    assert audit.read_sizes == [_FILE_BATCH_SIZE] * 19 + [_FILE_FINAL_BATCH_SIZE]
+    assert audit.read_sizes == [_FILE_BATCH_SIZE, _FILE_BATCH_SIZE, 4]
     progress = [
         event
         for event in events
         if isinstance(event, ProgressEvent) and event.route == 'object_put'
     ]
-    assert progress[-1].bytes_transferred == _FILE_TRANSFER_SIZE
-    assert progress[-1].total_bytes == _FILE_TRANSFER_SIZE
+    assert progress[-1].bytes_transferred == len(content)
+    assert progress[-1].total_bytes == len(content)
 
 
 @pytest.mark.anyio
@@ -899,7 +751,9 @@ async def test_file_field_upload_rejects_invalid_path_after_write(
     method_name: str,
 ) -> None:
     missing = str(tmp_path / 'missing.png')
-    sg, transport = _client([_make_response({'type': 'Version', 'id': 5, 'code': 'v001'})])
+    sg, transport = async_file_client(
+        [make_response({'type': 'Version', 'id': 5, 'code': 'v001'})]
+    )
     data = {'code': 'v001', 'image': missing}
 
     async def write() -> object:
@@ -922,27 +776,26 @@ async def test_file_download_batches_worker_writes_and_publishes_atomically(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    content = b'a' * (_FILE_TRANSFER_SIZE - 1) + b'b'
+    content = b'a' * (2 * _FILE_BATCH_SIZE) + b'tail'
     releases: list[str] = []
     stream = _stream(
         (content,),
         'download',
         releases,
-        options=_StreamOptions(headers={'content-length': str(_FILE_TRANSFER_SIZE)}),
+        options=_StreamOptions(headers={'content-length': str(len(content))}),
     )
     destination = tmp_path / 'download.bin'
     destination.write_bytes(b'existing')
     audit = _FilesystemAudit(threading.get_ident())
     audit.install(monkeypatch)
-    sg, transport = _client([stream], session_token=_SESSION_VALUE)
+    sg, transport = async_file_client([stream], session_token=_SESSION_VALUE)
     events: list[object] = []
     sg.config.on_progress = events.append
 
     assert await sg.download_attachment(41, file_path=str(destination)) == str(destination)
 
     assert stream.requested_sizes == [_FILE_BATCH_SIZE]
-    assert len(audit.write_sizes) <= 21
-    assert audit.write_sizes == [_FILE_BATCH_SIZE] * 19 + [_FILE_FINAL_BATCH_SIZE]
+    assert audit.write_sizes == [_FILE_BATCH_SIZE, _FILE_BATCH_SIZE, 4]
     operations = [operation for operation, _thread_id in audit.observed]
     assert operations.count('close') == 1
     assert operations.count('replace') == 1
@@ -951,8 +804,8 @@ async def test_file_download_batches_worker_writes_and_publishes_atomically(
     progress = [
         event for event in events if isinstance(event, ProgressEvent) and event.route == 'download'
     ]
-    assert progress[-1].bytes_transferred == _FILE_TRANSFER_SIZE
-    assert progress[-1].total_bytes == _FILE_TRANSFER_SIZE
+    assert progress[-1].bytes_transferred == len(content)
+    assert progress[-1].total_bytes == len(content)
     assert releases == ['download']
     assert transport.leases == transport.checkins
 
@@ -967,7 +820,7 @@ async def test_file_download_progress_uses_response_content_length() -> None:
         releases,
         options=_StreamOptions(headers={'Content-Length': '4'}),
     )
-    sg, transport = _client([stream], session_token=_SESSION_VALUE)
+    sg, transport = async_file_client([stream], session_token=_SESSION_VALUE)
     sg.config.on_progress = events.append
 
     assert await sg.download_attachment(41) == b'DATA'
@@ -992,7 +845,7 @@ async def test_download_cancellation_closes_once_and_preserves_destination(
     destination.write_bytes(b'existing')
     audit = _FilesystemAudit(threading.get_ident())
     audit.install(monkeypatch)
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
             _stream(
                 (b'partial',),
@@ -1004,23 +857,35 @@ async def test_download_cancellation_closes_once_and_preserves_destination(
         session_token=_SESSION_VALUE,
     )
     operation = asyncio.create_task(sg.download_attachment(41, file_path=str(destination)))
-    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
 
-    operation.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await operation
+        operation.cancel()
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the cancellation watchdog'
+        with pytest.raises(asyncio.CancelledError):
+            await operation
 
-    close_threads = [thread_id for operation, thread_id in audit.observed if operation == 'close']
-    unlink_threads = [
-        thread_id for operation, thread_id in audit.observed if operation == 'unlink'
-    ]
-    assert len(close_threads) == len(unlink_threads) == 1
-    assert close_threads[0] != threading.get_ident()
-    assert unlink_threads[0] != threading.get_ident()
-    assert await asyncio.to_thread(destination.read_bytes) == b'existing'
-    assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
-    assert releases == ['blocked']
-    assert transport.leases == transport.checkins
+        close_threads = [
+            thread_id for operation, thread_id in audit.observed if operation == 'close'
+        ]
+        unlink_threads = [
+            thread_id for operation, thread_id in audit.observed if operation == 'unlink'
+        ]
+        assert len(close_threads) == len(unlink_threads) == 1
+        assert close_threads[0] != threading.get_ident()
+        assert unlink_threads[0] != threading.get_ident()
+        assert await asyncio.to_thread(destination.read_bytes) == b'existing'
+        assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
+        assert releases == ['blocked']
+        assert transport.leases == transport.checkins
+    finally:
+        blocker.set()
+        if not operation.done():
+            operation.cancel('test teardown')
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the teardown watchdog'
+        await asyncio.gather(operation, return_exceptions=True)
 
 
 @pytest.mark.anyio
@@ -1033,36 +898,48 @@ async def test_download_cancellation_during_cleanup_replaces_transfer_failure(
     barrier = _FilesystemBarrier('close', {'write': ValueError('write failed')})
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
     operation = asyncio.create_task(sg.download_attachment(41, file_path=str(destination)))
-    assert await asyncio.to_thread(barrier.started.wait, 5)
+    try:
+        assert await asyncio.to_thread(barrier.started.wait, 5)
 
-    operation.cancel('first cancellation')
-    for _ in range(5):
-        await asyncio.sleep(0)
-    operation.cancel('second cancellation')
-    barrier.release.set()
-    assert await asyncio.to_thread(barrier.after_release.wait, 5)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    joined_before_return = not operation.done()
-    barrier.finish.set()
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await operation
-    assert caught.value.args == ('first cancellation',)
-    assert await asyncio.to_thread(barrier.idle.wait, 5)
+        operation.cancel('first cancellation')
+        for _ in range(5):
+            await asyncio.sleep(0)
+        operation.cancel('second cancellation')
+        barrier.release.set()
+        assert await asyncio.to_thread(barrier.after_release.wait, 5)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        joined_before_return = not operation.done()
+        barrier.finish.set()
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the cancellation watchdog'
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await operation
+        assert caught.value.args == ('first cancellation',)
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
 
-    assert joined_before_return
-    assert barrier.active == 0
-    assert barrier.counts.get('close') == 1
-    assert barrier.counts.get('unlink') == 1
-    assert await asyncio.to_thread(destination.read_bytes) == b'existing'
-    assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
-    assert releases == ['download']
-    assert transport.leases == transport.checkins
+        assert joined_before_return
+        assert barrier.active == 0
+        assert barrier.counts.get('close') == 1
+        assert barrier.counts.get('unlink') == 1
+        assert await asyncio.to_thread(destination.read_bytes) == b'existing'
+        assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
+        assert releases == ['download']
+        assert transport.leases == transport.checkins
+    finally:
+        barrier.release.set()
+        barrier.finish.set()
+        if not operation.done():
+            operation.cancel('test teardown')
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the teardown watchdog'
+        await asyncio.gather(operation, return_exceptions=True)
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
 
 
 @pytest.mark.anyio
@@ -1087,39 +964,51 @@ async def test_download_cancellation_joins_each_filesystem_worker_before_return(
     barrier = _FilesystemBarrier(phase)
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
     operation = asyncio.create_task(sg.download_attachment(41, file_path=str(destination)))
-    assert await asyncio.to_thread(barrier.started.wait, 5)
+    try:
+        assert await asyncio.to_thread(barrier.started.wait, 5)
 
-    operation.cancel()
-    barrier.release.set()
-    assert await asyncio.to_thread(barrier.after_release.wait, 5)
-    for _ in range(5):
+        operation.cancel()
+        barrier.release.set()
+        assert await asyncio.to_thread(barrier.after_release.wait, 5)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        joined_before_return = not operation.done()
+        pre_finish_close_count = barrier.counts.get('close', 0)
+        pre_finish_unlink_count = barrier.counts.get('unlink', 0)
+        barrier.finish.set()
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the cancellation watchdog'
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
+
+        assert joined_before_return
+        assert pre_finish_close_count == (1 if phase in {'close', 'replace'} else 0)
+        assert pre_finish_unlink_count == 0
+        assert barrier.active == 0
+        assert barrier.counts.get('close') == 1
+        assert barrier.counts.get('unlink') == 1
+        assert await asyncio.to_thread(destination.read_bytes) == expected_content
+        assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
+        assert releases == ['download']
+        assert transport.leases == transport.checkins
+        settled_content = await asyncio.to_thread(destination.read_bytes)
         await asyncio.sleep(0)
-    joined_before_return = not operation.done()
-    pre_finish_close_count = barrier.counts.get('close', 0)
-    pre_finish_unlink_count = barrier.counts.get('unlink', 0)
-    barrier.finish.set()
-    with pytest.raises(asyncio.CancelledError):
-        await operation
-    assert await asyncio.to_thread(barrier.idle.wait, 5)
-
-    assert joined_before_return
-    assert pre_finish_close_count == (1 if phase in {'close', 'replace'} else 0)
-    assert pre_finish_unlink_count == 0
-    assert barrier.active == 0
-    assert barrier.counts.get('close') == 1
-    assert barrier.counts.get('unlink') == 1
-    assert await asyncio.to_thread(destination.read_bytes) == expected_content
-    assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
-    assert releases == ['download']
-    assert transport.leases == transport.checkins
-    settled_content = await asyncio.to_thread(destination.read_bytes)
-    await asyncio.sleep(0)
-    assert await asyncio.to_thread(destination.read_bytes) == settled_content
+        assert await asyncio.to_thread(destination.read_bytes) == settled_content
+    finally:
+        barrier.release.set()
+        barrier.finish.set()
+        if not operation.done():
+            operation.cancel('test teardown')
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the teardown watchdog'
+        await asyncio.gather(operation, return_exceptions=True)
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
 
 
 @pytest.mark.anyio
@@ -1132,25 +1021,37 @@ async def test_download_cancellation_remains_primary_when_joined_worker_fails(
     barrier = _FilesystemBarrier('write', {'write': ValueError('write failed')})
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
     operation = asyncio.create_task(sg.download_attachment(41, file_path=str(destination)))
-    assert await asyncio.to_thread(barrier.started.wait, 5)
+    try:
+        assert await asyncio.to_thread(barrier.started.wait, 5)
 
-    operation.cancel()
-    barrier.release.set()
-    assert await asyncio.to_thread(barrier.after_release.wait, 5)
-    barrier.finish.set()
-    with pytest.raises(asyncio.CancelledError):
-        await operation
+        operation.cancel()
+        barrier.release.set()
+        assert await asyncio.to_thread(barrier.after_release.wait, 5)
+        barrier.finish.set()
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the cancellation watchdog'
+        with pytest.raises(asyncio.CancelledError):
+            await operation
 
-    assert barrier.counts.get('close') == 1
-    assert barrier.counts.get('unlink') == 1
-    assert await asyncio.to_thread(destination.read_bytes) == b'existing'
-    assert releases == ['download']
-    assert transport.leases == transport.checkins
+        assert barrier.counts.get('close') == 1
+        assert barrier.counts.get('unlink') == 1
+        assert await asyncio.to_thread(destination.read_bytes) == b'existing'
+        assert releases == ['download']
+        assert transport.leases == transport.checkins
+    finally:
+        barrier.release.set()
+        barrier.finish.set()
+        if not operation.done():
+            operation.cancel('test teardown')
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the teardown watchdog'
+        await asyncio.gather(operation, return_exceptions=True)
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
 
 
 @pytest.mark.anyio
@@ -1169,25 +1070,37 @@ async def test_download_cancellation_survives_cleanup_failures(
     )
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
     operation = asyncio.create_task(sg.download_attachment(41, file_path=str(destination)))
-    assert await asyncio.to_thread(barrier.started.wait, 5)
+    try:
+        assert await asyncio.to_thread(barrier.started.wait, 5)
 
-    operation.cancel()
-    barrier.release.set()
-    assert await asyncio.to_thread(barrier.after_release.wait, 5)
-    barrier.finish.set()
-    with pytest.raises(asyncio.CancelledError):
-        await operation
+        operation.cancel()
+        barrier.release.set()
+        assert await asyncio.to_thread(barrier.after_release.wait, 5)
+        barrier.finish.set()
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the cancellation watchdog'
+        with pytest.raises(asyncio.CancelledError):
+            await operation
 
-    assert barrier.counts.get('close') == 1
-    assert barrier.counts.get('unlink') == 1
-    assert await asyncio.to_thread(destination.read_bytes) == b'existing'
-    assert releases == ['download']
-    assert transport.leases == transport.checkins
+        assert barrier.counts.get('close') == 1
+        assert barrier.counts.get('unlink') == 1
+        assert await asyncio.to_thread(destination.read_bytes) == b'existing'
+        assert releases == ['download']
+        assert transport.leases == transport.checkins
+    finally:
+        barrier.release.set()
+        barrier.finish.set()
+        if not operation.done():
+            operation.cancel('test teardown')
+        done, _ = await asyncio.wait({operation}, timeout=5)
+        assert done, 'download did not finish within the teardown watchdog'
+        await asyncio.gather(operation, return_exceptions=True)
+        assert await asyncio.to_thread(barrier.idle.wait, 5)
 
 
 @pytest.mark.anyio
@@ -1204,7 +1117,7 @@ async def test_download_cleanup_only_failure_is_publicly_redacted(
     )
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
@@ -1250,7 +1163,7 @@ async def test_download_close_failure_still_unlinks_temporary(
     )
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
@@ -1286,7 +1199,7 @@ async def test_download_close_failure_still_unlinks_temporary(
 @pytest.mark.anyio
 async def test_download_exhaustion_redacts_signed_url() -> None:
     signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
-    sg, _transport = _client(
+    sg, _transport = async_file_client(
         [SendError(signed_url), SendError(signed_url), SendError(signed_url)],
         server_info=None,
     )
@@ -1303,6 +1216,96 @@ async def test_download_exhaustion_redacts_signed_url() -> None:
 
 
 @pytest.mark.anyio
+async def test_download_destination_error_names_path_and_reason(tmp_path: Path) -> None:
+    destination = tmp_path / 'missing' / 'download.bin'
+    signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
+    releases: list[str] = []
+    sg, _transport = async_file_client(
+        [_stream((b'DATA',), 'download', releases)],
+        server_info=None,
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(_errors.ShotgunFileDownloadError) as caught:
+        await sg.download_attachment({'url': signed_url}, file_path=str(destination))
+
+    assert str(destination) in str(caught.value)
+    assert 'No such file or directory' in str(caught.value)
+    assert 'secret-value' not in str(caught.value)
+    assert releases == ['download']
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('phase', ['write', 'flush', 'replace'])
+async def test_download_destination_transfer_error_preserves_file_and_cleans_temporary(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / 'download.bin'
+    destination.write_bytes(b'existing')
+    reason = 'No space left on device'
+    barrier = _FilesystemBarrier(
+        None,
+        {phase: OSError(28, reason)} if phase != 'replace' else {},
+    )
+    barrier.install(monkeypatch)
+    if phase == 'replace':
+
+        def fail_replace(_source: Path, _target: Path) -> Path:
+            raise OSError(28, reason)
+
+        monkeypatch.setattr(Path, 'replace', fail_replace)
+
+    releases: list[str] = []
+    sg, transport = async_file_client(
+        [_stream((b'DATA',), 'download', releases)],
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(_errors.ShotgunFileDownloadError) as caught:
+        await sg.download_attachment(41, file_path=str(destination))
+
+    assert str(destination) in str(caught.value)
+    assert reason in str(caught.value)
+    assert barrier.counts.get('close') == 1
+    assert barrier.counts.get('unlink') == 1
+    assert await asyncio.to_thread(destination.read_bytes) == b'existing'
+    assert await asyncio.to_thread(lambda: list(tmp_path.iterdir())) == [destination]
+    assert releases == ['download']
+    assert transport.leases == transport.checkins
+
+
+@pytest.mark.anyio
+async def test_download_http_error_keeps_generic_message_with_destination(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / 'download.bin'
+    signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
+    releases: list[str] = []
+    sg, _transport = async_file_client(
+        [
+            _stream(
+                (),
+                'download',
+                releases,
+                options=_StreamOptions(status=404),
+            )
+        ],
+        server_info=None,
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(
+        _errors.ShotgunFileDownloadError,
+        match=r'^attachment download failed$',
+    ):
+        await sg.download_attachment({'url': signed_url}, file_path=str(destination))
+
+    assert releases == ['download']
+
+
+@pytest.mark.anyio
 async def test_download_first_transfer_cancellation_wins_during_cleanup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1314,7 +1317,7 @@ async def test_download_first_transfer_cancellation_wins_during_cleanup(
     barrier.install(monkeypatch)
     releases: list[str] = []
     started = asyncio.Event()
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
             _stream(
                 (b'DATA',),
@@ -1372,7 +1375,7 @@ async def test_download_first_transfer_cancellation_wins_during_cleanup(
 @pytest.mark.anyio
 async def test_download_off_origin_skips_readiness_token_and_cookie() -> None:
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'PAGE',), 'page', releases)],
         server_info=None,
     )
@@ -1407,7 +1410,7 @@ async def test_download_primary_failure_survives_cleanup_failures(
     )
     barrier.install(monkeypatch)
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
@@ -1433,9 +1436,9 @@ async def test_download_redirect_and_token_publication_use_one_origin_snapshot()
         if _method_name(request) == 'get_session_token':
             sg.config.set_server_params('https://new.example')
 
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _make_response({'session_id': 'old-origin-token'}),
+            make_response({'session_id': 'old-origin-token'}),
             _stream(
                 (),
                 'redirect',
@@ -1464,7 +1467,7 @@ async def test_download_redirect_and_token_publication_use_one_origin_snapshot()
 @pytest.mark.anyio
 async def test_download_retries_pre_send_and_retryable_status_from_byte_zero() -> None:
     releases: list[str] = []
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
             SendError('pre-send'),
             _stream((), 'unavailable', releases, options=_StreamOptions(status=503)),
@@ -1477,7 +1480,7 @@ async def test_download_retries_pre_send_and_retryable_status_from_byte_zero() -
 
     download_requests = transport.requests[1:]
     assert len(download_requests) == 3
-    assert len({request.token for request in download_requests}) == 3
+    assert len({id(request) for request in download_requests}) == 3
     assert {request.url for request in download_requests} == {
         'https://x.example/file_serve/attachment/41'
     }
@@ -1489,7 +1492,7 @@ async def test_download_retry_discards_memory_and_file_partial_attempts(
     tmp_path: Path,
 ) -> None:
     memory_releases: list[str] = []
-    memory, _memory_transport = _client(
+    memory, _memory_transport = async_file_client(
         [
             _stream(
                 (b'partial-', ReadTimeoutError('body stalled')),
@@ -1506,7 +1509,7 @@ async def test_download_retry_discards_memory_and_file_partial_attempts(
     file_releases: list[str] = []
     destination = tmp_path / 'download.bin'
     destination.write_bytes(b'existing')
-    file_client, _file_transport = _client(
+    file_client, _file_transport = async_file_client(
         [
             _stream(
                 (b'partial', ReadTimeoutError('body stalled')),
@@ -1538,7 +1541,7 @@ async def test_download_setup_preserves_domain_exception_type(
     code: int,
     expected: type[_errors.ShotgunError],
 ) -> None:
-    sg, _transport = _client([_fault_response(code)])
+    sg, _transport = async_file_client([_fault_response(code)])
 
     with pytest.raises(expected) as caught:
         await sg.download_attachment(41)
@@ -1548,8 +1551,8 @@ async def test_download_setup_preserves_domain_exception_type(
 
 @pytest.mark.anyio
 async def test_download_attachment_rejects_string_before_network() -> None:
-    sg, transport = _client([])
-    download = cast('Callable[..., Any]', sg.download_attachment)
+    sg, transport = async_file_client([])
+    download = cast('Callable[..., Awaitable[object]]', sg.download_attachment)
 
     with pytest.raises(TypeError, match=r'^attachment must be an id or dictionary$'):
         await download('/path/to/some/file.jpg')
@@ -1559,7 +1562,7 @@ async def test_download_attachment_rejects_string_before_network() -> None:
 
 @pytest.mark.anyio
 async def test_download_attachment_rejects_non_attachment_entity_before_network() -> None:
-    sg, transport = _client([])
+    sg, transport = async_file_client([])
 
     with pytest.raises(ValueError, match=r'^attachment dictionary must reference an Attachment$'):
         await sg.download_attachment({'id': 123, 'type': 'Shot'})
@@ -1569,8 +1572,8 @@ async def test_download_attachment_rejects_non_attachment_entity_before_network(
 
 @pytest.mark.anyio
 async def test_download_attachment_requires_reference_but_accepts_explicit_none() -> None:
-    sg, transport = _client([])
-    download = cast('Callable[..., Any]', sg.download_attachment)
+    sg, transport = async_file_client([])
+    download = cast('Callable[..., Awaitable[object]]', sg.download_attachment)
 
     with pytest.raises(TypeError, match=r'^attachment or attachment_id is required$'):
         await download()
@@ -1578,37 +1581,10 @@ async def test_download_attachment_requires_reference_but_accepts_explicit_none(
     assert transport.requests == []
 
 
-def test_file_method_descriptors_and_signatures_match_sync() -> None:
-    method_names = (
-        'download_attachment',
-        'get_attachment_download_url',
-        'get_auth_cookie_handler',
-        'share_thumbnail',
-        'upload',
-        'upload_filmstrip_thumbnail',
-        'upload_thumbnail',
-    )
-
-    for method_name in method_names:
-        sync_member = inspect.getattr_static(Shotgun, method_name)
-        async_member = inspect.getattr_static(AsyncShotgun, method_name)
-        assert type(async_member) is type(sync_member)
-        assert inspect.signature(async_member) == inspect.signature(sync_member)
-        assert inspect.iscoroutinefunction(async_member)
-
-
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     'method_name',
-    [
-        'upload',
-        'upload_image',
-        'upload_filmstrip',
-        'upload_thumbnail',
-        'upload_filmstrip_thumbnail',
-        'share_thumbnail',
-        'share_filmstrip',
-    ],
+    UPLOAD_METHOD_NAMES,
 )
 async def test_public_upload_refuses_legacy_form_before_upload_request(
     tmp_path: Path,
@@ -1616,7 +1592,7 @@ async def test_public_upload_refuses_legacy_form_before_upload_request(
 ) -> None:
     source = tmp_path / 'private-file.png'
     source.write_bytes(b'image')
-    sg, transport = _client([], server_info=_FORM_INFO)
+    sg, transport = async_file_client([], server_info=_FORM_INFO)
 
     async def invoke() -> None:
         if method_name.startswith('share_'):
@@ -1654,13 +1630,20 @@ async def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(
     small = tmp_path / 'small.mov'
     small.write_bytes(b'file-data')
     direct_allocation = '1 https://storage.example/object timestamp Attachment upload-1'
-    allocation, allocation_transport = _client([SendError('allocation'), _text('unused')])
+    allocation, allocation_transport = async_file_client(
+        [SendError('allocation'), failed_text_response('unused')]
+    )
     with pytest.raises(SendError, match='allocation'):
         await allocation.upload('Version', 5, str(small), field_name='sg_uploaded_movie')
     assert len(allocation_transport.requests) == 2
 
-    link, link_transport = _client(
-        [_text(direct_allocation), _text(), SendError('link'), _text('unused')]
+    link, link_transport = async_file_client(
+        [
+            failed_text_response(direct_allocation),
+            failed_text_response(),
+            SendError('link'),
+            failed_text_response('unused'),
+        ]
     )
     with pytest.raises(SendError, match='link'):
         await link.upload('Version', 5, str(small), field_name='sg_uploaded_movie')
@@ -1672,29 +1655,35 @@ async def test_unsafe_upload_endpoints_do_not_retry_ambiguous_send(
     multipart_allocation = (
         '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
     )
-    part_link, part_link_transport = _client(
-        [_text(multipart_allocation), SendError('part link'), _text('unused')]
+    part_link, part_link_transport = async_file_client(
+        [
+            failed_text_response(multipart_allocation),
+            SendError('part link'),
+            failed_text_response('unused'),
+        ]
     )
     with pytest.raises(SendError, match='part link'):
         await part_link.upload('Version', 5, str(large), field_name='sg_uploaded_movie')
     assert len(part_link_transport.requests) == 3
 
-    finalize, finalize_transport = _client(
+    finalize, finalize_transport = async_file_client(
         [
-            _text(multipart_allocation),
-            _text('1 https://storage.example/part-1'),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
+            failed_text_response(multipart_allocation),
+            failed_text_response('1 https://storage.example/part-1'),
+            failed_text_response(headers={'etag': 'etag-1'}),
+            failed_text_response('1 https://storage.example/part-2'),
+            failed_text_response(headers={'etag': 'etag-2'}),
             SendError('finalize'),
-            _text('unused'),
+            failed_text_response('unused'),
         ]
     )
     with pytest.raises(SendError, match='finalize'):
         await finalize.upload('Version', 5, str(large), field_name='sg_uploaded_movie')
     assert len(finalize_transport.requests) == 7
 
-    share, share_transport = _client([SendError('share'), _text('unused')])
+    share, share_transport = async_file_client(
+        [SendError('share'), failed_text_response('unused')]
+    )
     with pytest.raises(SendError, match='share'):
         await share.share_thumbnail(
             [{'type': 'Version', 'id': 2}],
@@ -1712,16 +1701,16 @@ async def test_multipart_upload_replays_parts_and_preserves_etag_order(
     movie = tmp_path / 'large.mov'
     movie.write_bytes(b'abcde')
     encoded = '1 https://storage.example/multipart timestamp Attachment upload-1 opaque'
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _text(encoded),
-            _text('1 https://storage.example/part-1'),
-            _PartialUploadFailure(SendError('ambiguous part PUT')),
-            _text(headers={'etag': 'etag-1'}),
-            _text('1 https://storage.example/part-2'),
-            _text(headers={'etag': 'etag-2'}),
-            _text('17'),
-            _text('1:84 large.mov'),
+            failed_text_response(encoded),
+            failed_text_response('1 https://storage.example/part-1'),
+            PartialUploadFailure(SendError('ambiguous part PUT')),
+            failed_text_response(headers={'etag': 'etag-1'}),
+            failed_text_response('1 https://storage.example/part-2'),
+            failed_text_response(headers={'etag': 'etag-2'}),
+            failed_text_response('17'),
+            failed_text_response('1:84 large.mov'),
         ]
     )
     sg.config.user_agents = ('upload-transcript',)
@@ -1750,59 +1739,59 @@ async def test_multipart_upload_replays_parts_and_preserves_etag_order(
         b'upload-1+opaque&script_name=script&script_key=key'
     )
     form_content_type = 'application/x-www-form-urlencoded'
-    assert _raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
+    assert raw_upload_transcript(transport.requests[1:], transport.bodies[1:]) == [
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_info',
-            _upload_headers(allocation_body, form_content_type),
+            upload_headers(allocation_body, form_content_type),
             allocation_body,
         ),
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_for_part',
-            _upload_headers(part_one_body, form_content_type),
+            upload_headers(part_one_body, form_content_type),
             part_one_body,
         ),
         (
             'PUT',
             'https://storage.example/part-1',
-            _upload_headers(b'abcd', 'application/octet-stream'),
+            upload_headers(b'abcd', 'application/octet-stream'),
             b'abcd',
         ),
         (
             'PUT',
             'https://storage.example/part-1',
-            _upload_headers(b'abcd', 'application/octet-stream'),
+            upload_headers(b'abcd', 'application/octet-stream'),
             b'abcd',
         ),
         (
             'POST',
             'https://x.example:443/upload/api_get_upload_link_for_part',
-            _upload_headers(part_two_body, form_content_type),
+            upload_headers(part_two_body, form_content_type),
             part_two_body,
         ),
         (
             'PUT',
             'https://storage.example/part-2',
-            _upload_headers(b'e', 'application/octet-stream'),
+            upload_headers(b'e', 'application/octet-stream'),
             b'e',
         ),
         (
             'POST',
             'https://x.example:443/upload/api_complete_multipart_upload',
-            _upload_headers(complete_body, form_content_type),
+            upload_headers(complete_body, form_content_type),
             complete_body,
         ),
         (
             'POST',
             'https://x.example:443/upload/api_link_file',
-            _upload_headers(link_body, form_content_type),
+            upload_headers(link_body, form_content_type),
             link_body,
         ),
     ]
     assert transport.bodies[3:5] == [b'abcd', b'abcd']
     assert transport.bodies[6] == b'e'
-    assert _form_fields(cast('bytes', transport.bodies[7]))['etags'] == 'etag-1,etag-2'
+    assert form_fields(cast('bytes', transport.bodies[7]))['etags'] == 'etag-1,etag-2'
 
 
 @pytest.mark.anyio
@@ -1814,10 +1803,10 @@ async def test_one_use_auth_direct_upload_exchanges_once_before_all_http(
     allocation = '1 https://storage.example/object timestamp Attachment upload-1'
     sg, transport = _one_use_client(
         [
-            _make_response({'session_id': _SESSION_VALUE}),
-            _text(allocation),
-            _text(),
-            _text('1:9 linked'),
+            make_response({'session_id': _SESSION_VALUE}),
+            failed_text_response(allocation),
+            failed_text_response(),
+            failed_text_response('1:9 linked'),
         ]
     )
 
@@ -1840,7 +1829,7 @@ async def test_one_use_auth_source_and_path_share_use_exchanged_session(
     tmp_path: Path,
 ) -> None:
     source, source_transport = _one_use_client(
-        [_make_response({'session_id': _SESSION_VALUE}), _text('1:31')]
+        [make_response({'session_id': _SESSION_VALUE}), failed_text_response('1:31')]
     )
     assert (
         await source.share_thumbnail(
@@ -1864,12 +1853,12 @@ async def test_one_use_auth_source_and_path_share_use_exchanged_session(
     }
     path, path_transport = _one_use_client(
         [
-            _make_response({'session_id': _SESSION_VALUE}),
-            _text(allocation),
-            _text(),
-            _text('1:41 image.jpg'),
-            _make_response(ready),
-            _text('1:42'),
+            make_response({'session_id': _SESSION_VALUE}),
+            failed_text_response(allocation),
+            failed_text_response(),
+            failed_text_response('1:41 image.jpg'),
+            make_response(ready),
+            failed_text_response('1:42'),
         ]
     )
     assert (
@@ -1897,7 +1886,7 @@ async def test_path_share_rejects_bind_error_before_one_use_exchange(
 ) -> None:
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
-    sg, transport = _one_use_client([_make_response({'session_id': _SESSION_VALUE})])
+    sg, transport = _one_use_client([make_response({'session_id': _SESSION_VALUE})])
 
     with pytest.raises(TypeError, match='unexpected'):
         await sg.share_thumbnail(
@@ -1915,7 +1904,7 @@ async def test_path_share_rejects_bind_error_before_one_use_exchange(
 async def test_path_share_rejects_missing_file_before_one_use_exchange(
     tmp_path: Path,
 ) -> None:
-    sg, transport = _one_use_client([_make_response({'session_id': _SESSION_VALUE})])
+    sg, transport = _one_use_client([make_response({'session_id': _SESSION_VALUE})])
 
     with pytest.raises(ShotgunError, match=r'^Path must be a valid file, got '):
         await sg.share_thumbnail(
@@ -1929,26 +1918,47 @@ async def test_path_share_rejects_missing_file_before_one_use_exchange(
 
 
 @pytest.mark.anyio
-async def test_share_thumbnail_rejects_duplicate_field_name_before_network(
+@pytest.mark.parametrize('filmstrip_thumbnail', [False, True], ids=['static', 'filmstrip'])
+async def test_share_thumbnail_large_local_path_uses_direct_route(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    filmstrip_thumbnail: bool,
 ) -> None:
-    image = tmp_path / 'image.jpg'
-    image.write_bytes(b'image')
-    sg, transport = _client([])
+    monkeypatch.setattr(_files, '_MULTIPART_CHUNK_SIZE', 4)
+    source = tmp_path / 'image.jpg'
+    source.write_bytes(b'image')
+    allocation = '1 https://storage.example/image timestamp Thumbnail upload-1'
+    sg, transport = async_file_client(
+        [
+            failed_text_response(allocation),
+            failed_text_response(),
+            failed_text_response('1:7 image.jpg'),
+        ]
+    )
 
-    with pytest.raises(TypeError, match='multiple values'):
-        await sg.share_thumbnail(
-            [{'type': 'Version', 'id': 2}],
-            thumbnail_path=str(image),
-            field_name='thumb_image',
+    with patch.object(sg, '_driver_lease', wraps=sg._driver_lease) as lease:
+        assert (
+            await sg.share_thumbnail(
+                [{'type': 'Version', 'id': 5}],
+                thumbnail_path=str(source),
+                filmstrip_thumbnail=filmstrip_thumbnail,
+            )
+            == 7
         )
-
-    assert transport.requests == []
+    lease.assert_called_once()
+    requests = transport.requests
+    assert [request.url for request in requests[1:]] == [
+        'https://x.example:443/upload/api_get_upload_link_info',
+        'https://storage.example/image',
+        'https://x.example:443/upload/api_link_file',
+    ]
+    assert isinstance(requests[1].body, bytes)
+    assert form_fields(requests[1].body)['multipart_upload'] == 'false'
 
 
 @pytest.mark.anyio
 async def test_share_thumbnail_source_and_path_workflows(tmp_path: Path) -> None:
-    source, source_transport = _client([_text('1:31')])
+    source, source_transport = async_file_client([failed_text_response('1:31')])
     source.config.user_agents = ('upload-transcript',)
     entities = [{'type': 'Version', 'id': 2}, {'type': 'Shot', 'id': 7}]
     assert (
@@ -1964,18 +1974,18 @@ async def test_share_thumbnail_source_and_path_workflows(tmp_path: Path) -> None
         b'entities=Version_2%2CShot_7&filmstrip_thumbnail=1&source_entity=Version_1&'
         b'script_name=script&script_key=key'
     )
-    assert _raw_upload_transcript(
+    assert raw_upload_transcript(
         source_transport.requests[1:],
         source_transport.bodies[1:],
     ) == [
         (
             'POST',
             'https://x.example:443/upload/share_thumbnail',
-            _upload_headers(source_body, 'application/x-www-form-urlencoded'),
+            upload_headers(source_body, 'application/x-www-form-urlencoded'),
             source_body,
         )
     ]
-    assert _form_fields(cast('bytes', source_transport.bodies[1])) == {
+    assert form_fields(cast('bytes', source_transport.bodies[1])) == {
         'entities': 'Version_2,Shot_7',
         'filmstrip_thumbnail': '1',
         'source_entity': 'Version_1',
@@ -2000,14 +2010,14 @@ async def test_share_thumbnail_source_and_path_workflows(tmp_path: Path) -> None
         'entities': [{'type': 'Version', 'id': 2, 'image': 'https://x.example/image/ready.jpg'}],
         'paging_info': {'entity_count': 1},
     }
-    path, path_transport = _client(
+    path, path_transport = async_file_client(
         [
-            _text(allocation),
-            _text(),
-            _text('1:41 image.jpg'),
-            _make_response(transient),
-            _make_response(ready),
-            _text('1:42'),
+            failed_text_response(allocation),
+            failed_text_response(),
+            failed_text_response('1:41 image.jpg'),
+            make_response(transient),
+            make_response(ready),
+            failed_text_response('1:42'),
         ]
     )
     assert (
@@ -2026,12 +2036,12 @@ async def test_share_thumbnail_source_and_path_workflows(tmp_path: Path) -> None
     )
     assert [_method_name(request) for request in path_transport.requests].count('read') == 2
     assert path_transport.requests[-1].url.endswith(_files.SHARE_THUMBNAIL)
-    assert _form_fields(cast('bytes', path_transport.bodies[-1]))['entities'] == 'Shot_7'
+    assert form_fields(cast('bytes', path_transport.bodies[-1]))['entities'] == 'Shot_7'
 
 
 @pytest.mark.anyio
 async def test_site_independent_attachment_urls_do_not_require_current_site() -> None:
-    sg, transport = _client([], server_info=None)
+    sg, transport = async_file_client([], server_info=None)
     sg.config.update_fields(server=None)
     external = {
         'link_type': 'web',
@@ -2065,7 +2075,7 @@ async def test_streamed_download_uses_captured_same_origin_cookie(
     )
     assert await sg.download_attachment(attachment_id=41) == b'DATA'
 
-    request = _fake_async_transport(sg).requests[1]
+    request = fake_async_transport(sg).requests[1]
     assert request.url == 'https://x.example/file_serve/attachment/41'
     assert request.headers['cookie'] == '_session_id=session-one'
 
@@ -2086,13 +2096,19 @@ async def test_thumbnail_wrappers_forward_kwargs(
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
     encoded = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg, transport = _client([_text(encoded), _text(), _text('1:7 image.jpg')])
-    method = cast('Callable[..., Any]', getattr(sg, method_name))
+    sg, transport = async_file_client(
+        [
+            failed_text_response(encoded),
+            failed_text_response(),
+            failed_text_response('1:7 image.jpg'),
+        ]
+    )
+    method = cast('Callable[..., Awaitable[object]]', getattr(sg, method_name))
 
     assert await method('Version', 5, str(image), display_name='Nice Image') == 7
 
-    assert _form_fields(cast('bytes', transport.bodies[1]))['upload_type'] == 'Thumbnail'
-    assert _form_fields(cast('bytes', transport.bodies[3])) == {
+    assert form_fields(cast('bytes', transport.bodies[1]))['upload_type'] == 'Thumbnail'
+    assert form_fields(cast('bytes', transport.bodies[3])) == {
         'entity_type': 'Version',
         'entity_id': '5',
         'display_name': 'Nice Image',
@@ -2107,14 +2123,14 @@ async def test_thumbnail_wrappers_forward_kwargs(
 async def test_update_uploads_file_fields_and_passes_none_through(tmp_path: Path) -> None:
     image = tmp_path / 'thumb.png'
     image.write_bytes(b'image')
-    sg, transport = _client(
+    sg, transport = async_file_client(
         [
-            _make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
-            _text('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
-            _text(),
-            _text('1:7 thumb.png'),
-            _read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
-            _make_response({'type': 'Version', 'id': 5, 'image': None}),
+            make_response({'type': 'Version', 'id': 5, 'description': 'new'}),
+            failed_text_response('1 https://storage.example/thumb timestamp Thumbnail upload-1'),
+            failed_text_response(),
+            failed_text_response('1:7 thumb.png'),
+            read_response({'type': 'Version', 'id': 5, 'image': _TRANSIENT_IMAGE}),
+            make_response({'type': 'Version', 'id': 5, 'image': None}),
         ]
     )
 
@@ -2150,12 +2166,18 @@ async def test_upload_display_thumbnail_fields_use_thumbnail_wire_protocol(
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
     encoded = '1 https://storage.example/image timestamp Thumbnail upload-1'
-    sg, transport = _client([_text(encoded), _text(), _text('1:7 image.jpg')])
+    sg, transport = async_file_client(
+        [
+            failed_text_response(encoded),
+            failed_text_response(),
+            failed_text_response('1:7 image.jpg'),
+        ]
+    )
 
     assert await sg.upload('Task', 5, str(image), field_name) == 7
 
-    assert _form_fields(cast('bytes', transport.bodies[1]))['upload_type'] == 'Thumbnail'
-    assert _form_fields(cast('bytes', transport.bodies[3])) == {
+    assert form_fields(cast('bytes', transport.bodies[1]))['upload_type'] == 'Thumbnail'
+    assert form_fields(cast('bytes', transport.bodies[3])) == {
         'entity_type': 'Task',
         'entity_id': '5',
         **expected_extra,
@@ -2169,8 +2191,8 @@ async def test_upload_display_thumbnail_fields_use_thumbnail_wire_protocol(
 async def test_upload_rejects_invalid_created_at_before_network(tmp_path: Path) -> None:
     image = tmp_path / 'image.jpg'
     image.write_bytes(b'image')
-    sg, transport = _client([])
-    upload = cast('Callable[..., Any]', sg.upload)
+    sg, transport = async_file_client([])
+    upload = cast('Callable[..., Awaitable[object]]', sg.upload)
 
     with pytest.raises(ShotgunError, match=r'^created_at must be a datetime\.datetime instance$'):
         await upload('Version', 5, str(image), created_at='2026-02-15T10:30:00Z')
@@ -2185,12 +2207,18 @@ async def test_upload_accepts_unicode_and_utf8_byte_paths(tmp_path: Path, byte_p
     source.write_bytes(b'image-data')
     path = str(source).encode('utf-8') if byte_path else str(source)
     encoded = '1 https://storage.example/object timestamp Attachment upload-1'
-    sg, transport = _client([_text(encoded), _text(), _text('1:42 linked')])
+    sg, transport = async_file_client(
+        [
+            failed_text_response(encoded),
+            failed_text_response(),
+            failed_text_response('1:42 linked'),
+        ]
+    )
 
     assert await sg.upload('Version', 5, path, 'sg_uploaded_movie') == 42
 
     assert transport.bodies[2] == b'image-data'
-    assert _form_fields(cast('bytes', transport.bodies[1]))['filename'] == source.name
+    assert form_fields(cast('bytes', transport.bodies[1]))['filename'] == source.name
 
 
 @pytest.mark.anyio
@@ -2203,11 +2231,17 @@ async def test_upload_and_download_filesystem_work_runs_off_loop(
     movie = tmp_path / 'clip.mov'
     await asyncio.to_thread(movie.write_bytes, b'clip')
     allocation = '1 https://storage.example/object timestamp Attachment upload-1'
-    uploader, _upload_transport = _client([_text(allocation), _text(), _text('1:9 linked')])
+    uploader, _upload_transport = async_file_client(
+        [
+            failed_text_response(allocation),
+            failed_text_response(),
+            failed_text_response('1:9 linked'),
+        ]
+    )
     assert await uploader.upload('Version', 5, str(movie), field_name='sg_uploaded_movie') == 9
 
     releases: list[str] = []
-    downloader, _download_transport = _client(
+    downloader, _download_transport = async_file_client(
         [_stream((b'DATA',), 'download', releases)],
         session_token=_SESSION_VALUE,
     )
@@ -2215,3 +2249,38 @@ async def test_upload_and_download_filesystem_work_runs_off_loop(
     assert await downloader.download_attachment(41, file_path=str(destination)) == str(destination)
     assert await asyncio.to_thread(destination.read_bytes) == b'DATA'
     audit.assert_complete()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('keyword', ['field_name', 'display_naem'])
+async def test_share_thumbnail_path_errors_name_share_thumbnail(
+    tmp_path: Path,
+    keyword: str,
+) -> None:
+    image = tmp_path / 'image.jpg'
+    image.write_bytes(b'image')
+    sg, transport = async_file_client([])
+    share_thumbnail = cast('Callable[..., Coroutine[object, object, object]]', sg.share_thumbnail)
+    with pytest.raises(TypeError) as caught:
+        await share_thumbnail(
+            [{'type': 'Version', 'id': 2}],
+            thumbnail_path=str(image),
+            **{keyword: 'value'},
+        )
+    assert 'AsyncShotgun.share_thumbnail()' in str(caught.value)
+    assert keyword in str(caught.value)
+    assert transport.requests == []
+
+
+@pytest.mark.anyio
+async def test_share_thumbnail_source_entity_ignores_keywords() -> None:
+    sg, _transport = async_file_client([failed_text_response('1:31')])
+    assert (
+        await sg.share_thumbnail(
+            [{'type': 'Version', 'id': 2}],
+            source_entity={'type': 'Version', 'id': 1},
+            field_name='ignored',
+            display_naem=object(),
+        )
+        == 31
+    )

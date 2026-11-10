@@ -14,11 +14,13 @@ from shotgun_api3._transport import (
 
 if TYPE_CHECKING:
     import asyncio
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Iterator, Sequence
 
 
-class _AsyncFakeTransport:  # pyright: ignore[reportUnusedClass]
-    def __init__(self, responses: list[TransportResponse | TransportError]) -> None:
+class AsyncFakeTransport:
+    def __init__(
+        self, responses: Sequence[TransportResponse | AsyncStreamingResponse | TransportError]
+    ) -> None:
         self._responses = list(responses)
         self._reserved_tasks: set[asyncio.Task[object]] = set()
         self.requests: list[TransportRequest] = []
@@ -27,10 +29,12 @@ class _AsyncFakeTransport:  # pyright: ignore[reportUnusedClass]
         self.reservation_releases = 0
         self.reservations = 0
 
-    def _next_response(self, request: TransportRequest) -> TransportResponse:
+    def _next_response(
+        self, request: TransportRequest
+    ) -> TransportResponse | AsyncStreamingResponse:
         self.requests.append(request)
         if not self._responses:
-            raise AssertionError('_AsyncFakeTransport responses exhausted')
+            raise AssertionError('AsyncFakeTransport responses exhausted')
         response = self._responses.pop(0)
         if isinstance(response, TransportError):
             raise response
@@ -59,13 +63,17 @@ class _AsyncFakeTransport:  # pyright: ignore[reportUnusedClass]
         task.add_done_callback(self._release_reservation)
 
     async def send(self, request: TransportRequest) -> TransportResponse:
-        return self._next_response(request)
+        response = self._next_response(request)
+        assert isinstance(response, TransportResponse)
+        return response
 
     async def send_streaming(
         self,
         request: TransportRequest,
     ) -> AsyncStreamingResponse:
         response = self._next_response(request)
+        if isinstance(response, AsyncStreamingResponse):
+            return response
 
         async def stream(size: int) -> AsyncIterator[bytes]:
             for offset in range(0, len(response.content), size):
@@ -84,7 +92,7 @@ class _AsyncFakeTransport:  # pyright: ignore[reportUnusedClass]
 
 
 @dataclass
-class _FakeTransport:
+class FakeTransport:
     _responses: list[TransportResponse | TransportError] = field(init=False, repr=False)
     requests: list[TransportRequest] = field(init=False)
     _lock: threading.Lock = field(init=False, repr=False)
@@ -98,14 +106,11 @@ class _FakeTransport:
         with self._lock:
             self.requests.append(request)
             if not self._responses:
-                raise AssertionError('_FakeTransport responses exhausted')
+                raise AssertionError('FakeTransport responses exhausted')
             response = self._responses.pop(0)
         if isinstance(response, TransportError):
             raise response
         return response
-
-    def abort(self, token: str) -> None:
-        del token
 
     def close(self) -> None:
         pass

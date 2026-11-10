@@ -28,7 +28,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeVar, cast, overload
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
@@ -47,34 +47,63 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 _AUTHENTICATION_ERROR_CODE = 102
-_CAPTURE_SPECS: Mapping[
-    str,
-    tuple[str, Literal['script', 'session'], Literal['success', 'fault']],
-] = {
-    'activity_stream_read': ('activity_stream', 'script', 'success'),
-    'batch': ('batch', 'script', 'success'),
-    'create': ('create', 'script', 'success'),
-    'fault_bad_auth': ('read', 'session', 'fault'),
-    'following': ('following', 'script', 'success'),
-    'get_session_token': ('get_session_token', 'script', 'success'),
-    'info': ('info', 'script', 'success'),
-    'nav_expand': ('nav_expand', 'script', 'success'),
-    'nav_search_entity': ('nav_search', 'script', 'success'),
-    'nav_search_string': ('nav_search', 'script', 'success'),
-    'note_thread_read': ('note_thread_contents', 'script', 'success'),
-    'preferences_read': ('preferences_read', 'script', 'success'),
-    'read': ('read', 'script', 'success'),
-    'schema_entity_read': ('schema_entity_read', 'script', 'success'),
-    'schema_read': ('schema_read', 'script', 'success'),
-    'summarize': ('summarize', 'script', 'success'),
-    'text_search': ('query_display_name_cache', 'script', 'success'),
-    'update_project_last_accessed': (
-        'update_project_last_accessed_by_current_user',
-        'script',
-        'success',
-    ),
-    'user_subscriptions_read': ('user_subscriptions_read', 'script', 'success'),
-    'work_schedule_read': ('work_schedule_read', 'script', 'success'),
+_CAPTURE_SPECS: Mapping[str, _CaptureSpecFields] = {
+    'activity_stream_read': {
+        'rpc_method': 'activity_stream',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'batch': {'rpc_method': 'batch', 'auth_mode': 'script', 'outcome': 'success'},
+    'create': {'rpc_method': 'create', 'auth_mode': 'script', 'outcome': 'success'},
+    'fault_bad_auth': {'rpc_method': 'read', 'auth_mode': 'session', 'outcome': 'fault'},
+    'following': {'rpc_method': 'following', 'auth_mode': 'script', 'outcome': 'success'},
+    'get_session_token': {
+        'rpc_method': 'get_session_token',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'info': {'rpc_method': 'info', 'auth_mode': 'script', 'outcome': 'success'},
+    'nav_expand': {'rpc_method': 'nav_expand', 'auth_mode': 'script', 'outcome': 'success'},
+    'nav_search_entity': {'rpc_method': 'nav_search', 'auth_mode': 'script', 'outcome': 'success'},
+    'nav_search_string': {'rpc_method': 'nav_search', 'auth_mode': 'script', 'outcome': 'success'},
+    'note_thread_read': {
+        'rpc_method': 'note_thread_contents',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'preferences_read': {
+        'rpc_method': 'preferences_read',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'read': {'rpc_method': 'read', 'auth_mode': 'script', 'outcome': 'success'},
+    'schema_entity_read': {
+        'rpc_method': 'schema_entity_read',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'schema_read': {'rpc_method': 'schema_read', 'auth_mode': 'script', 'outcome': 'success'},
+    'summarize': {'rpc_method': 'summarize', 'auth_mode': 'script', 'outcome': 'success'},
+    'text_search': {
+        'rpc_method': 'query_display_name_cache',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'update_project_last_accessed': {
+        'rpc_method': 'update_project_last_accessed_by_current_user',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'user_subscriptions_read': {
+        'rpc_method': 'user_subscriptions_read',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
+    'work_schedule_read': {
+        'rpc_method': 'work_schedule_read',
+        'auth_mode': 'script',
+        'outcome': 'success',
+    },
 }
 _COMMON_SENSITIVE_KEYS = frozenset(
     {
@@ -115,6 +144,14 @@ _SENSITIVE_SUFFIXES = ('_cookie', '_key', '_password', '_secret', '_token')
 _T = TypeVar('_T')
 _WORK_SCHEDULE_DAY_COUNT = 5
 _WORK_SCHEDULE_WEEKDAY_END = 10
+
+
+class _CaptureSpecFields(TypedDict):
+    """Describe the named fields of a required RPC capture."""
+
+    rpc_method: str
+    auth_mode: Literal['script', 'session']
+    outcome: Literal['success', 'fault']
 
 
 @dataclass(frozen=True)
@@ -172,17 +209,6 @@ class _RecordingTransport:
         self._secrets = {category: secret for category, secret in secrets.items() if secret}
         self.records: dict[str, dict[str, object]] = {}
 
-    def _add_secret(self, category: str, secret: str) -> None:
-        """Register a credential and resanitize previously recorded responses."""
-        if not secret:
-            return
-        self._secrets[category] = secret
-        for label, raw_content in self._raw_response_content.items():
-            raw_record = copy.deepcopy(self.records[label])
-            response = cast('dict[str, object]', raw_record['response'])
-            response['content_b64'] = base64.b64encode(raw_content).decode('ascii')
-            self.records[label] = _normalize_fixture_record(raw_record, self._secrets)
-
     def _record(
         self,
         spec: _CaptureSpec,
@@ -224,9 +250,47 @@ class _RecordingTransport:
             f'{spec.label} did not capture exactly one exchange; captured {self._matched}'
         )
 
+    def add_secret(self, category: str, secret: str) -> None:
+        """Register a credential and resanitize previously recorded responses.
+
+        Args:
+            category: Credential category used during fixture normalization.
+            secret: Value to redact; an empty value leaves the records
+                unchanged.
+
+        Raises:
+            ValueError: If a recorded exchange cannot be normalized.
+            RuntimeError: If a normalized record retains forbidden secret
+                bytes.
+        """
+        if not secret:
+            return
+        self._secrets[category] = secret
+        for label, raw_content in self._raw_response_content.items():
+            raw_record = copy.deepcopy(self.records[label])
+            response = cast('dict[str, object]', raw_record['response'])
+            response['content_b64'] = base64.b64encode(raw_content).decode('ascii')
+            self.records[label] = _normalize_fixture_record(raw_record, self._secrets)
+
     @contextmanager
-    def _capture(self, spec: _CaptureSpec) -> Generator[None, None, None]:
-        """Require exactly one exchange matching `spec` in the context."""
+    def capture(self, spec: _CaptureSpec) -> Generator[None, None, None]:
+        """Require exactly one exchange matching `spec` in the context.
+
+        Args:
+            spec: Expected label and RPC method for the wrapped operation.
+
+        Yields:
+            Control to the wrapped client operation.
+
+        Raises:
+            RuntimeError: If captures overlap, the label repeats, the operation
+                produces other than one matching exchange, or a normalized
+                record retains forbidden secret bytes.
+            ValueError: If the captured exchange cannot be normalized.
+            BaseExceptionGroup: If the operation and capture both fail; the
+                group retains the original operation exception.
+            Exception: If the wrapped operation fails and capture succeeds.
+        """
         if self._active is not None:
             raise _ProbeError('capture contexts cannot overlap')
         if spec.label in self.records:
@@ -258,16 +322,12 @@ class _RecordingTransport:
             if failures:
                 raise failures[0]
 
-    def abort(self, token: str) -> None:
-        """Abort one delegated in-flight request.
-
-        Args:
-            token: Request token identifying the in-flight exchange.
-        """
-        self._inner.abort(token)
-
     def close(self) -> None:
-        """Close the delegated transport."""
+        """Close the delegated transport.
+
+        Raises:
+            Exception: If delegated transport cleanup fails.
+        """
         self._inner.close()
 
     def send(self, request: TransportRequest) -> TransportResponse:
@@ -280,7 +340,7 @@ class _RecordingTransport:
             The delegated response unchanged.
 
         Raises:
-            _ProbeError: If a labeled request is malformed or duplicated.
+            RuntimeError: If a labeled request is malformed or duplicated.
             TransportError: If the delegated transport fails.
         """
         response = self._inner.send(request)
@@ -306,7 +366,7 @@ class _RecordingTransport:
             The delegated streaming response.
 
         Raises:
-            _ProbeError: If an RPC fixture capture is active.
+            RuntimeError: If an RPC fixture capture is active.
             TransportError: If the delegated transport fails.
         """
         if self._active is not None:
@@ -356,7 +416,7 @@ class _ResourceRegistry:
         """Initialize an empty creation-order resource list."""
         self._resources: list[tuple[str, int]] = []
 
-    def _cleanup(self, client: _CleanupClient) -> list[BaseException]:
+    def cleanup(self, client: _CleanupClient) -> list[BaseException]:
         """Delete and verify all tracked resources while collecting every failure."""
         failures: list[BaseException] = []
         for entity_type, entity_id in reversed(self._resources):
@@ -372,20 +432,28 @@ class _ResourceRegistry:
                     raise _ProbeError(f'cleanup left active {entity_type}')
         return failures
 
-    def _track(self, entity_type: str, entity_id: int) -> None:
-        """Track one created entity or attachment."""
+    def track(self, entity_type: str, entity_id: int) -> None:
+        """Track one created entity or attachment.
+
+        Args:
+            entity_type: Nonempty entity type.
+            entity_id: Positive integer identifier, excluding booleans.
+
+        Raises:
+            RuntimeError: If either part of the identity is malformed.
+        """
         if not entity_type or isinstance(entity_id, bool) or entity_id <= 0:
             raise _ProbeError('created resource identity is malformed')
         self._resources.append((entity_type, entity_id))
 
 
 def _capture_spec(label: str) -> _CaptureSpec:
-    """Build one immutable capture spec from the required inventory."""
+    """Return one immutable capture spec from the required inventory."""
     try:
-        rpc_method, auth_mode, outcome = _CAPTURE_SPECS[label]
+        spec = _CAPTURE_SPECS[label]
     except KeyError:
         raise _ProbeError(f'unknown capture label {label}') from None
-    return _CaptureSpec(label, rpc_method, auth_mode, outcome)
+    return _CaptureSpec(label, spec['rpc_method'], spec['auth_mode'], spec['outcome'])
 
 
 def _capture_call(
@@ -394,7 +462,7 @@ def _capture_call(
     call: Callable[[], _T],
 ) -> _T:
     """Capture exactly one labeled public client call."""
-    with recorder._capture(_capture_spec(label)):  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with recorder.capture(_capture_spec(label)):
         return call()
 
 
@@ -476,7 +544,7 @@ def _capture_bad_auth(client: Shotgun, recorder: _RecordingTransport) -> None:
     """Capture the exact authentication fault from an isolated session client."""
     authentication_fault, fault = _load_error_classes()
     try:
-        with recorder._capture(_capture_spec('fault_bad_auth')):  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        with recorder.capture(_capture_spec('fault_bad_auth')):
             client.find_one('Project', [], ['id'])
     except authentication_fault:
         return
@@ -511,7 +579,7 @@ def _make_recording_client(
         _load_transport_class()(ca_certs=os.environ.get('SHOTGUN_API_CACERTS') or None),
         secrets,
     )
-    client._transport = recorder  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]  # White-box fixture capture owns this transport.
+    client.transport = recorder
     return client, recorder
 
 
@@ -560,6 +628,28 @@ def _normalization_dict(
     if any(not isinstance(key, str) for key in mapping) or frozenset(mapping) != frozenset(keys):
         raise _normalization_error(operation, rule)
     return cast('dict[str, object]', mapping)
+
+
+def _nav_search_request(operation: str, tail: list[object]) -> dict[str, object]:
+    """Validate the common navigation request."""
+    request = _normalization_dict(
+        operation,
+        tail[0],
+        {'root_path', 'search_criteria', 'seed_entity_field'},
+        'nav search request',
+    )
+    if not isinstance(request['root_path'], str) or not request['root_path'].startswith('/'):
+        raise _normalization_error(operation, 'nav search root')
+    if (
+        not isinstance(request['seed_entity_field'], str)
+        or re.fullmatch(
+            r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
+            request['seed_entity_field'],
+        )
+        is None
+    ):
+        raise _normalization_error(operation, 'nav search seed')
+    return request
 
 
 def _normalization_exact(
@@ -686,7 +776,7 @@ def _normalization_params(
     tail_length: int,
 ) -> tuple[list[object], list[object]]:
     """Validate authentication parameters and return raw and normalized tails."""
-    _rpc_method, auth_mode, _outcome = _CAPTURE_SPECS[operation]
+    auth_mode = _CAPTURE_SPECS[operation]['auth_mode']
     auth_length = 0 if operation == 'info' else 1
     params = _normalization_list(
         operation,
@@ -749,7 +839,8 @@ def _normalization_parts(
         {'auth_mode', 'operation', 'outcome', 'request', 'response', 'schema_version'},
         'record shape',
     )
-    rpc_method, auth_mode, outcome_kind = _CAPTURE_SPECS[operation]
+    spec = _CAPTURE_SPECS[operation]
+    rpc_method, auth_mode, outcome_kind = (spec['rpc_method'], spec['auth_mode'], spec['outcome'])
     _normalization_exact(operation, record['schema_version'], _SCHEMA_VERSION, 'schema version')
     _normalization_exact(operation, record['operation'], operation, 'operation label')
     _normalization_exact(operation, record['auth_mode'], auth_mode, 'auth mode')
@@ -1049,7 +1140,8 @@ def _normalized_record(
     response_content: object,
 ) -> dict[str, object]:
     """Build one deterministic complete record before independent controls."""
-    rpc_method, auth_mode, outcome_kind = _CAPTURE_SPECS[operation]
+    spec = _CAPTURE_SPECS[operation]
+    rpc_method, auth_mode, outcome_kind = (spec['rpc_method'], spec['auth_mode'], spec['outcome'])
     outcome: dict[str, object] = {'kind': outcome_kind}
     if outcome_kind == 'fault':
         outcome['exception'] = 'AuthenticationFault'
@@ -1400,23 +1492,7 @@ def _normalize_nav_search_entity(value: Mapping[str, object]) -> dict[str, objec
     operation = 'nav_search_entity'
     body, response = _normalization_parts(value, operation, direct=True)
     tail, params = _normalization_params(operation, body, 1)
-    request = _normalization_dict(
-        operation,
-        tail[0],
-        {'root_path', 'search_criteria', 'seed_entity_field'},
-        'nav search request',
-    )
-    if not isinstance(request['root_path'], str) or not request['root_path'].startswith('/'):
-        raise _normalization_error(operation, 'nav search root')
-    if (
-        not isinstance(request['seed_entity_field'], str)
-        or re.fullmatch(
-            r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
-            request['seed_entity_field'],
-        )
-        is None
-    ):
-        raise _normalization_error(operation, 'nav search seed')
+    request = _nav_search_request(operation, tail)
     criteria = _normalization_dict(
         operation, request['search_criteria'], {'entity'}, 'nav search criteria'
     )
@@ -1441,23 +1517,7 @@ def _normalize_nav_search_string(value: Mapping[str, object]) -> dict[str, objec
     operation = 'nav_search_string'
     body, response = _normalization_parts(value, operation, direct=True)
     tail, params = _normalization_params(operation, body, 1)
-    request = _normalization_dict(
-        operation,
-        tail[0],
-        {'root_path', 'search_criteria', 'seed_entity_field'},
-        'nav search request',
-    )
-    if not isinstance(request['root_path'], str) or not request['root_path'].startswith('/'):
-        raise _normalization_error(operation, 'nav search root')
-    if (
-        not isinstance(request['seed_entity_field'], str)
-        or re.fullmatch(
-            r'[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*',
-            request['seed_entity_field'],
-        )
-        is None
-    ):
-        raise _normalization_error(operation, 'nav search seed')
+    request = _nav_search_request(operation, tail)
     criteria = _normalization_dict(
         operation, request['search_criteria'], {'search_string'}, 'nav search criteria'
     )
@@ -1979,7 +2039,7 @@ def _run_guarded(
         result = operation()
     finally:
         primary = sys.exception()
-        failures = ([primary] if primary is not None else []) + resources._cleanup(cleanup_client)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        failures = ([primary] if primary is not None else []) + resources.cleanup(cleanup_client)
         for client in clients:
             with _FailureCollector(failures):
                 client.close()
@@ -2019,7 +2079,7 @@ def _run_live_operations(
             {'subject': run_name, 'project': project},
         )
         note = _require_entity(result, 'Note')
-        resources._track('Note', cast('int', note['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        resources.track('Note', cast('int', note['id']))
         return result
 
     note = _require_entity(_capture_call(recorder, 'create', create_note), 'Note')
@@ -2068,14 +2128,14 @@ def _run_live_operations(
         if len(batch_results) != 1:
             raise _ProbeError('batch capture did not create exactly one entity')
         batch_note = _require_entity(batch_results[0], 'Note')
-        resources._track('Note', cast('int', batch_note['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        resources.track('Note', cast('int', batch_note['id']))
         return batch_results
 
     _capture_call(recorder, 'batch', create_batch_note)
     project_expansion = client.nav_expand(f'/Project/{project["id"]}')
     project_path = _project_nav_path(project_expansion)
     reply = _require_entity(client.create('Reply', {'entity': note, 'content': run_name}), 'Reply')
-    resources._track('Reply', cast('int', reply['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    resources.track('Reply', cast('int', reply['id']))
     _capture_call(
         recorder,
         'note_thread_read',
@@ -2085,7 +2145,7 @@ def _run_live_operations(
     asset = _require_entity(
         client.create('Asset', {'code': run_name, 'project': project}), 'Asset'
     )
-    resources._track('Asset', cast('int', asset['id']))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    resources.track('Asset', cast('int', asset['id']))
     _capture_call(
         recorder,
         'nav_search_string',
@@ -2099,31 +2159,10 @@ def _run_live_operations(
     _capture_call(recorder, 'user_subscriptions_read', client.user_subscriptions_read)
     session_token = _capture_call(recorder, 'get_session_token', client.get_session_token)
     secrets['session_token'] = session_token
-    recorder._add_secret('session_token', session_token)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    bad_recorder._add_secret('session_token', session_token)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    recorder.add_secret('session_token', session_token)
+    bad_recorder.add_secret('session_token', session_token)
     _capture_bad_auth(bad_client, bad_recorder)
     return [*recorder.records.values(), *bad_recorder.records.values()]
-
-
-def _sanitize(value: object, secrets: Collection[str]) -> object:
-    """Recursively redact common sensitive keys and configured secret values."""
-    if isinstance(value, dict):
-        sanitized: dict[object, object] = {}
-        for key, item in cast('dict[object, object]', value).items():
-            sanitized[key] = _REDACTED if _is_sensitive_key(key) else _sanitize(item, secrets)
-        return sanitized
-    if isinstance(value, list):
-        return [_sanitize(item, secrets) for item in cast('list[object]', value)]
-    if isinstance(value, tuple):
-        return tuple(_sanitize(item, secrets) for item in cast('tuple[object, ...]', value))
-    if isinstance(value, str):
-        return _redact_text(value, secrets)
-    if isinstance(value, bytes):
-        sanitized_bytes = value
-        for secret in sorted((item for item in secrets if item), key=len, reverse=True):
-            sanitized_bytes = sanitized_bytes.replace(secret.encode(), _REDACTED.encode())
-        return sanitized_bytes
-    return value
 
 
 def _select_headers(
@@ -2151,13 +2190,12 @@ def _validate_operation_contract(
     body: Mapping[str, object],
 ) -> None:
     """Validate operation-specific RPC, auth, and outcome metadata."""
-    spec_tuple = _CAPTURE_SPECS.get(operation)
-    if spec_tuple is None:
+    spec = _CAPTURE_SPECS.get(operation)
+    if spec is None:
         return
-    rpc_method, expected_auth, expected_outcome = spec_tuple
-    if body['method_name'] != rpc_method:
+    if body['method_name'] != spec['rpc_method']:
         raise _FixtureError('fixture request RPC does not match its operation')
-    if auth_mode != expected_auth or kind != expected_outcome:
+    if auth_mode != spec['auth_mode'] or kind != spec['outcome']:
         raise _FixtureError('fixture auth or outcome does not match its operation')
 
 
@@ -2434,18 +2472,8 @@ def _write_fixture_directory(
             shutil.rmtree(staging)
 
 
-def main() -> int:
-    """Capture, sanitize, validate, and publish the full live fixture inventory.
-
-    Returns:
-        Process exit status zero after successful capture, cleanup, and
-        publication.
-
-    Raises:
-        KeyError: If a required `SG_TEST_*` environment variable is absent.
-        BaseException: If capture, cleanup, close, validation, or publication
-            fails.
-    """
+def _main() -> int:
+    """Capture, sanitize, validate, and publish the full live fixture inventory."""
     site = os.environ['SG_TEST_SITE']
     script_name = os.environ['SG_TEST_SCRIPT']
     api_key = os.environ['SG_TEST_KEY']
@@ -2464,4 +2492,4 @@ def main() -> int:
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(_main())

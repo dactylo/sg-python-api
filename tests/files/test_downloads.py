@@ -1,10 +1,11 @@
 import dataclasses
+import errno
 import json
 import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Never, ParamSpec, Self, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, BinaryIO, ParamSpec, Self, TypeAlias, cast
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +14,6 @@ from shotgun_api3 import _errors, _files
 from shotgun_api3._client import Shotgun
 from shotgun_api3._config import ProgressEvent
 from shotgun_api3._transport import (
-    AbortedError,
     CaseInsensitiveHeaders,
     ConnectError,
     ReadTimeoutError,
@@ -23,13 +23,17 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _FakeTransport
-from tests.conftest import _fake_transport, _make_response
+from tests._exceptions import call_inside_except
+from tests._origin_cases import (
+    ALLOWED_ORIGIN_CASES,
+    REJECTED_ORIGIN_CASES,
+)
+from tests._transports import FakeTransport
+from tests.conftest import fake_transport, make_response
 
 if TYPE_CHECKING:
-    from shotgun_api3._config import ObserverEvent
+    from shotgun_api3._config import _ObserverEvent
 
-_AmbientResult = TypeVar('_AmbientResult')
 _CallParams = ParamSpec('_CallParams')
 _StreamItem: TypeAlias = bytes | TransportError
 _NEW_ORIGIN_API_KEY = 'new-origin-key'
@@ -62,6 +66,13 @@ class _CleanupFile:
         if error is not None:
             raise error
 
+    def flush(self) -> None:
+        self._calls.append('flush')
+        error = self._errors.get('flush')
+        if error is not None:
+            raise error
+        self._handle.flush()
+
     @property
     def name(self) -> str:
         return cast('str', self._handle.name)
@@ -84,7 +95,7 @@ class _StreamScript:
     reason: str = 'OK'
 
 
-class _DownloadTransport(_FakeTransport):
+class _DownloadTransport(FakeTransport):
     def __init__(
         self,
         responses: list[TransportResponse | TransportError | _StreamScript],
@@ -165,7 +176,7 @@ def _download_client(
         http_proxy=http_proxy,
         connect=False,
     )
-    sg._transport = _DownloadTransport(responses, on_send)
+    sg.transport = _DownloadTransport(responses, on_send)
     sg.config.rpc_attempt_interval = 0
     return sg
 
@@ -209,17 +220,6 @@ def _install_cleanup_failures(
         _cleanup_file_factory(original_named_temporary, calls, errors),
     )
     monkeypatch.setattr(Path, 'unlink', unlink)
-
-
-def _raise_ambient_exception() -> Never:
-    raise RuntimeError('ambient exception state')
-
-
-def _call_inside_except(function: Callable[[], _AmbientResult]) -> _AmbientResult:
-    try:
-        _raise_ambient_exception()
-    except RuntimeError:
-        return function()
 
 
 def _stream(
@@ -293,14 +293,14 @@ def test_attachment_urls_use_current_site_without_auth_io(
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         base_url='https://old.example',
         session_token=_SESSION_VALUE,
     )
     sg.config.set_server_params(site_url)
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     external = {
         'link_type': 'web',
         'url': 'https://storage.example/object?X-Amz-Signature=secret-value',
@@ -322,16 +322,7 @@ def test_attachment_urls_use_current_site_without_auth_io(
 
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('https://remote.example', None),
-        ('https://remote.example', 'proxy.example:3128'),
-        ('https://remote.example', 'localhost:3128'),
-        ('http://localhost', None),
-        ('http://LOCALHOST', None),
-        ('http://127.0.0.1', None),
-        ('http://127.42.0.1', None),
-        ('http://[::1]', None),
-    ],
+    ALLOWED_ORIGIN_CASES,
 )
 @pytest.mark.parametrize('session_token', [None, _SESSION_VALUE], ids=['uncached', 'cached'])
 def test_authenticated_file_download_allows_https_and_literal_loopback(
@@ -340,17 +331,17 @@ def test_authenticated_file_download_allows_https_and_literal_loopback(
     http_proxy: str | None,
 ) -> None:
     responses: list[TransportResponse | TransportError | _StreamScript] = [
-        _make_response({'version': [9, 0, 0]})
+        make_response({'version': [9, 0, 0]})
     ]
     if session_token is None:
-        responses.append(_make_response({'session_id': _SESSION_VALUE}))
+        responses.append(make_response({'session_id': _SESSION_VALUE}))
     responses.append(_stream((b'DATA',), 'download', []))
     sg = _download_client(
         responses, base_url=base_url, http_proxy=http_proxy, session_token=session_token
     )
 
     assert sg.download_attachment(41) == b'DATA'
-    assert _fake_transport(sg).requests[-1].headers['cookie'] == f'_session_id={_SESSION_VALUE}'
+    assert fake_transport(sg).requests[-1].headers['cookie'] == f'_session_id={_SESSION_VALUE}'
 
 
 @pytest.mark.parametrize('url', ['http://storage.example/file', 'http://remote.example:8080/file'])
@@ -362,7 +353,7 @@ def test_authenticated_file_external_http_download_omits_credentials(url: str) -
     )
 
     assert sg.download_attachment({'url': url}) == b'DATA'
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert len(requests) == 1
     assert requests[0].url == url
     assert set(requests[0].headers) == {'user-agent'}
@@ -372,21 +363,13 @@ def test_authenticated_file_external_http_download_omits_credentials(url: str) -
 @pytest.mark.parametrize('session_token', [None, _SESSION_VALUE], ids=['uncached', 'cached'])
 @pytest.mark.parametrize(
     ('base_url', 'http_proxy'),
-    [
-        ('http://remote.example', None),
-        ('http://localhost', 'proxy.example:3128'),
-        ('http://127.0.0.1', 'proxy.example:3128'),
-        ('http://[::1]', 'proxy.example:3128'),
-        ('http://localhost', 'localhost:3128'),
-        ('http://127.0.0.1', '127.0.0.1:3128'),
-        ('http://[::1]', '[::1]:3128'),
-    ],
+    REJECTED_ORIGIN_CASES,
 )
 def test_authenticated_file_http_download_rejects_before_lease(
     session_token: str | None, base_url: str, http_proxy: str | None
 ) -> None:
     sg = _download_client(
-        [_make_response({'version': [9, 0, 0]}), _stream((b'DATA',), 'download', [])],
+        [make_response({'version': [9, 0, 0]}), _stream((b'DATA',), 'download', [])],
         base_url=base_url,
         http_proxy=http_proxy,
         session_token=session_token,
@@ -400,35 +383,15 @@ def test_authenticated_file_http_download_rejects_before_lease(
         ):
             sg.download_attachment(41)
         lease.assert_not_called()
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
     assert events == []
-
-
-def test_download_attachment_abort_is_terminal_and_closes_once() -> None:
-    releases: list[str] = []
-    sg = _download_client(
-        [
-            _make_response({'version': [9, 0, 0]}),
-            _stream((b'partial', AbortedError('request-token')), 'abort', releases),
-        ],
-        session_token=_SESSION_VALUE,
-    )
-
-    with pytest.raises(
-        _errors.ShotgunFileDownloadError,
-        match=r'^attachment download failed$',
-    ):
-        sg.download_attachment(41)
-
-    assert len(_fake_transport(sg).requests) == 2
-    assert releases == ['abort']
 
 
 def test_download_attachment_cached_token_first_call_runs_readiness() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
+            make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -436,7 +399,7 @@ def test_download_attachment_cached_token_first_call_runs_readiness() -> None:
 
     assert sg.download_attachment(41) == b'DATA'
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert [request.url for request in requests] == [
         'https://x.example:443/api3/json',
         'https://x.example/file_serve/attachment/41',
@@ -453,7 +416,7 @@ def test_download_attachment_discards_partial_memory_before_retry() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream(
                 (b'partial-', ReadTimeoutError('body stalled')),
                 'partial',
@@ -500,7 +463,7 @@ def test_download_attachment_exhaustion_preserves_destination_and_redacts_url(
 
 def test_download_attachment_keeps_token_exchange_bound_to_original_snapshot() -> None:
     releases: list[str] = []
-    old_transport: _FakeTransport
+    old_transport: FakeTransport
     sg: Shotgun
 
     def change_origin_during_token(request: TransportRequest) -> None:
@@ -510,8 +473,8 @@ def test_download_attachment_keeps_token_exchange_bound_to_original_snapshot() -
 
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
-            _make_response({'session_id': 'old-origin-token'}),
+            make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
+            make_response({'session_id': 'old-origin-token'}),
             _stream(
                 (),
                 'redirect',
@@ -523,7 +486,7 @@ def test_download_attachment_keeps_token_exchange_bound_to_original_snapshot() -
         ],
         on_send=change_origin_during_token,
     )
-    old_transport = _fake_transport(sg)
+    old_transport = fake_transport(sg)
 
     assert sg.download_attachment(41) == b'old-origin-data'
 
@@ -537,11 +500,11 @@ def test_download_attachment_keeps_token_exchange_bound_to_original_snapshot() -
 
     replacement = _DownloadTransport(
         [
-            _make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
-            _make_response({'session_id': _NEW_ORIGIN_SESSION_VALUE}),
+            make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
+            make_response({'session_id': _NEW_ORIGIN_SESSION_VALUE}),
         ]
     )
-    sg._transport = replacement
+    sg.transport = replacement
     assert sg.get_session_token() == 'new-origin-token'
     assert len(replacement.requests) == 2
 
@@ -555,7 +518,7 @@ def test_download_attachment_off_origin_skips_readiness_and_token_lookup() -> No
     )
 
     assert result == b'PAGE'
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert len(requests) == 1
     assert requests[0].url == 'https://elsewhere.example/page?token=secret'
     assert 'cookie' not in requests[0].headers
@@ -567,7 +530,7 @@ def test_download_attachment_progress_uses_response_content_length() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases, headers={'Content-Length': '4'}),
         ],
         session_token=_SESSION_VALUE,
@@ -589,7 +552,7 @@ def test_download_attachment_rejects_non_attachment_entity_before_network() -> N
     with pytest.raises(ValueError, match=r'^attachment dictionary must reference an Attachment$'):
         sg.download_attachment({'id': 123, 'type': 'Shot'})
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_download_attachment_rejects_string_before_network() -> None:
@@ -599,7 +562,7 @@ def test_download_attachment_rejects_string_before_network() -> None:
     with pytest.raises(TypeError, match=r'^attachment must be an id or dictionary$'):
         download('/path/to/some/file.jpg')
 
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_download_attachment_requires_reference_but_accepts_explicit_none() -> None:
@@ -609,15 +572,15 @@ def test_download_attachment_requires_reference_but_accepts_explicit_none() -> N
     with pytest.raises(TypeError, match=r'^attachment or attachment_id is required$'):
         download()
     assert sg.download_attachment(None) is None
-    assert _fake_transport(sg).requests == []
+    assert fake_transport(sg).requests == []
 
 
 def test_download_attachment_resolves_id_from_active_origin_snapshot() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [10, 0, 0], 'api_max_entities_per_page': 250}),
-            _make_response({'session_id': 'new-origin-token'}),
+            make_response({'version': [10, 0, 0], 'api_max_entities_per_page': 250}),
+            make_response({'session_id': 'new-origin-token'}),
             _stream((b'new-origin-data',), 'download', releases),
         ]
     )
@@ -630,7 +593,7 @@ def test_download_attachment_resolves_id_from_active_origin_snapshot() -> None:
 
     assert sg.download_attachment(41) == b'new-origin-data'
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     assert [request.url for request in requests] == [
         'https://new.example:443/api3/json',
         'https://new.example:443/api3/json',
@@ -657,7 +620,7 @@ def test_download_attachment_retries_files_atomically_from_byte_zero(tmp_path: P
     destination.write_bytes(b'existing')
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'partial', SendError('body failed')), 'partial', releases),
             _stream((b'complete-', b'file'), 'complete', releases),
         ],
@@ -674,7 +637,7 @@ def test_download_attachment_retries_pre_send_and_retryable_status() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             ConnectError('connection failed'),
             _stream((b'unused',), 'maintenance', releases, status=503),
             _stream((b'DATA',), 'success', releases),
@@ -684,10 +647,10 @@ def test_download_attachment_retries_pre_send_and_retryable_status() -> None:
 
     assert sg.download_attachment(41) == b'DATA'
 
-    requests = _fake_transport(sg).requests
+    requests = fake_transport(sg).requests
     download_requests = requests[1:]
     assert len(download_requests) == 3
-    assert len({request.token for request in download_requests}) == 3
+    assert len({id(request) for request in download_requests}) == 3
     assert all(
         request.url == 'https://x.example/file_serve/attachment/41'
         for request in download_requests
@@ -697,12 +660,12 @@ def test_download_attachment_retries_pre_send_and_retryable_status() -> None:
 
 def test_download_attachment_uses_snapshot_token_and_credential_free_redirect() -> None:
     releases: list[str] = []
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
-            _make_response({'session_id': 'session-one'}),
+            make_response({'version': [9, 0, 0], 'api_max_entities_per_page': 500}),
+            make_response({'session_id': 'session-one'}),
             _stream((), 'redirect', releases, headers={'Location': signed_url}, status=302),
             _stream((b'DA', b'TA'), 'storage', releases, headers={'Content-Length': '4'}),
         ]
@@ -713,7 +676,7 @@ def test_download_attachment_uses_snapshot_token_and_credential_free_redirect() 
     result = sg.download_attachment({'type': 'Attachment', 'id': 41})
 
     assert result == b'DATA'
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     assert [request.url for request in transport.requests] == [
         'https://x.example:443/api3/json',
         'https://x.example:443/api3/json',
@@ -756,7 +719,7 @@ def test_download_cleanup_only_failure_inside_except_is_publicly_redacted(
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -773,7 +736,7 @@ def test_download_cleanup_only_failure_inside_except_is_publicly_redacted(
         _errors.ShotgunFileDownloadError,
         match=r'^attachment download failed$',
     ) as caught:
-        _call_inside_except(lambda: sg.download_attachment(41, file_path=str(destination)))
+        call_inside_except(lambda: sg.download_attachment(41, file_path=str(destination)))
 
     assert caught.value.__cause__ is None
     assert caught.value.__suppress_context__ is True
@@ -781,10 +744,92 @@ def test_download_cleanup_only_failure_inside_except_is_publicly_redacted(
     assert 'secret backend' not in diagnostic
     assert 'request-secret' not in diagnostic
     assert retries == []
-    assert len(_fake_transport(sg).requests) == 2
-    assert calls == ['write', 'close', 'unlink']
+    assert len(fake_transport(sg).requests) == 2
+    assert calls == ['write', 'flush', 'close', 'unlink']
     assert destination.read_bytes() == (b'existing' if phase == 'close' else b'DATA')
     assert list(tmp_path.iterdir()) == [destination]
+    assert releases == ['download']
+
+
+def test_download_destination_error_names_path_and_reason(tmp_path: Path) -> None:
+    destination = tmp_path / 'missing' / 'download.bin'
+    signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
+    releases: list[str] = []
+    sg = _download_client(
+        [_stream((b'DATA',), 'download', releases)],
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(_errors.ShotgunFileDownloadError) as caught:
+        sg.download_attachment({'url': signed_url}, file_path=str(destination))
+
+    assert str(destination) in str(caught.value)
+    assert 'No such file or directory' in str(caught.value)
+    assert 'secret-value' not in str(caught.value)
+    assert releases == ['download']
+
+
+@pytest.mark.parametrize('phase', ['write', 'flush', 'replace'])
+def test_download_destination_transfer_error_preserves_file_and_cleans_temporary(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / 'download.bin'
+    destination.write_bytes(b'existing')
+    reason = 'No space left on device'
+    calls: list[str] = []
+    _install_cleanup_failures(
+        monkeypatch,
+        calls,
+        {phase: OSError(errno.ENOSPC, reason)} if phase in {'write', 'flush'} else {},
+    )
+    if phase == 'replace':
+
+        def fail_replace(_source: Path, _target: Path) -> Path:
+            raise OSError(errno.ENOSPC, reason)
+
+        monkeypatch.setattr(Path, 'replace', fail_replace)
+
+    releases: list[str] = []
+    sg = _download_client(
+        [
+            make_response({'version': [9, 0, 0]}),
+            _stream((b'DATA',), 'download', releases),
+        ],
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(_errors.ShotgunFileDownloadError) as caught:
+        sg.download_attachment(41, file_path=str(destination))
+
+    assert str(destination) in str(caught.value)
+    assert reason in str(caught.value)
+    assert calls == (
+        ['write', 'close', 'unlink'] if phase == 'write' else ['write', 'flush', 'close', 'unlink']
+    )
+    assert destination.read_bytes() == b'existing'
+    assert list(tmp_path.iterdir()) == [destination]
+    assert releases == ['download']
+
+
+def test_download_http_error_keeps_generic_message_with_destination(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / 'download.bin'
+    signed_url = 'https://storage.example/object?X-Amz-Signature=secret-value'
+    releases: list[str] = []
+    sg = _download_client(
+        [_stream((), 'download', releases, status=404)],
+        session_token=_SESSION_VALUE,
+    )
+
+    with pytest.raises(
+        _errors.ShotgunFileDownloadError,
+        match=r'^attachment download failed$',
+    ):
+        sg.download_attachment({'url': signed_url}, file_path=str(destination))
+
     assert releases == ['download']
 
 
@@ -810,7 +855,7 @@ def test_download_primary_failure_survives_cleanup_failures(
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -839,7 +884,7 @@ def test_download_cleanup_control_exception_propagates_unchanged(
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -849,7 +894,7 @@ def test_download_cleanup_control_exception_propagates_unchanged(
         sg.download_attachment(41, file_path=str(destination))
 
     assert caught.value is control
-    assert calls == ['write', 'close', 'unlink']
+    assert calls == ['write', 'flush', 'close', 'unlink']
     assert destination.read_bytes() == (b'existing' if phase == 'close' else b'DATA')
     assert releases == ['download']
 
@@ -859,7 +904,7 @@ def test_download_rejects_invalid_url_before_io(url: str, tmp_path: Path) -> Non
     destination = tmp_path / 'download.bin'
     destination.write_bytes(b'existing')
     sg = _download_client([], session_token=_SESSION_VALUE)
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     events: list[object] = []
     sg.config.on_request = events.append
     sg.config.on_response = events.append
@@ -917,7 +962,7 @@ def test_download_transfer_runtime_error_propagates_unchanged(
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -936,7 +981,7 @@ def test_get_attachment_download_url_and_legacy_attachment_id() -> None:
     releases: list[str] = []
     sg = _download_client(
         [
-            _make_response({'version': [9, 0, 0]}),
+            make_response({'version': [9, 0, 0]}),
             _stream((b'DATA',), 'download', releases),
         ],
         session_token=_SESSION_VALUE,
@@ -978,7 +1023,7 @@ def test_origin_comparison_rejects_credential_leak_boundaries(url: str) -> None:
 def test_site_independent_attachment_urls_do_not_require_current_site() -> None:
     sg = _download_client([])
     sg.config.update_fields(server=None)
-    transport = _fake_transport(sg)
+    transport = fake_transport(sg)
     external = {
         'link_type': 'web',
         'url': 'https://storage.example/object?X-Amz-Signature=secret-value',

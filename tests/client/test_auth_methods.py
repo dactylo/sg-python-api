@@ -1,4 +1,3 @@
-import concurrent.futures
 import inspect
 import json
 import threading
@@ -10,9 +9,11 @@ import pytest
 from shotgun_api3 import _config as config_module
 from shotgun_api3 import _errors
 from shotgun_api3._client import Shotgun
-from shotgun_api3._config import ObserverEvent, RequestEvent, ResponseEvent, RetryEvent
+from shotgun_api3._config import RequestEvent, ResponseEvent, RetryEvent, _ObserverEvent
 from shotgun_api3._transport import SendError, TransportResponse
-from tests.conftest import _fake_client, _fake_transport, _make_response, _sent_payload
+from tests._threads import run_concurrently
+from tests.client._payloads import rpc_params
+from tests.conftest import fake_client, fake_transport, make_response, sent_payload
 
 _AuthenticateHumanUserCallable: TypeAlias = Callable[
     [str, str, str | None],
@@ -31,18 +32,13 @@ def _fault(code: int) -> TransportResponse:
     )
 
 
-def _params(sg: Shotgun, index: int = 0) -> dict[str, object]:
-    params = cast('list[object]', _sent_payload(sg, index)['params'])
-    return cast('dict[str, object]', params[1])
-
-
 def _payload_auth(payload: dict[str, object]) -> dict[str, object]:
     params = cast('list[object]', payload['params'])
     return cast('dict[str, object]', params[0])
 
 
 def _auth(sg: Shotgun, index: int = 0) -> dict[str, object]:
-    return _payload_auth(_sent_payload(sg, index))
+    return _payload_auth(sent_payload(sg, index))
 
 
 def _static_callable_contract(sg: Shotgun) -> _AuthenticateHumanUserCallable:
@@ -50,7 +46,7 @@ def _static_callable_contract(sg: Shotgun) -> _AuthenticateHumanUserCallable:
 
 
 def test_authenticate_human_user_accepts_empty_documented_strings() -> None:
-    sg = _fake_client([_make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
+    sg = fake_client([make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
 
     assert sg.authenticate_human_user('', '', '') is None
 
@@ -59,7 +55,7 @@ def test_authenticate_human_user_accepts_empty_documented_strings() -> None:
         'user_password': '',
         'auth_token': '',
     }
-    assert _params(sg)['filters'] == {
+    assert rpc_params(sg)['filters'] == {
         'logical_operator': 'and',
         'conditions': [
             {'path': 'sg_status_list', 'relation': 'is', 'values': ['act']},
@@ -77,12 +73,13 @@ def test_authenticate_human_user_ambiguous_send_uses_logical_operation_policy(
     operation_attempts: int,
     retry_events: int,
 ) -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     response: dict[str, object] = {
         'entities': [],
         'paging_info': {'entity_count': 0},
     }
-    sg = _fake_client([SendError('ambiguous'), _make_response(response)])
+    sg = fake_client([SendError('ambiguous'), make_response(response)])
+    sg.config.rpc_attempt_interval = 0
     sg.config.on_request = events.append
     sg.config.on_response = events.append
     sg.config.on_retry = events.append
@@ -102,11 +99,11 @@ def test_authenticate_human_user_ambiguous_send_uses_logical_operation_policy(
     assert sum(isinstance(event, RequestEvent) for event in operation_events) == operation_attempts
     assert sum(isinstance(event, RetryEvent) for event in operation_events) == retry_events
     assert all(event.operation == 'human_authentication' for event in operation_events)
-    assert len(_fake_transport(sg).requests) == 1 + operation_attempts
+    assert len(fake_transport(sg).requests) == 1 + operation_attempts
 
 
 def test_authenticate_human_user_bad_credentials_returns_none() -> None:
-    sg = _fake_client([_fault(102)])
+    sg = fake_client([_fault(102)])
     before = config_module.snapshot(sg.config)
 
     assert sg.authenticate_human_user('me', 'wrong-password') is None
@@ -117,11 +114,11 @@ def test_authenticate_human_user_bad_credentials_returns_none() -> None:
 
 
 def test_authenticate_human_user_builds_exact_read_payload_from_one_snapshot() -> None:
-    sg = _fake_client([_make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
+    sg = fake_client([make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
     sg.config.session_uuid = 'captured-session'
     response_count = 0
 
-    def change_session_after_readiness(event: ObserverEvent) -> None:
+    def change_session_after_readiness(event: _ObserverEvent) -> None:
         nonlocal response_count
         if not isinstance(event, ResponseEvent):
             return
@@ -133,7 +130,7 @@ def test_authenticate_human_user_builds_exact_read_payload_from_one_snapshot() -
 
     assert sg.authenticate_human_user('me', 'password', 'two-factor') is None
 
-    payload = _sent_payload(sg)
+    payload = sent_payload(sg)
     assert payload['method_name'] == 'read'
     assert _payload_auth(payload) == {
         'user_login': 'me',
@@ -141,7 +138,7 @@ def test_authenticate_human_user_builds_exact_read_payload_from_one_snapshot() -
         'auth_token': 'two-factor',
         'session_uuid': 'captured-session',
     }
-    assert _params(sg) == {
+    assert rpc_params(sg) == {
         'type': 'HumanUser',
         'return_fields': ['id', 'login'],
         'filters': {
@@ -168,7 +165,7 @@ def test_authenticate_human_user_excludes_configured_extra_auth_and_owns_config(
     expected_extra = {
         'nested': {'sentinels': ['configured-extra-auth-secret']},
     }
-    sg = _fake_client([_make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
+    sg = fake_client([make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
     sg.config.extra_auth_params = configured_extra
     sentinels.append('caller-mutation')
     before = sg.config.extra_auth_params
@@ -214,7 +211,7 @@ def test_authenticate_human_user_exposes_exact_signature_and_static_contract() -
     )
     assert signature.return_annotation == dict[str, object] | None
 
-    _static_callable_contract(_fake_client([]))
+    _static_callable_contract(fake_client([]))
 
 
 def test_authenticate_human_user_forwards_and_owns_annotated_out_values() -> None:
@@ -225,9 +222,9 @@ def test_authenticate_human_user_forwards_and_owns_annotated_out_values() -> Non
         'entities': [],
         'paging_info': {'entity_count': 0},
     }
-    sg = _fake_client([_make_response(response)])
+    sg = fake_client([make_response(response)])
 
-    def mutate_after_readiness(event: ObserverEvent) -> None:
+    def mutate_after_readiness(event: _ObserverEvent) -> None:
         if isinstance(event, ResponseEvent):
             login[0] = 'changed-login'
             password['nested'][0] = 'changed-password'
@@ -242,7 +239,7 @@ def test_authenticate_human_user_forwards_and_owns_annotated_out_values() -> Non
         'user_password': {'nested': ['original-password']},
         'auth_token': ['original-token'],
     }
-    filters = cast('dict[str, object]', _params(sg)['filters'])
+    filters = cast('dict[str, object]', rpc_params(sg)['filters'])
     conditions = cast('list[dict[str, object]]', filters['conditions'])
     assert conditions[1]['values'] == ['original-login']
 
@@ -252,28 +249,24 @@ def test_authenticate_human_user_keeps_concurrent_configured_auth_isolated() -> 
         'entities': [],
         'paging_info': {'entity_count': 0},
     }
-    sg = _fake_client([_make_response(response), _make_response(response)])
+    sg = fake_client([make_response(response), make_response(response)])
     sg.connect()
     barrier = threading.Barrier(2)
 
-    def synchronize_requests(event: ObserverEvent) -> None:
+    def synchronize_requests(event: _ObserverEvent) -> None:
         if isinstance(event, RequestEvent):
             barrier.wait(timeout=5)
 
     sg.config.on_request = synchronize_requests
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        auth_future = executor.submit(
-            sg.authenticate_human_user,
-            'human-login',
-            'human-password',
-            'human-token',
-        )
-        configured_future = executor.submit(sg.preferences_read)
-        assert auth_future.result(timeout=5) is None
-        assert configured_future.result(timeout=5) == response
+    assert run_concurrently(
+        [
+            lambda: sg.authenticate_human_user('human-login', 'human-password', 'human-token'),
+            sg.preferences_read,
+        ]
+    ) == [None, response]
 
-    payloads = [_sent_payload(sg, index) for index in range(2)]
+    payloads = [sent_payload(sg, index) for index in range(2)]
     auth_payload = next(
         payload
         for payload in payloads
@@ -297,7 +290,7 @@ def test_authenticate_human_user_keeps_concurrent_configured_auth_isolated() -> 
 
 
 def test_authenticate_human_user_propagates_missing_two_factor_fault() -> None:
-    sg = _fake_client([_fault(106)])
+    sg = fake_client([_fault(106)])
 
     with pytest.raises(_errors.MissingTwoFactorAuthenticationFault):
         sg.authenticate_human_user('me', 'password')
@@ -315,7 +308,7 @@ def test_authenticate_human_user_propagates_other_faults(
     code: int,
     fault_type: type[_errors.Fault],
 ) -> None:
-    sg = _fake_client([_fault(code)])
+    sg = fake_client([_fault(code)])
 
     with pytest.raises(fault_type) as error:
         sg.authenticate_human_user('login-secret', 'password-secret')
@@ -340,7 +333,7 @@ def test_authenticate_human_user_returns_exact_first_call_boundary_entity(
         return {'entities': [first_entity, second_entity]}
 
     monkeypatch.setattr(Shotgun, '_call', call)
-    sg = _fake_client([])
+    sg = fake_client([])
 
     result = sg.authenticate_human_user('me', 'password')
 
@@ -348,7 +341,7 @@ def test_authenticate_human_user_returns_exact_first_call_boundary_entity(
 
 
 def test_authenticate_human_user_returns_none_when_no_user_matches() -> None:
-    sg = _fake_client([_make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
+    sg = fake_client([make_response({'entities': [], 'paging_info': {'entity_count': 0}})])
 
     assert sg.authenticate_human_user('missing', 'password') is None
 
@@ -356,8 +349,8 @@ def test_authenticate_human_user_returns_none_when_no_user_matches() -> None:
 def test_authenticate_human_user_secrets_stay_out_of_errors_events_and_logs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    events: list[ObserverEvent] = []
-    sg = _fake_client([_make_response(['response-secret'])])
+    events: list[_ObserverEvent] = []
+    sg = fake_client([make_response(['response-secret'])])
     sg.config.on_request = events.append
     sg.config.on_response = events.append
 
@@ -379,7 +372,7 @@ def test_authenticate_human_user_secrets_stay_out_of_errors_events_and_logs(
 
 def test_authenticate_human_user_success_leaves_config_untouched() -> None:
     entity = {'type': 'HumanUser', 'id': 7, 'login': 'me'}
-    sg = _fake_client([_make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})])
+    sg = fake_client([make_response({'entities': [entity], 'paging_info': {'entity_count': 1}})])
     before = config_module.snapshot(sg.config)
 
     result = sg.authenticate_human_user('me', 'password-secret')
@@ -417,7 +410,7 @@ def test_authenticate_human_user_validates_response_shape_without_values(
     result: object,
     message: str,
 ) -> None:
-    sg = _fake_client([_make_response(result)])
+    sg = fake_client([make_response(result)])
 
     with pytest.raises(
         _errors.ShotgunError,

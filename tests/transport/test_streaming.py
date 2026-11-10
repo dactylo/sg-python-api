@@ -1,30 +1,23 @@
 import socket
 import threading
-import time
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
-from typing import cast, get_type_hints
+from typing import cast
 
 import pytest
 import urllib3
 
 from shotgun_api3._transport import (
-    AbortedError,
-    ReadTimeoutError,
     SendError,
     StreamingResponse,
     TimeoutConfig,
-    Transport,
     TransportError,
     TransportRequest,
     TransportResponse,
     Urllib3Transport,
-    _AbortHandle,
 )
 from tests._loopback import receive_request
-from tests._transports import _FakeTransport
-
-_REQUEST_ID = 'stream-request'
+from tests._transports import FakeTransport
 
 
 @contextmanager
@@ -72,7 +65,6 @@ def _request(
         headers={},
         body=body,
         timeout=timeout or TimeoutConfig(connect=5.0, read=5.0),
-        token=_REQUEST_ID,
     )
 
 
@@ -105,36 +97,28 @@ def _track_releases(
     monkeypatch: pytest.MonkeyPatch,
     transport: Urllib3Transport,
     url: str,
-) -> tuple[list[object], list[object | None]]:
-    registry_releases: list[object] = []
+) -> list[object | None]:
     connection_releases: list[object | None] = []
-    registry = transport._abort_registry
-    original_registry_release = registry._release
     manager = transport._pool
     pool = manager.connection_from_url(url)
     pool_type = type(pool)
     original_connection_release = cast(
         'Callable[[object, object | None], None]',
-        vars(pool_type)['_put_conn'],
+        pool_type._put_conn,
     )
-
-    def release_registry(handle: _AbortHandle) -> None:
-        registry_releases.append(handle)
-        original_registry_release(handle)
 
     def release_connection(active_pool: object, connection: object | None) -> None:
         if active_pool is pool:
             connection_releases.append(connection)
         original_connection_release(active_pool, connection)
 
-    monkeypatch.setattr(registry, '_release', release_registry)
     monkeypatch.setattr(pool_type, '_put_conn', release_connection)
-    return registry_releases, connection_releases
+    return connection_releases
 
 
 def test_fake_streaming_exhaustion_releases_once_and_preserves_headers() -> None:
     releases: list[str] = []
-    fake = _FakeTransport([_scripted_response(releases)])
+    fake = FakeTransport([_scripted_response(releases)])
 
     response = fake.send_streaming(_request())
 
@@ -150,7 +134,7 @@ def test_fake_streaming_exhaustion_releases_once_and_preserves_headers() -> None
 
 def test_fake_streaming_explicit_close_without_consumption_releases_once() -> None:
     releases: list[str] = []
-    fake = _FakeTransport([_scripted_response(releases)])
+    fake = FakeTransport([_scripted_response(releases)])
     response = fake.send_streaming(_request())
 
     response.close()
@@ -161,7 +145,7 @@ def test_fake_streaming_explicit_close_without_consumption_releases_once() -> No
 
 def test_fake_streaming_rejects_consumption_after_close() -> None:
     releases: list[str] = []
-    response = _FakeTransport([_scripted_response(releases)]).send_streaming(_request())
+    response = FakeTransport([_scripted_response(releases)]).send_streaming(_request())
 
     response.close()
 
@@ -172,7 +156,7 @@ def test_fake_streaming_rejects_consumption_after_close() -> None:
 
 def test_fake_streaming_rejects_second_consumption() -> None:
     releases: list[str] = []
-    response = _FakeTransport([_scripted_response(releases)]).send_streaming(_request())
+    response = FakeTransport([_scripted_response(releases)]).send_streaming(_request())
 
     chunks = response.iter_chunks(2)
     with pytest.raises(TransportError, match='already'):
@@ -206,7 +190,7 @@ def test_shared_request_reader_rejects_socket_early_eof(
 @pytest.mark.parametrize('size', [0, -1])
 def test_fake_streaming_rejects_non_positive_chunk_size(size: int) -> None:
     releases: list[str] = []
-    response = _FakeTransport([_scripted_response(releases)]).send_streaming(_request())
+    response = FakeTransport([_scripted_response(releases)]).send_streaming(_request())
 
     with pytest.raises(TransportError, match='positive'):
         response.iter_chunks(size)
@@ -239,13 +223,6 @@ def test_streaming_iterator_failure_releases_once() -> None:
     assert releases == ['release']
 
 
-def test_transport_vocabulary_supports_streaming() -> None:
-    body_type = get_type_hints(TransportRequest)['body']
-
-    assert body_type == bytes | Iterator[bytes] | None
-    assert callable(Transport.send_streaming)
-
-
 @pytest.mark.parametrize('streaming', [False, True])
 def test_urllib3_iterator_body_error_maps_and_releases_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -265,7 +242,7 @@ def test_urllib3_iterator_body_error_maps_and_releases_once(
 
     with _loopback(receive_until_close) as server_url:
         transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
+        connection_releases = _track_releases(
             monkeypatch,
             transport,
             server_url,
@@ -283,7 +260,6 @@ def test_urllib3_iterator_body_error_maps_and_releases_once(
         finally:
             transport.close()
 
-    assert len(registry_releases) == 1
     assert len(connection_releases) == 1
 
 
@@ -314,54 +290,6 @@ def test_urllib3_send_accepts_iterator_body() -> None:
     assert observed_bodies == [b'aabbcc']
 
 
-def test_urllib3_streaming_abort_during_body_read_releases_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    allow_server_exit = threading.Event()
-    first_chunk_received = threading.Event()
-
-    def respond(connection: socket.socket) -> None:
-        receive_request(connection)
-        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nab')
-        allow_server_exit.wait(timeout=5.0)
-
-    with _loopback(respond) as server_url:
-        transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
-            monkeypatch,
-            transport,
-            server_url,
-        )
-        response = transport.send_streaming(_request(server_url + '/stall'))
-        outcome: list[AssertionError | TransportError] = []
-
-        def consume() -> None:
-            try:
-                chunks = response.iter_chunks(2)
-                assert next(chunks) == b'ab'
-                first_chunk_received.set()
-                next(chunks)
-            except (AssertionError, TransportError) as exc:
-                outcome.append(exc)
-
-        thread = threading.Thread(target=consume, daemon=True)
-        thread.start()
-        try:
-            assert first_chunk_received.wait(timeout=5.0)
-            transport.abort(_REQUEST_ID)
-        finally:
-            allow_server_exit.set()
-            response.close()
-            transport.close()
-            thread.join(timeout=5.0)
-            assert not thread.is_alive()
-
-    assert len(outcome) == 1
-    assert isinstance(outcome[0], AbortedError)
-    assert len(registry_releases) == 1
-    assert len(connection_releases) == 1
-
-
 def test_urllib3_streaming_body_error_maps_and_releases_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,7 +299,7 @@ def test_urllib3_streaming_body_error_maps_and_releases_once(
 
     with _loopback(respond) as server_url:
         transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
+        connection_releases = _track_releases(
             monkeypatch,
             transport,
             server_url,
@@ -384,7 +312,6 @@ def test_urllib3_streaming_body_error_maps_and_releases_once(
         finally:
             transport.close()
 
-    assert len(registry_releases) == 1
     assert len(connection_releases) == 1
 
 
@@ -405,7 +332,7 @@ def test_urllib3_streaming_close_failure_still_releases_connection_once(
 
     with _loopback(respond) as server_url:
         transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
+        connection_releases = _track_releases(
             monkeypatch,
             transport,
             server_url,
@@ -420,46 +347,10 @@ def test_urllib3_streaming_close_failure_still_releases_connection_once(
             transport.close()
 
     assert len(close_calls) == 1
-    assert len(registry_releases) == 1
     assert len(connection_releases) == 1
 
 
-def test_urllib3_streaming_enforces_cumulative_total_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def respond(connection: socket.socket) -> None:
-        receive_request(connection)
-        connection.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na')
-        for chunk in (b'b', b'c'):
-            time.sleep(0.12)
-            try:
-                connection.sendall(chunk)
-            except OSError:
-                return
-
-    with _loopback(respond) as server_url:
-        transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
-            monkeypatch,
-            transport,
-            server_url,
-        )
-        try:
-            request = _request(
-                server_url + '/slow',
-                timeout=TimeoutConfig(connect=1.0, read=0.5, total=0.2),
-            )
-            response = transport.send_streaming(request)
-            with pytest.raises(ReadTimeoutError, match='total'):
-                list(response.iter_chunks(1))
-        finally:
-            transport.close()
-
-    assert len(registry_releases) == 1
-    assert len(connection_releases) == 1
-
-
-def test_urllib3_streaming_exhaustion_releases_registry_and_connection_once(
+def test_urllib3_streaming_exhaustion_releases_connection_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_requests: list[tuple[str, str, dict[str, str], bytes]] = []
@@ -470,7 +361,7 @@ def test_urllib3_streaming_exhaustion_releases_registry_and_connection_once(
 
     with _loopback(respond) as server_url:
         transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
+        connection_releases = _track_releases(
             monkeypatch,
             transport,
             server_url,
@@ -485,11 +376,10 @@ def test_urllib3_streaming_exhaustion_releases_registry_and_connection_once(
             transport.close()
 
     assert observed_requests[0][:2] == ('GET', '/file')
-    assert len(registry_releases) == 1
     assert len(connection_releases) == 1
 
 
-def test_urllib3_streaming_explicit_close_releases_registry_and_connection_once(
+def test_urllib3_streaming_explicit_close_releases_connection_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def respond(connection: socket.socket) -> None:
@@ -498,7 +388,7 @@ def test_urllib3_streaming_explicit_close_releases_registry_and_connection_once(
 
     with _loopback(respond) as server_url:
         transport = Urllib3Transport()
-        registry_releases, connection_releases = _track_releases(
+        connection_releases = _track_releases(
             monkeypatch,
             transport,
             server_url,
@@ -510,28 +400,19 @@ def test_urllib3_streaming_explicit_close_releases_registry_and_connection_once(
         finally:
             transport.close()
 
-    assert len(registry_releases) == 1
     assert len(connection_releases) == 1
 
 
-def test_urllib3_streaming_header_error_releases_registry_once(
+def test_urllib3_streaming_header_error_maps_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = Urllib3Transport()
-    releases: list[object] = []
     request_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-    registry = transport._abort_registry
-    original_release = registry._release
-
-    def release(handle: _AbortHandle) -> None:
-        releases.append(handle)
-        original_release(handle)
 
     def fail(*args: object, **kwargs: object) -> object:
         request_calls.append((args, kwargs))
         raise urllib3.exceptions.ProtocolError('headers failed')
 
-    monkeypatch.setattr(registry, '_release', release)
     monkeypatch.setattr(urllib3.PoolManager, 'request', fail)
     try:
         with pytest.raises(SendError):
@@ -539,66 +420,6 @@ def test_urllib3_streaming_header_error_releases_registry_once(
     finally:
         transport.close()
 
-    assert len(releases) == 1
     assert len(request_calls) == 1
     assert request_calls[0][1]['preload_content'] is False
     assert request_calls[0][1]['retries'] is False
-
-
-@pytest.mark.parametrize(
-    ('abort_request', 'error_type'),
-    [(False, SendError), (True, AbortedError)],
-)
-def test_urllib3_streaming_timeout_setup_failure_maps_and_releases_once(
-    monkeypatch: pytest.MonkeyPatch,
-    abort_request: bool,
-    error_type: type[TransportError],
-) -> None:
-    transport = Urllib3Transport()
-
-    class RacingSocket:
-        def settimeout(self, _value: float) -> None:
-            if abort_request:
-                transport.abort(_REQUEST_ID)
-            raise OSError('socket closed during timeout setup')
-
-    class RacingConnection:
-        sock: RacingSocket | None = RacingSocket()
-
-    class StubResponse:
-        def __init__(self) -> None:
-            self.close_calls = 0
-            self.connection: RacingConnection | None = RacingConnection()
-            self.headers: dict[str, str] = {}
-            self.reason = 'OK'
-            self.release_calls = 0
-            self.status = 200
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-        def release_conn(self) -> None:
-            self.release_calls += 1
-            self.connection = None
-
-        def stream(self, _size: int) -> Iterator[bytes]:
-            yield b'unreachable'
-
-    stub_response = StubResponse()
-
-    def return_response(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        return stub_response
-
-    monkeypatch.setattr(urllib3.PoolManager, 'request', return_response)
-    try:
-        response = transport.send_streaming(
-            _request(timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0))
-        )
-        with pytest.raises(error_type):
-            next(response.iter_chunks())
-    finally:
-        transport.close()
-
-    assert stub_response.close_calls == 1
-    assert stub_response.release_calls == 1

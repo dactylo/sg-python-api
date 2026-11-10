@@ -2,187 +2,26 @@
 
 import copy
 import dataclasses
-import inspect
-from collections.abc import Callable
 from typing import Any, Literal, cast
 
 from . import _protocol
 from ._errors import ShotgunError
-from ._signatures import bind_arguments, expose_signature
-
-_FIND_DOCSTRING = """Find entities matching the supplied filters.
-
-Args:
-    entity_type: Entity type to find.
-    filters: Filters in list or dict syntax.
-    fields: Optional fields to return; defaults to `id`.
-    order: Optional field and direction sort specifications.
-    filter_operator: `'all'` or `'any'` for list-syntax filters.
-    limit: Maximum entities to return, or `0` for no limit.
-    retired_only: Return retired entities instead of active entities.
-    page: Specific page to return, or `0` to read all pages.
-    include_archived_projects: Include entities from archived projects.
-    additional_filter_presets: Optional server-side filter presets.
-
-Returns:
-    Matching entities in server order.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if filters, paging, ordering, or a server result is invalid.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_FIND_ONE_DOCSTRING = """Return the first entity matching the supplied filters.
-
-Args:
-    entity_type: Entity type to find.
-    filters: Filters in list or dict syntax.
-    fields: Optional fields to return; defaults to `id`.
-    order: Optional field and direction sort specifications.
-    filter_operator: `'all'` or `'any'` for list-syntax filters.
-    retired_only: Return a retired entity instead of an active entity.
-    include_archived_projects: Include entities from archived projects.
-    additional_filter_presets: Optional server-side filter presets.
-
-Returns:
-    The first matching entity, or `None` when no entity matches.
-
-Raises:
-    TypeError: If arguments do not match the documented signature.
-    ShotgunError: If an RPC fault or terminal transport failure
-        occurs, or if filters, paging, ordering, or a server result is invalid.
-    ProtocolError: If a server request returns an HTTP error.
-    ValueError: If authenticated HTTP violates the configured origin policy.
-"""
-_FIND_ONE_PARAMETERS = (
-    inspect.Parameter('entity_type', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter(
-        'filters',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        annotation=list[Any] | tuple[Any, ...] | dict[str, Any],
-    ),
-    inspect.Parameter(
-        'fields',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=list[str] | None,
-    ),
-    inspect.Parameter(
-        'order',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=list[dict[str, str]] | None,
-    ),
-    inspect.Parameter(
-        'filter_operator',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'retired_only',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=False,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'include_archived_projects',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=True,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'additional_filter_presets',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=object,
-    ),
-)
-_FIND_ONE_SIGNATURE = inspect.Signature(
-    _FIND_ONE_PARAMETERS,
-    return_annotation=dict[str, object] | None,
-)
-_FIND_PARAMETERS = (
-    inspect.Parameter('entity_type', inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str),
-    inspect.Parameter(
-        'filters',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        annotation=list[Any] | tuple[Any, ...] | dict[str, Any],
-    ),
-    inspect.Parameter(
-        'fields',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=list[str] | None,
-    ),
-    inspect.Parameter(
-        'order',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=list[dict[str, str]] | None,
-    ),
-    inspect.Parameter(
-        'filter_operator',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=str | None,
-    ),
-    inspect.Parameter(
-        'limit',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=0,
-        annotation=int,
-    ),
-    inspect.Parameter(
-        'retired_only',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=False,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'page',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=0,
-        annotation=int,
-    ),
-    inspect.Parameter(
-        'include_archived_projects',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=True,
-        annotation=bool,
-    ),
-    inspect.Parameter(
-        'additional_filter_presets',
-        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        default=None,
-        annotation=object,
-    ),
-)
-_FIND_SIGNATURE = inspect.Signature(
-    _FIND_PARAMETERS,
-    return_annotation=list[dict[str, object]],
-)
-_METHOD_FIND_ONE_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_FIND_ONE_PARAMETERS,
-    ),
-    return_annotation=dict[str, object] | None,
-)
-_METHOD_FIND_SIGNATURE = inspect.Signature(
-    (
-        inspect.Parameter('self', inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *_FIND_PARAMETERS,
-    ),
-    return_annotation=list[dict[str, object]],
-)
 
 
 @dataclasses.dataclass(frozen=True)
-class _FindOneOptions:
-    """Collect exact public `find_one` arguments for validation."""
+class FindOneOptions:
+    """Collect exact public `find_one` arguments for validation.
+
+    Attributes:
+        entity_type: Entity type to find.
+        filters: Filters in list or dict syntax.
+        fields: Optional fields to return; defaults to `id`.
+        order: Optional field and direction sort specifications.
+        filter_operator: `'all'` or `'any'` for list-syntax filters.
+        retired_only: Return a retired entity instead of an active entity.
+        include_archived_projects: Include entities from archived projects.
+        additional_filter_presets: Optional server-side filter presets.
+    """
 
     entity_type: str
     filters: list[Any] | tuple[Any, ...] | dict[str, Any]
@@ -196,11 +35,11 @@ class _FindOneOptions:
 
 @dataclasses.dataclass(frozen=True)
 class FindOptions:
-    """Collect the exact public `find` arguments for runtime validation.
+    """Hold the public `find` arguments in a frozen configuration record.
 
     Attributes:
         entity_type: Type of entity to query.
-        filters: Query filters or filter preset structure.
+        filters: Query filters in list, tuple, or dict syntax.
         fields: Optional fields to return.
         order: Optional field ordering directives.
         filter_operator: Optional logical operator joining filters.
@@ -346,54 +185,6 @@ def _validate_nonnegative_integer(value: object, name: str) -> None:
         raise ShotgunError(f'{name} must be a nonnegative integer')
 
 
-def bind_find(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    client_name: str,
-) -> FindOptions:
-    """Bind runtime arguments with client-specific `find` errors.
-
-    Args:
-        args: Positional public arguments.
-        kwargs: Keyword public arguments.
-        client_name: Public client class name for error attribution.
-
-    Returns:
-        Bound find options retaining the supplied argument values without
-        copying mutable containers.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(_FIND_SIGNATURE, args, kwargs, f'{client_name}.find()')
-    options = cast('Callable[..., FindOptions]', FindOptions)
-    return options(**bound.arguments)
-
-
-def bind_find_one(
-    args: tuple[object, ...],
-    kwargs: dict[str, object],
-    client_name: str,
-) -> _FindOneOptions:
-    """Bind runtime arguments with client-specific `find_one` errors.
-
-    Args:
-        args: Positional public arguments.
-        kwargs: Keyword public arguments.
-        client_name: Public client class name for error attribution.
-
-    Returns:
-        Bound find-one options retaining the supplied argument values without
-        copying mutable containers.
-
-    Raises:
-        TypeError: If the arguments do not match the public signature.
-    """
-    bound = bind_arguments(_FIND_ONE_SIGNATURE, args, kwargs, f'{client_name}.find_one()')
-    options = cast('Callable[..., _FindOneOptions]', _FindOneOptions)
-    return options(**bound.arguments)
-
-
 def build_entity_action_params(entity_type: str, entity_id: int) -> dict[str, object]:
     """Build parameters for delete and revive operations.
 
@@ -447,34 +238,16 @@ def build_page_params(plan: _FindPlan, page_number: int, convert_utc: bool) -> o
 
     Returns:
         Detached transformed page parameters.
+
+    Raises:
+        ValueError: If a naive datetime cannot be converted to UTC.
+        OverflowError: If converting an aware datetime to UTC exceeds the
+            supported datetime range.
+        OSError: If the platform cannot resolve a local datetime.
     """
     built = dict(plan.params)
     built['paging'] = {**plan.paging, 'current_page': page_number}
     return _protocol.transform_outbound(built, convert_utc)
-
-
-def expose_find_one_signature(function: Callable[..., object]) -> Callable[..., object]:
-    """Expose the documented `find_one` signature and documentation.
-
-    Args:
-        function: Variadic method implementation.
-
-    Returns:
-        The same function with its public runtime contract attached.
-    """
-    return expose_signature(function, _METHOD_FIND_ONE_SIGNATURE, _FIND_ONE_DOCSTRING)
-
-
-def expose_find_signature(function: Callable[..., object]) -> Callable[..., object]:
-    """Expose the documented `find` signature and documentation.
-
-    Args:
-        function: Variadic method implementation.
-
-    Returns:
-        The same function with its public runtime contract attached.
-    """
-    return expose_signature(function, _METHOD_FIND_SIGNATURE, _FIND_DOCSTRING)
 
 
 def finalize_find(
@@ -499,7 +272,7 @@ def finalize_find(
     return _protocol.inject_local_paths(records, local_path_field)
 
 
-def find_options_from_one(options: _FindOneOptions) -> FindOptions:
+def find_options_from_one(options: FindOneOptions) -> FindOptions:
     """Convert bound find-one arguments into a one-result find plan.
 
     Args:
@@ -544,11 +317,13 @@ def prepare_find(options: FindOptions) -> _PreparedFind:
         Detached inputs ready for server-aware paging.
 
     Raises:
-        ShotgunError: If paging or ordering is invalid.
+        ShotgunError: If fields, paging, or ordering is invalid.
         Fault: If filter syntax is invalid.
     """
     _validate_nonnegative_integer(options.limit, 'limit')
     _validate_nonnegative_integer(options.page, 'page')
+    if isinstance(options.fields, (str, bytes)):
+        raise ShotgunError('find fields must be an iterable of strings or None')
     translated_filters = copy.deepcopy(
         _protocol.translate_filters(
             _protocol.require_filter_container(options.filters, options.filter_operator),

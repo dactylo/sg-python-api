@@ -27,13 +27,12 @@ from shotgun_api3._async_transport import (
 from shotgun_api3._config import (
     CompatibilityWarningEvent,
     Config,
-    ObserverEvent,
     ProgressEvent,
     RequestEvent,
     ResponseEvent,
     RetryEvent,
+    _ObserverEvent,
 )
-from shotgun_api3._driver import Driver, _DriverTiming
 from shotgun_api3._transport import (
     CaseInsensitiveHeaders,
     ConnectError,
@@ -43,17 +42,13 @@ from shotgun_api3._transport import (
     TransportRequest,
     TransportResponse,
 )
-from tests._transports import _AsyncFakeTransport, _FakeTransport
+from tests._exceptions import raise_ambient_exception
+from tests._transports import AsyncFakeTransport
 
 pytestmark = pytest.mark.async_required
 
-_BLOCKED_UPLOAD_REQUEST_ID = 'blocked-upload-token'
-_CANCELLED_UPLOAD_REQUEST_ID = 'cancelled-upload-token'
 _GATEWAY = TransportResponse(status=502, reason='Bad Gateway', headers={}, content=b'')
 
-_LOOP_DEADLINE_REQUEST_ID = 'loop-deadline'
-_LOOP_OBSERVER_FAILURE_REQUEST_ID = 'loop-observer-failure'
-_LOOP_PROGRESS_REQUEST_ID = 'loop-progress'
 _OK = TransportResponse(
     status=200,
     reason='OK',
@@ -62,13 +57,10 @@ _OK = TransportResponse(
 )
 
 _PENDING_BODY_CLEANUP_CANCELLATION = 'pending body cleanup cancellation'
-_PENDING_BODY_CLEANUP_REQUEST_ID = 'cancel-before-body-cleanup'
 _PENDING_RESPONSE_CLEANUP_CANCELLATION = 'pending response cleanup cancellation'
-_POST_RESPONSE_CLEANUP_REQUEST_ID = 'post-response-cleanup'
-_POST_RESPONSE_CLOSE_FAILURE_REQUEST_ID = 'post-response-close-failure'
 
 
-class _AsyncCloseResponse:
+class _AsyncCloseResponse(AsyncStreamingResponse):
     def __init__(
         self,
         close_error: BaseException | None = None,
@@ -80,9 +72,12 @@ class _AsyncCloseResponse:
     ) -> None:
         self.close_calls = 0
         self.content = b'data'
-        self.headers = CaseInsensitiveHeaders(headers or {})
-        self.reason = 'OK'
-        self.status = status
+
+        async def stream(size: int) -> AsyncIterator[bytes]:
+            for offset in range(0, len(self.content), size):
+                yield self.content[offset : offset + size]
+
+        super().__init__(status, 'OK', CaseInsensitiveHeaders(headers or {}), stream, self.close)
         self._close_error = close_error
         self._close_headers = close_headers
         self._close_status = close_status
@@ -196,7 +191,7 @@ class _FailingCloseBody(_Body):
         raise RuntimeError('body close failed')
 
 
-class _HangingTransport(_AsyncFakeTransport):
+class _HangingTransport(AsyncFakeTransport):
     def __init__(self) -> None:
         super().__init__([])
         self.started = asyncio.Event()
@@ -212,7 +207,7 @@ class _HangingTransport(_AsyncFakeTransport):
         raise AssertionError('unexpected streaming send')
 
 
-class _LoopPullingTransport(_AsyncFakeTransport):
+class _LoopPullingTransport(AsyncFakeTransport):
     def __init__(self) -> None:
         super().__init__([_OK])
         self.returned_chunks: list[bytes] = []
@@ -265,11 +260,7 @@ def _config() -> Config:
     return config
 
 
-def _raise_ambient_exception() -> Never:
-    raise RuntimeError('ambient exception state')
-
-
-def _request(token: str) -> TransportRequest:
+def _request() -> TransportRequest:
     context = config_module.snapshot(_config())
     return TransportRequest(
         method='GET',
@@ -277,7 +268,6 @@ def _request(token: str) -> TransportRequest:
         headers={},
         body=None,
         timeout=context.timeout,
-        token=token,
     )
 
 
@@ -288,10 +278,10 @@ async def _sleepless(_delay: float) -> None:
 @pytest.mark.anyio
 async def test_already_active_cancellation_joins_response_cleanup_once() -> None:
     response = _BlockingAsyncCloseResponse()
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
+    fake = AsyncFakeTransport([response])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def cancel_before_cleanup(
         _response: AsyncLiveResponse,
@@ -306,8 +296,9 @@ async def test_already_active_cancellation_joins_response_cleanup_once() -> None
         driver.execute(
             operation,
             context,
-            lambda _attempt: _request('cancel-before-response-cleanup'),
+            lambda _attempt: _request(),
             cancel_before_cleanup,
+            options=AsyncExecutionOptions(streaming=True),
         )
     )
 
@@ -333,15 +324,9 @@ async def test_already_active_cancellation_joins_response_cleanup_once() -> None
 async def test_attempt_control_collects_empty_and_multiple_chunks(
     chunks: tuple[bytes, ...],
 ) -> None:
-    clock_calls = 0
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
 
-    def clock() -> float:
-        nonlocal clock_calls
-        clock_calls += 1
-        return 1.0
-
-    control = AsyncAttemptControl(2, clock, 2.0, events.append, 'read', 'rpc')
+    control = AsyncAttemptControl(2, events.append, 'read', 'rpc')
 
     async def stream() -> AsyncIterator[bytes]:
         for chunk in chunks:
@@ -351,7 +336,6 @@ async def test_attempt_control_collects_empty_and_multiple_chunks(
 
     assert type(consumed) is bytes
     assert consumed == b''.join(chunks)
-    assert clock_calls == len(chunks)
     progress = [event for event in events if isinstance(event, ProgressEvent)]
     assert [event.bytes_transferred for event in progress] == ([1, 3] if chunks else [])
     assert [event.total_bytes for event in progress] == ([3, 3] if chunks else [])
@@ -360,27 +344,18 @@ async def test_attempt_control_collects_empty_and_multiple_chunks(
 @pytest.mark.anyio
 @pytest.mark.parametrize('body', [b'data', b''])
 async def test_attempt_control_consumes_buffered_body_without_copy(body: bytes) -> None:
-    clock_calls = 0
-    events: list[ObserverEvent] = []
-
-    def clock() -> float:
-        nonlocal clock_calls
-        clock_calls += 1
-        return 1.0
+    events: list[_ObserverEvent] = []
 
     control = AsyncAttemptControl(
         _attempt=2,
-        _clock=clock,
-        _deadline=2.0,
         _observer=events.append,
         _operation='read',
         _route='rpc',
     )
 
-    consumed = await control._consume_buffered(body, total_bytes=len(body))
+    consumed = await control.consume_buffered(body, total_bytes=len(body))
 
     assert consumed is body
-    assert clock_calls == 1
     progress = [event for event in events if isinstance(event, ProgressEvent)]
     assert [event.bytes_transferred for event in progress] == ([len(body)] if body else [])
     assert [event.total_bytes for event in progress] == ([len(body)] if body else [])
@@ -388,10 +363,10 @@ async def test_attempt_control_consumes_buffered_body_without_copy(body: bytes) 
 
 @pytest.mark.anyio
 async def test_async_request_factory_failure_releases_lease_without_sending() -> None:
-    fake = _AsyncFakeTransport([])
+    fake = AsyncFakeTransport([])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     def request_factory(_attempt: int) -> TransportRequest:
         raise ValueError('factory failed')
@@ -410,7 +385,7 @@ async def test_async_request_factory_failure_releases_lease_without_sending() ->
 
 
 @pytest.mark.anyio
-async def test_async_rpc_nested_extra_auth_matches_sync_payload() -> None:
+async def test_async_rpc_preserves_nested_extra_auth_in_payload() -> None:
     config = _config()
     config.extra_auth_params = {
         'nested': {
@@ -418,25 +393,21 @@ async def test_async_rpc_nested_extra_auth_matches_sync_payload() -> None:
         },
     }
     context = config_module.snapshot(config)
-    sync_fake = _FakeTransport([_OK])
-    async_fake = _AsyncFakeTransport([_OK])
+    async_fake = AsyncFakeTransport([_OK])
 
-    assert Driver(sync_fake, _DriverTiming(sleep=lambda _delay: None)).call(
-        'read',
-        {},
-        context,
-    ) == {'id': 7}
     assert await AsyncDriver(async_fake, _AsyncDriverTiming(sleep=_sleepless)).call(
         'read',
         {},
         context,
     ) == {'id': 7}
 
-    sync_body = sync_fake.requests[0].body
     async_body = async_fake.requests[0].body
-    assert isinstance(sync_body, bytes)
     assert isinstance(async_body, bytes)
-    assert json.loads(async_body) == json.loads(sync_body)
+    assert json.loads(async_body)['params'][0] == {
+        'script_name': 'script',
+        'script_key': 'key',
+        'nested': {'roles': ['artist', {'name': 'lead'}]},
+    }
 
 
 @pytest.mark.anyio
@@ -484,7 +455,7 @@ async def test_auth_and_unknown_categories_drive_retry_and_observer_choreography
     category: _protocol.OperationCategory,
     retries: bool,
 ) -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = Config()
     config.set_server_params('https://x.example')
     config.update_fields(
@@ -495,7 +466,7 @@ async def test_auth_and_unknown_categories_drive_retry_and_observer_choreography
         on_response=events.append,
         on_retry=events.append,
     )
-    fake = _AsyncFakeTransport([SendError('ambiguous'), _OK])
+    fake = AsyncFakeTransport([SendError('ambiguous'), _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     if retries:
@@ -523,12 +494,12 @@ async def test_batch_retries_only_when_every_member_is_replay_safe() -> None:
     safe = {'requests': [{'request_type': 'read'}, {'request_type': 'read'}]}
     unsafe = {'requests': [{'request_type': 'read'}, {'request_type': 'create'}]}
 
-    safe_fake = _AsyncFakeTransport([SendError('ambiguous'), _OK])
+    safe_fake = AsyncFakeTransport([SendError('ambiguous'), _OK])
     safe_driver = AsyncDriver(safe_fake, _AsyncDriverTiming(sleep=_sleepless))
     assert await safe_driver.call('batch', safe, config_module.snapshot(_config())) == {'id': 7}
     assert len(safe_fake.requests) == 2
 
-    unsafe_fake = _AsyncFakeTransport([SendError('ambiguous'), _OK])
+    unsafe_fake = AsyncFakeTransport([SendError('ambiguous'), _OK])
     unsafe_driver = AsyncDriver(unsafe_fake, _AsyncDriverTiming(sleep=_sleepless))
     with pytest.raises(SendError, match='ambiguous'):
         await unsafe_driver.call('batch', unsafe, config_module.snapshot(_config()))
@@ -560,7 +531,7 @@ async def test_call_routes_original_body_through_one_response_decode(
     )
 
     assert await AsyncDriver(
-        _AsyncFakeTransport([response]),
+        AsyncFakeTransport([response]),
         _AsyncDriverTiming(sleep=_sleepless),
     ).call('info', {}, config_module.snapshot(_config())) == {'id': 7}
     assert decoded_bodies == [body]
@@ -574,7 +545,7 @@ async def test_call_detaches_nested_input_before_request_and_retry_observers() -
     config = _config()
     config.on_request = lambda _event: values.append('request mutation')
     config.on_retry = lambda _event: values.append('retry mutation')
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     assert await driver.call('read', params, config_module.snapshot(config)) == {'id': 7}
@@ -591,15 +562,15 @@ async def test_call_detaches_nested_input_before_request_and_retry_observers() -
         }
     assert attempts[0].body == attempts[1].body
     assert attempts[0].body is not attempts[1].body
-    assert attempts[0].token != attempts[1].token
+    assert attempts[0] is not attempts[1]
 
 
 @pytest.mark.anyio
 async def test_call_publishes_infinite_timeout_compatibility_warning() -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.update_fields(timeout_secs=None, on_compatibility_warning=events.append)
-    driver = AsyncDriver(_AsyncFakeTransport([_OK]), _AsyncDriverTiming(sleep=_sleepless))
+    driver = AsyncDriver(AsyncFakeTransport([_OK]), _AsyncDriverTiming(sleep=_sleepless))
 
     assert await driver.call(
         'info',
@@ -607,7 +578,8 @@ async def test_call_publishes_infinite_timeout_compatibility_warning() -> None:
         config_module.snapshot(config),
     ) == {'id': 7}
 
-    warnings = [cast('CompatibilityWarningEvent', event) for event in events]
+    warnings = [event for event in events if isinstance(event, CompatibilityWarningEvent)]
+    assert len(warnings) == len(events)
     assert [event.code for event in warnings] == ['legacy-infinite-timeout']
 
 
@@ -618,7 +590,7 @@ async def test_cancellation_closes_request_body_and_releases_lease(
     transport = _HangingTransport()
     driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
     body = _Body()
     cleanup_worker_release = threading.Event()
     cleanup_worker_started = threading.Event()
@@ -655,7 +627,6 @@ async def test_cancellation_closes_request_body_and_releases_lease(
                 headers={},
                 body=body,
                 timeout=context.timeout,
-                token=_CANCELLED_UPLOAD_REQUEST_ID,
             ),
             consume,
         )
@@ -701,7 +672,7 @@ async def test_cancellation_during_backoff_releases_lease_without_another_attemp
         content=b'',
         on_close=lambda: response_closed.append('close'),
     )
-    fake = _AsyncFakeTransport([retry, _OK])
+    fake = AsyncFakeTransport([retry, _OK])
 
     async def sleep(_delay: float) -> None:
         started.set()
@@ -731,9 +702,9 @@ async def test_cancellation_during_post_response_body_cleanup_closes_response_on
 ) -> None:
     body = _BlockingCloseBody()
     response = _AsyncCloseResponse()
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
+    fake = AsyncFakeTransport([response])
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -751,9 +722,9 @@ async def test_cancellation_during_post_response_body_cleanup_closes_response_on
                 headers={},
                 body=body,
                 timeout=context.timeout,
-                token=_POST_RESPONSE_CLEANUP_REQUEST_ID,
             ),
             consume,
+            options=AsyncExecutionOptions(streaming=True),
         )
     )
     assert await asyncio.to_thread(body.close_started.wait, 1.0)
@@ -792,13 +763,13 @@ async def test_cancellation_retains_blocked_response_cleanup(
     response = _BlockingAsyncCloseResponse()
     if selected_outcome == 'retry':
         response.status = 502
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([response])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = config_module.snapshot(config)
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def select_outcome(
         _response: AsyncLiveResponse,
@@ -812,8 +783,9 @@ async def test_cancellation_retains_blocked_response_cleanup(
         driver.execute(
             operation,
             context,
-            lambda _attempt: _request('blocked-response-cleanup'),
+            lambda _attempt: _request(),
             select_outcome,
+            options=AsyncExecutionOptions(streaming=True),
         )
     )
     await response.close_started.wait()
@@ -839,13 +811,13 @@ async def test_cancellation_retains_blocked_response_cleanup(
 @pytest.mark.anyio
 async def test_cancellation_survives_failing_async_response_cleanup() -> None:
     response = _AsyncCloseResponse(RuntimeError('close failed'))
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
+    fake = AsyncFakeTransport([response])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = config_module.snapshot(config)
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def cancel(
         _response: AsyncLiveResponse,
@@ -857,8 +829,9 @@ async def test_cancellation_survives_failing_async_response_cleanup() -> None:
         await driver.execute(
             operation,
             context,
-            lambda _attempt: _request('cancel-response'),
+            lambda _attempt: _request(),
             cancel,
+            options=AsyncExecutionOptions(streaming=True),
         )
 
     await asyncio.sleep(0)
@@ -874,7 +847,7 @@ async def test_cancelled_blocked_body_pull_cleans_up_without_racing_or_delaying(
     transport = _PullingHangingTransport()
     driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
     body = _BlockingBody()
 
     async def consume(
@@ -893,7 +866,6 @@ async def test_cancelled_blocked_body_pull_cleans_up_without_racing_or_delaying(
                 headers={},
                 body=body,
                 timeout=context.timeout,
-                token=_BLOCKED_UPLOAD_REQUEST_ID,
             ),
             consume,
         )
@@ -924,13 +896,13 @@ async def test_close_failure_preserves_success_metadata_and_event() -> None:
         close_status=599,
         headers={'x-sg-correlation-id': 'selected-correlation'},
     )
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([response])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = config_module.snapshot(config)
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -939,13 +911,14 @@ async def test_close_failure_preserves_success_metadata_and_event() -> None:
         return 'complete'
 
     try:
-        _raise_ambient_exception()
+        raise_ambient_exception()
     except RuntimeError:
         result = await driver.execute(
             operation,
             context,
-            lambda _attempt: _request('close-failure'),
+            lambda _attempt: _request(),
             consume,
+            options=AsyncExecutionOptions(streaming=True),
         )
 
     assert result == 'complete'
@@ -964,8 +937,8 @@ async def test_close_failures_preserve_retries_and_last_result() -> None:
         _AsyncCloseResponse(RuntimeError('secret backend close text'), status=status)
         for status in (503, 503, 200)
     ]
-    fake = _AsyncFakeTransport([cast('TransportResponse', response) for response in responses])
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([*responses])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.update_fields(
         max_rpc_attempts=3,
@@ -975,7 +948,7 @@ async def test_close_failures_preserve_retries_and_last_result() -> None:
     )
     context = config_module.snapshot(config)
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -984,13 +957,14 @@ async def test_close_failures_preserve_retries_and_last_result() -> None:
         return {'id': 7}
 
     try:
-        _raise_ambient_exception()
+        raise_ambient_exception()
     except RuntimeError:
         result = await driver.execute(
             operation,
             context,
-            lambda attempt: _request(f'close-failure-retry-{attempt}'),
+            lambda _attempt: _request(),
             consume,
+            options=AsyncExecutionOptions(streaming=True),
         )
 
     assert result == {'id': 7}
@@ -1012,10 +986,10 @@ async def test_common_executor_streams_download_and_closes_response_once() -> No
         content=b'data',
         on_close=lambda: closed.append('close'),
     )
-    fake = _AsyncFakeTransport([response])
+    fake = AsyncFakeTransport([response])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def consume(
         live_response: AsyncLiveResponse,
@@ -1027,7 +1001,7 @@ async def test_common_executor_streams_download_and_closes_response_once() -> No
     result = await driver.execute(
         operation,
         context,
-        lambda attempt: _request(f'download-{attempt}'),
+        lambda _attempt: _request(),
         consume,
         options=AsyncExecutionOptions(streaming=True),
     )
@@ -1040,13 +1014,13 @@ async def test_common_executor_streams_download_and_closes_response_once() -> No
 @pytest.mark.anyio
 async def test_consumer_failure_survives_close_failure_with_one_error_event() -> None:
     response = _AsyncCloseResponse(RuntimeError('close failed'))
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([response])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = config_module.snapshot(config)
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -1058,8 +1032,9 @@ async def test_consumer_failure_survives_close_failure_with_one_error_event() ->
         await driver.execute(
             operation,
             context,
-            lambda _attempt: _request('consumer-failure'),
+            lambda _attempt: _request(),
             consume,
+            options=AsyncExecutionOptions(streaming=True),
         )
 
     assert response.close_calls == 1
@@ -1070,7 +1045,7 @@ async def test_consumer_failure_survives_close_failure_with_one_error_event() ->
 
 @pytest.mark.anyio
 async def test_control_consumes_stream_into_async_sink_with_progress() -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_progress = events.append
     context = config_module.snapshot(config)
@@ -1080,9 +1055,9 @@ async def test_control_consumes_stream_into_async_sink_with_progress() -> None:
         headers={'content-length': '4'},
         content=b'data',
     )
-    fake = _AsyncFakeTransport([response])
+    fake = AsyncFakeTransport([response])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
     chunks: list[bytes] = []
 
     async def sink(chunk: bytes) -> None:
@@ -1105,7 +1080,7 @@ async def test_control_consumes_stream_into_async_sink_with_progress() -> None:
         await driver.execute(
             operation,
             context,
-            lambda _attempt: _request('async-sink'),
+            lambda _attempt: _request(),
             consume,
             options=AsyncExecutionOptions(streaming=True),
         )
@@ -1119,10 +1094,10 @@ async def test_control_consumes_stream_into_async_sink_with_progress() -> None:
 
 @pytest.mark.anyio
 async def test_download_retries_body_read_transport_error() -> None:
-    fake = _AsyncFakeTransport([_OK, _OK])
+    fake = AsyncFakeTransport([_OK, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
     attempts = 0
 
     async def consume(
@@ -1139,7 +1114,7 @@ async def test_download_retries_body_read_transport_error() -> None:
         await driver.execute(
             operation,
             context,
-            lambda attempt: _request(f'download-{attempt}'),
+            lambda _attempt: _request(),
             consume,
         )
         == b'data'
@@ -1170,10 +1145,10 @@ async def test_endpoint_role_controls_ambiguous_send_replay(
     endpoint_role: _protocol._EndpointRole,
     retries: bool,
 ) -> None:
-    fake = _AsyncFakeTransport([SendError('ambiguous'), _OK])
+    fake = AsyncFakeTransport([SendError('ambiguous'), _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint(endpoint_role, body_restartable=True)
+    operation = _protocol.classify_endpoint(endpoint_role)
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -1186,7 +1161,7 @@ async def test_endpoint_role_controls_ambiguous_send_replay(
             await driver.execute(
                 operation,
                 context,
-                lambda attempt: _request(f'endpoint-{attempt}'),
+                lambda _attempt: _request(),
                 consume,
             )
             == 'ok'
@@ -1197,7 +1172,7 @@ async def test_endpoint_role_controls_ambiguous_send_replay(
             await driver.execute(
                 operation,
                 context,
-                lambda attempt: _request(f'endpoint-{attempt}'),
+                lambda _attempt: _request(),
                 consume,
             )
         assert len(fake.requests) == 1
@@ -1205,15 +1180,15 @@ async def test_endpoint_role_controls_ambiguous_send_replay(
 
 @pytest.mark.anyio
 async def test_executor_builds_fresh_request_per_attempt() -> None:
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
     built: list[int] = []
 
     def request_factory(attempt: int) -> TransportRequest:
         built.append(attempt)
-        return _request(f'async-{attempt}')
+        return _request()
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -1232,18 +1207,19 @@ async def test_executor_builds_fresh_request_per_attempt() -> None:
     )
 
     assert built == [1, 2]
-    assert [request.token for request in fake.requests] == ['async-1', 'async-2']
+    assert len(fake.requests) == 2
+    assert fake.requests[0] is not fake.requests[1]
 
 
 @pytest.mark.anyio
 async def test_executor_rebuilds_and_closes_upload_body_per_attempt() -> None:
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
     bodies: list[_Body] = []
 
-    def request_factory(attempt: int) -> TransportRequest:
+    def request_factory(_attempt: int) -> TransportRequest:
         body = _Body()
         bodies.append(body)
         return TransportRequest(
@@ -1252,7 +1228,6 @@ async def test_executor_rebuilds_and_closes_upload_body_per_attempt() -> None:
             headers={},
             body=body,
             timeout=context.timeout,
-            token=f'upload-{attempt}',
         )
 
     async def consume(
@@ -1270,10 +1245,10 @@ async def test_executor_rebuilds_and_closes_upload_body_per_attempt() -> None:
 
 @pytest.mark.anyio
 async def test_form_post_retries_through_common_executor() -> None:
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('read', body_restartable=True)
+    operation = _protocol.classify_endpoint('read')
 
     def request_factory(attempt: int) -> TransportRequest:
         return TransportRequest(
@@ -1282,7 +1257,6 @@ async def test_form_post_retries_through_common_executor() -> None:
             headers={'content-type': 'application/x-www-form-urlencoded'},
             body=f'attempt={attempt}'.encode(),
             timeout=context.timeout,
-            token=f'form-{attempt}',
         )
 
     async def consume(
@@ -1301,12 +1275,12 @@ async def test_form_post_retries_through_common_executor() -> None:
         == 'form-result'
     )
     assert [request.method for request in fake.requests] == ['POST', 'POST']
-    assert [request.token for request in fake.requests] == ['form-1', 'form-2']
+    assert [request.body for request in fake.requests] == [b'attempt=1', b'attempt=2']
 
 
 @pytest.mark.anyio
 async def test_logical_method_controls_retry_without_changing_wire_method() -> None:
-    fake = _AsyncFakeTransport([SendError('ambiguous')])
+    fake = AsyncFakeTransport([SendError('ambiguous')])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     with pytest.raises(SendError, match='ambiguous'):
@@ -1324,34 +1298,10 @@ async def test_logical_method_controls_retry_without_changing_wire_method() -> N
 
 
 @pytest.mark.anyio
-async def test_nonrestartable_body_never_retries_presend_failure() -> None:
-    fake = _AsyncFakeTransport([ConnectError('refused'), _OK])
-    driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-    context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=False)
-
-    async def consume(
-        _response: AsyncLiveResponse,
-        _control: AsyncAttemptControl,
-    ) -> str:
-        return 'ok'
-
-    with pytest.raises(ConnectError, match='refused'):
-        await driver.execute(
-            operation,
-            context,
-            lambda attempt: _request(f'upload-{attempt}'),
-            consume,
-        )
-
-    assert len(fake.requests) == 1
-
-
-@pytest.mark.anyio
 async def test_observer_failures_are_sanitized_and_noninvasive(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    def fail(_event: ObserverEvent) -> None:
+    def fail(_event: _ObserverEvent) -> None:
         raise RuntimeError('observer-secret')
 
     config = _config()
@@ -1361,7 +1311,7 @@ async def test_observer_failures_are_sanitized_and_noninvasive(
         on_response=fail,
         on_retry=fail,
     )
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
 
     with caplog.at_level('WARNING', logger='shotgun_api3'):
         assert await AsyncDriver(
@@ -1375,7 +1325,7 @@ async def test_observer_failures_are_sanitized_and_noninvasive(
 
 @pytest.mark.anyio
 async def test_observers_record_retry_progress_and_fresh_rpc_attempts() -> None:
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sleeps: list[float] = []
 
     async def sleep(delay: float) -> None:
@@ -1388,7 +1338,7 @@ async def test_observers_record_retry_progress_and_fresh_rpc_attempts() -> None:
         on_response=events.append,
         on_retry=events.append,
     )
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
     timing = _AsyncDriverTiming(jitter_seed=lambda: 1000.25, sleep=sleep)
 
     assert await AsyncDriver(fake, timing).call('info', {}, config_module.snapshot(config)) == {
@@ -1404,7 +1354,7 @@ async def test_observers_record_retry_progress_and_fresh_rpc_attempts() -> None:
         ResponseEvent,
     ]
     assert len(sleeps) == 1
-    assert len({request.token for request in fake.requests}) == 2
+    assert len({id(request) for request in fake.requests}) == 2
     assert fake.requests[0].body == fake.requests[1].body
     assert fake.requests[0].body is not fake.requests[1].body
 
@@ -1416,7 +1366,7 @@ async def test_pending_caller_cancellation_replaces_send_error_before_body_clean
     transport = _HangingTransport()
     driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
     body = _BlockingCloseBody()
 
     async def cancel_then_fail(request: TransportRequest) -> TransportResponse:
@@ -1443,7 +1393,6 @@ async def test_pending_caller_cancellation_replaces_send_error_before_body_clean
                 headers={},
                 body=body,
                 timeout=context.timeout,
-                token=_PENDING_BODY_CLEANUP_REQUEST_ID,
             ),
             consume,
         )
@@ -1474,12 +1423,12 @@ async def test_pending_caller_cancellation_replaces_send_error_before_body_clean
 async def test_post_response_body_close_failure_preserves_primary_and_closes_response() -> None:
     body = _FailingCloseBody()
     response = _AsyncCloseResponse(RuntimeError('response close failed'))
-    fake = _AsyncFakeTransport([cast('TransportResponse', response)])
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([response])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = config_module.snapshot(config)
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -1497,9 +1446,9 @@ async def test_post_response_body_close_failure_preserves_primary_and_closes_res
                 headers={},
                 body=body,
                 timeout=context.timeout,
-                token=_POST_RESPONSE_CLOSE_FAILURE_REQUEST_ID,
             ),
             consume,
+            options=AsyncExecutionOptions(streaming=True),
         )
 
     assert body.close_calls == 1
@@ -1512,7 +1461,7 @@ async def test_post_response_body_close_failure_preserves_primary_and_closes_res
 
 @pytest.mark.anyio
 async def test_public_info_extracts_results() -> None:
-    fake = _AsyncFakeTransport([_OK])
+    fake = AsyncFakeTransport([_OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     result = await driver.call('info', {}, config_module.snapshot(_config()))
@@ -1523,7 +1472,7 @@ async def test_public_info_extracts_results() -> None:
 
 @pytest.mark.anyio
 async def test_read_retries_connect_error() -> None:
-    fake = _AsyncFakeTransport([ConnectError('refused'), _OK])
+    fake = AsyncFakeTransport([ConnectError('refused'), _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     assert await driver.call('read', {'type': 'Shot'}, config_module.snapshot(_config())) == {
@@ -1546,17 +1495,15 @@ async def test_redirect_close_failure_preserves_redirect_and_observer() -> None:
         },
     )
     final = _AsyncCloseResponse(headers={'x-sg-correlation-id': 'final-correlation'})
-    fake = _AsyncFakeTransport(
-        [cast('TransportResponse', redirect), cast('TransportResponse', final)]
-    )
-    events: list[ObserverEvent] = []
+    fake = AsyncFakeTransport([redirect, final])
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_response = events.append
     context = dataclasses.replace(config_module.snapshot(config), max_rpc_attempts=1)
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     def redirect_factory(response: AsyncLiveResponse) -> TransportRequest:
-        return dataclasses.replace(_request('redirect'), url=response.headers['location'])
+        return dataclasses.replace(_request(), url=response.headers['location'])
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -1565,14 +1512,14 @@ async def test_redirect_close_failure_preserves_redirect_and_observer() -> None:
         return b'data'
 
     try:
-        _raise_ambient_exception()
+        raise_ambient_exception()
     except RuntimeError:
         result = await AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless)).execute(
             operation,
             context,
-            lambda _attempt: _request('original'),
+            lambda _attempt: _request(),
             consume,
-            options=AsyncExecutionOptions(redirect_factory=redirect_factory),
+            options=AsyncExecutionOptions(redirect_factory=redirect_factory, streaming=True),
         )
 
     assert result == b'data'
@@ -1613,7 +1560,7 @@ async def test_request_body_cleanup_iterator_creates_one_task_and_closes_off_loo
 
     monkeypatch.setattr(body, 'close', close)
     monkeypatch.setattr(_async_driver.asyncio, 'create_task', create_task)
-    request = dataclasses.replace(_request('iterator-body-cleanup'), body=body)
+    request = dataclasses.replace(_request(), body=body)
 
     await _close_request_body_after_send(request)
 
@@ -1627,7 +1574,7 @@ async def test_request_body_cleanup_iterator_creates_one_task_and_closes_off_loo
 async def test_request_body_cleanup_looks_up_and_invokes_close_off_loop() -> None:
     body = _DescriptorCloseBody()
     loop_thread = threading.get_ident()
-    request = dataclasses.replace(_request('shared-body-close'), body=body)
+    request = dataclasses.replace(_request(), body=body)
 
     await _close_request_body_after_send(request)
 
@@ -1642,7 +1589,7 @@ async def test_request_body_cleanup_lookup_failure_preserves_active_primary_exce
     lookup_error = RuntimeError('descriptor lookup failed')
     primary_error = RuntimeError('active primary')
     body = _DescriptorCloseBody(lookup_error)
-    request = dataclasses.replace(_request('failing-body-close-lookup'), body=body)
+    request = dataclasses.replace(_request(), body=body)
 
     async def fail_with_cleanup() -> None:
         try:
@@ -1675,7 +1622,7 @@ async def test_request_body_cleanup_none_or_bytes_schedules_no_work(
 
     monkeypatch.setattr(_async_driver.asyncio, 'create_task', unexpected_work)
     monkeypatch.setattr(_async_driver.asyncio, 'to_thread', unexpected_work)
-    request = dataclasses.replace(_request('no-op-body-cleanup'), body=body)
+    request = dataclasses.replace(_request(), body=body)
 
     await _close_request_body_after_send(request)
 
@@ -1694,7 +1641,7 @@ async def test_response_closes_before_retry_sleep() -> None:
     async def sleep(_delay: float) -> None:
         order.append('sleep')
 
-    fake = _AsyncFakeTransport([gateway, _OK])
+    fake = AsyncFakeTransport([gateway, _OK])
 
     assert await AsyncDriver(fake, _AsyncDriverTiming(sleep=sleep)).call(
         'info',
@@ -1706,29 +1653,8 @@ async def test_response_closes_before_retry_sleep() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ('retry_after', 'expected_delay', 'should_retry'),
-    [
-        pytest.param('0', 0.0, True, id='delta-zero'),
-        pytest.param('30', 30.0, True, id='delta-cap'),
-        pytest.param('31', None, False, id='delta-oversized'),
-        pytest.param('9' * 5_000, None, False, id='delta-very-long-oversized'),
-        pytest.param('Wed, 01 Jan 2025 00:00:00 GMT', 0.0, True, id='date-zero'),
-        pytest.param('Wed, 01 Jan 2025 00:00:30 GMT', 30.0, True, id='date-cap'),
-        pytest.param('Wed, 01 Jan 2025 00:00:31 GMT', None, False, id='date-oversized'),
-        pytest.param('tomorrow', None, True, id='malformed'),
-        pytest.param('-1', None, True, id='negative'),
-        pytest.param('NaN', None, True, id='nan'),
-        pytest.param('Infinity', None, True, id='positive-infinity'),
-        pytest.param('-Infinity', None, True, id='negative-infinity'),
-    ],
-)
-async def test_retry_after_never_sleeps_above_backoff_cap(
-    retry_after: str,
-    expected_delay: float | None,
-    should_retry: bool,
-) -> None:
-    retries: list[ObserverEvent] = []
+async def test_retry_after_never_sleeps_above_backoff_cap() -> None:
+    retries: list[_ObserverEvent] = []
     sleeps: list[float] = []
 
     async def sleep(delay: float) -> None:
@@ -1740,10 +1666,10 @@ async def test_retry_after_never_sleeps_above_backoff_cap(
     retry = TransportResponse(
         status=429,
         reason='Retry Later',
-        headers={'retry-after': retry_after},
+        headers={'retry-after': 'Wed, 01 Jan 2025 00:00:30 GMT'},
         content=b'',
     )
-    transport = _AsyncFakeTransport([retry, _OK])
+    transport = AsyncFakeTransport([retry, _OK])
     driver = AsyncDriver(
         transport,
         _AsyncDriverTiming(
@@ -1753,47 +1679,16 @@ async def test_retry_after_never_sleeps_above_backoff_cap(
         ),
     )
 
-    if not should_retry:
-        with pytest.raises(_errors.ProtocolError):
-            await driver.call('info', {}, config_module.snapshot(config))
-        assert sleeps == []
-        assert retries == []
-        assert len(transport.requests) == 1
-        return
-
     assert await driver.call('info', {}, config_module.snapshot(config)) == {'id': 7}
-    if expected_delay is None:
-        fallback_delay = _protocol.decide(
-            _protocol.classify('read', {}),
-            1,
-            _protocol.Failure('http_status', 'rate_limit', 429, None),
-            max_attempts=config.max_rpc_attempts,
-            base_interval=config.rpc_attempt_interval / 1000.0,
-            now=1000.25,
-        )
-        assert fallback_delay is not None
-        assert sleeps == [fallback_delay]
-    else:
-        assert sleeps == [expected_delay]
+    assert sleeps == [30.0]
     assert all(delay <= 30.0 for delay in sleeps)
     assert [type(event) for event in retries] == [RetryEvent]
     assert len(transport.requests) == 2
 
 
 @pytest.mark.anyio
-async def test_retry_holds_one_lease_for_the_whole_logical_rpc() -> None:
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
-    driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
-
-    assert await driver.call('info', {}, config_module.snapshot(_config())) == {'id': 7}
-
-    assert len(fake.requests) == 2
-    assert (fake.leases, fake.checkins) == (1, 1)
-
-
-@pytest.mark.anyio
 async def test_retry_sleep_runs_inside_the_logical_rpc_lease() -> None:
-    fake = _AsyncFakeTransport([_GATEWAY, _OK])
+    fake = AsyncFakeTransport([_GATEWAY, _OK])
 
     async def sleep(_delay: float) -> None:
         assert (fake.leases, fake.checkins) == (1, 0)
@@ -1815,13 +1710,21 @@ async def test_rpc_fault_and_terminal_status_close_before_propagating() -> None:
         on_close=lambda: closed.append('fault'),
     )
     driver = AsyncDriver(
-        _AsyncFakeTransport([fault]),
+        AsyncFakeTransport([fault]),
         _AsyncDriverTiming(sleep=_sleepless),
     )
 
     with pytest.raises(_errors.AuthenticationFault):
         await driver.call('read', {'type': 'Shot'}, config_module.snapshot(_config()))
 
+    retries: list[_ObserverEvent] = []
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    config = _config()
+    config.on_retry = retries.append
     forbidden = TransportResponse(
         status=403,
         reason='Forbidden',
@@ -1829,15 +1732,16 @@ async def test_rpc_fault_and_terminal_status_close_before_propagating() -> None:
         content=b'denied',
         on_close=lambda: closed.append('status'),
     )
-    driver = AsyncDriver(
-        _AsyncFakeTransport([forbidden]),
-        _AsyncDriverTiming(sleep=_sleepless),
-    )
+    transport = AsyncFakeTransport([forbidden])
+    driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=sleep))
 
     with pytest.raises(_errors.ProtocolError):
-        await driver.call('read', {'type': 'Shot'}, config_module.snapshot(_config()))
+        await driver.call('read', {'type': 'Shot'}, config_module.snapshot(config))
 
     assert closed == ['fault', 'status']
+    assert len(transport.requests) == 1
+    assert sleeps == []
+    assert retries == []
 
 
 @pytest.mark.anyio
@@ -1849,7 +1753,7 @@ async def test_rpc_non_json_response_uses_shared_normalization() -> None:
         content=b'plain response',
     )
     driver = AsyncDriver(
-        _AsyncFakeTransport([response]),
+        AsyncFakeTransport([response]),
         _AsyncDriverTiming(sleep=_sleepless),
     )
 
@@ -1857,15 +1761,14 @@ async def test_rpc_non_json_response_uses_shared_normalization() -> None:
 
 
 @pytest.mark.anyio
-async def test_streaming_deadline_allows_equality_then_rejects_overrun() -> None:
-    ticks = iter((0.0, 0.2, 0.4, 0.8, 1.0, 1.2, 1.4))
-    events: list[ObserverEvent] = []
+async def test_streaming_consumer_reports_progress() -> None:
+    events: list[_ObserverEvent] = []
     config = _config()
     config.on_progress = events.append
     context = dataclasses.replace(
         config_module.snapshot(config),
         max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0),
+        timeout=TimeoutConfig(connect=1.0, read=1.0),
     )
     response = TransportResponse(
         status=200,
@@ -1874,10 +1777,10 @@ async def test_streaming_deadline_allows_equality_then_rejects_overrun() -> None
         content=b'abcd',
     )
     driver = AsyncDriver(
-        _AsyncFakeTransport([response]),
-        _AsyncDriverTiming(clock=lambda: next(ticks), sleep=_sleepless),
+        AsyncFakeTransport([response]),
+        _AsyncDriverTiming(sleep=_sleepless),
     )
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     async def consume(
         live_response: AsyncLiveResponse,
@@ -1886,17 +1789,17 @@ async def test_streaming_deadline_allows_equality_then_rejects_overrun() -> None
         streaming = cast('AsyncStreamingResponse', live_response)
         return await control.consume(streaming.aiter_chunks(1), total_bytes=4)
 
-    with pytest.raises(ReadTimeoutError, match='total attempt timeout exceeded'):
-        await driver.execute(
-            operation,
-            context,
-            lambda _attempt: _request('deadline'),
-            consume,
-            options=AsyncExecutionOptions(streaming=True),
-        )
+    result = await driver.execute(
+        operation,
+        context,
+        lambda _attempt: _request(),
+        consume,
+        options=AsyncExecutionOptions(streaming=True),
+    )
 
+    assert result == b'abcd'
     progress = [event for event in events if isinstance(event, ProgressEvent)]
-    assert [event.bytes_transferred for event in progress] == [1, 2, 3]
+    assert [event.bytes_transferred for event in progress] == [1, 2, 3, 4]
 
 
 @pytest.mark.anyio
@@ -1916,14 +1819,14 @@ async def test_streaming_redirect_stays_inside_one_leased_attempt() -> None:
         content=b'data',
         on_close=lambda: releases.append('final'),
     )
-    fake = _AsyncFakeTransport([redirect, final])
+    fake = AsyncFakeTransport([redirect, final])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = dataclasses.replace(config_module.snapshot(_config()), max_rpc_attempts=1)
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
+    operation = _protocol.classify_endpoint('download')
 
     def redirect_factory(response: AsyncLiveResponse) -> TransportRequest:
         return dataclasses.replace(
-            _request('redirect'),
+            _request(),
             url=response.headers['location'],
         )
 
@@ -1938,7 +1841,7 @@ async def test_streaming_redirect_stays_inside_one_leased_attempt() -> None:
         await driver.execute(
             operation,
             context,
-            lambda _attempt: _request('original'),
+            lambda _attempt: _request(),
             consume,
             options=AsyncExecutionOptions(
                 redirect_factory=redirect_factory,
@@ -1957,72 +1860,13 @@ async def test_streaming_redirect_stays_inside_one_leased_attempt() -> None:
 
 
 @pytest.mark.anyio
-async def test_streaming_redirect_uses_only_remaining_total_timeout() -> None:
-    ticks = iter((0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
-    redirect = TransportResponse(
-        status=302,
-        reason='Found',
-        headers={'location': 'https://storage.example/signed'},
-        content=b'',
-    )
-    final = TransportResponse(
-        status=200,
-        reason='OK',
-        headers={},
-        content=b'data',
-    )
-    fake = _AsyncFakeTransport([redirect, final])
-    context = dataclasses.replace(
-        config_module.snapshot(_config()),
-        max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
-    )
-    driver = AsyncDriver(
-        fake,
-        _AsyncDriverTiming(clock=lambda: next(ticks), sleep=_sleepless),
-    )
-    operation = _protocol.classify_endpoint('download', body_restartable=True)
-
-    def redirect_factory(response: AsyncLiveResponse) -> TransportRequest:
-        return dataclasses.replace(
-            _request('redirect-timeout'),
-            timeout=context.timeout,
-            url=response.headers['location'],
-        )
-
-    async def consume(
-        response: AsyncLiveResponse,
-        control: AsyncAttemptControl,
-    ) -> bytes:
-        streaming = cast('AsyncStreamingResponse', response)
-        return await control.consume(streaming.aiter_chunks(), total_bytes=4)
-
-    assert (
-        await driver.execute(
-            operation,
-            context,
-            lambda _attempt: dataclasses.replace(
-                _request('original-timeout'),
-                timeout=context.timeout,
-            ),
-            consume,
-            options=AsyncExecutionOptions(
-                redirect_factory=redirect_factory,
-                streaming=True,
-            ),
-        )
-        == b'data'
-    )
-
-    assert fake.requests[0].timeout.total == 10.0
-    assert fake.requests[1].timeout.total == 7.0
-
-
-@pytest.mark.anyio
 @pytest.mark.parametrize('streaming', [False, True])
-async def test_redirect_budget_includes_request_observer_time(streaming: bool) -> None:
+async def test_redirect_latency_includes_cleanup_and_request_observer_time(
+    streaming: bool,
+) -> None:
     now = 0.0
     requests: list[RequestEvent] = []
+    responses: list[_ObserverEvent] = []
     redirect = TransportResponse(
         status=302,
         reason='Found',
@@ -2031,24 +1875,25 @@ async def test_redirect_budget_includes_request_observer_time(streaming: bool) -
         on_close=lambda: advance(3.0),
     )
     final = TransportResponse(status=200, reason='OK', headers={}, content=b'data')
-    fake = _AsyncFakeTransport([redirect, final])
+    fake = AsyncFakeTransport([redirect, final])
     config = _config()
 
     def advance(value: float) -> None:
         nonlocal now
         now = value
 
-    def observe(event: ObserverEvent) -> None:
+    def observe(event: _ObserverEvent) -> None:
         assert isinstance(event, RequestEvent)
         requests.append(event)
         if len(requests) == 2:
             advance(5.0)
 
     config.on_request = observe
+    config.on_response = responses.append
     context = dataclasses.replace(
         config_module.snapshot(config),
         max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
+        timeout=TimeoutConfig(connect=10.0, read=10.0),
     )
 
     async def consume(response: AsyncLiveResponse, control: AsyncAttemptControl) -> bytes:
@@ -2056,16 +1901,17 @@ async def test_redirect_budget_includes_request_observer_time(streaming: bool) -
             return await control.consume(
                 cast('AsyncStreamingResponse', response).aiter_chunks(), total_bytes=4
             )
-        return cast('TransportResponse', response).content
+        assert isinstance(response, TransportResponse)
+        return response.content
 
     result = await AsyncDriver(fake, _AsyncDriverTiming(clock=lambda: now)).execute(
         _protocol.classify_endpoint('download'),
         context,
-        lambda _attempt: dataclasses.replace(_request('original'), timeout=context.timeout),
+        lambda _attempt: dataclasses.replace(_request(), timeout=context.timeout),
         consume,
         options=AsyncExecutionOptions(
             redirect_factory=lambda response: dataclasses.replace(
-                _request('redirected'),
+                _request(),
                 timeout=context.timeout,
                 url=response.headers['location'],
             ),
@@ -2075,21 +1921,21 @@ async def test_redirect_budget_includes_request_observer_time(streaming: bool) -
 
     assert result == b'data'
     assert len(requests) == 2
-    assert [request.timeout.total for request in fake.requests] == [10.0, 5.0]
+    assert [event.latency for event in responses if isinstance(event, ResponseEvent)] == [
+        3.0,
+        5.0,
+    ]
     assert (fake.leases, fake.checkins) == (1, 1)
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize('streaming', [False, True])
-@pytest.mark.parametrize('expiry', ['cleanup', 'observer'])
 @pytest.mark.parametrize('policy', ['one_attempt', 'replay_safe', 'unsafe'])
-async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
+async def test_redirect_read_failure_uses_attempt_retry_policy(
     streaming: bool,
-    expiry: str,
     policy: str,
 ) -> None:
-    now = 0.0
-    events: list[ObserverEvent] = []
+    events: list[_ObserverEvent] = []
     sleeps: list[float] = []
     body_closes: list[str] = []
     response_closes: list[str] = []
@@ -2112,28 +1958,20 @@ async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
         content=b'data',
         on_close=lambda: response_closes.append('final'),
     )
-    fake = _AsyncFakeTransport([redirects[0], redirects[1], final])
+    fake = AsyncFakeTransport(
+        [redirects[0], ReadTimeoutError('redirect read failed'), redirects[1], final]
+    )
     config = _config()
 
     def close_redirect(attempt: int) -> None:
-        nonlocal now
         response_closes.append(f'redirect-{attempt}')
-        now = (11.0 if expiry == 'cleanup' else 3.0) if attempt == 1 else 23.0
 
-    def observe_request(event: ObserverEvent) -> None:
-        nonlocal now
+    def observe_request(event: _ObserverEvent) -> None:
         assert isinstance(event, RequestEvent)
         events.append(event)
-        request_count = len([item for item in events if isinstance(item, RequestEvent)])
-        if request_count == 2:
-            now = 11.0 if expiry == 'observer' else now
-        elif request_count == 4:
-            now = 25.0
 
     async def sleep(delay: float) -> None:
-        nonlocal now
         sleeps.append(delay)
-        now = 20.0
 
     config.update_fields(
         on_request=observe_request,
@@ -2143,13 +1981,13 @@ async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
     )
     context = dataclasses.replace(
         config_module.snapshot(config),
-        timeout=TimeoutConfig(connect=10.0, read=10.0, total=10.0),
+        timeout=TimeoutConfig(connect=10.0, read=10.0),
     )
 
     def redirect_factory(response: AsyncLiveResponse) -> TransportRequest:
         attempt = len([item for item in events if isinstance(item, RequestEvent)])
         return dataclasses.replace(
-            _request(f'redirect-{attempt}'),
+            _request(),
             timeout=context.timeout,
             url=response.headers['location'],
             headers={'authorization': 'secret-request-header'},
@@ -2158,18 +1996,19 @@ async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
 
     async def consume(response: AsyncLiveResponse, _control: AsyncAttemptControl) -> bytes:
         consumer_calls.append('consume')
-        return cast('TransportResponse', response).content if not streaming else b'data'
+        if streaming:
+            return b'data'
+        assert isinstance(response, TransportResponse)
+        return response.content
 
-    driver = AsyncDriver(fake, _AsyncDriverTiming(clock=lambda: now, sleep=sleep))
+    driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=sleep))
     operation = _protocol.classify_endpoint('allocation' if policy == 'unsafe' else 'download')
 
     async def call() -> bytes:
         return await driver.execute(
             operation,
             context,
-            lambda attempt: dataclasses.replace(
-                _request(f'original-{attempt}'), timeout=context.timeout
-            ),
+            lambda _attempt: dataclasses.replace(_request(), timeout=context.timeout),
             consume,
             options=AsyncExecutionOptions(redirect_factory=redirect_factory, streaming=streaming),
         )
@@ -2181,9 +2020,9 @@ async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
             await call()
 
     assert (
-        [request.timeout.total for request in fake.requests],
+        len(fake.requests),
         len([event for event in events if isinstance(event, RequestEvent)]),
-    ) == (([10.0, 10.0, 5.0], 4) if retry else ([10.0], 2))
+    ) == ((4, 4) if retry else (2, 2))
     assert [
         (event.attempt, event.status, event.outcome)
         for event in events
@@ -2209,10 +2048,10 @@ async def test_redirect_deadline_expiry_uses_attempt_retry_policy(
 
 @pytest.mark.anyio
 async def test_unsafe_allocation_does_not_retry_body_read_transport_error() -> None:
-    fake = _AsyncFakeTransport([_OK, _OK])
+    fake = AsyncFakeTransport([_OK, _OK])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
     context = config_module.snapshot(_config())
-    operation = _protocol.classify_endpoint('allocation', body_restartable=True)
+    operation = _protocol.classify_endpoint('allocation')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -2224,58 +2063,11 @@ async def test_unsafe_allocation_does_not_retry_body_read_transport_error() -> N
         await driver.execute(
             operation,
             context,
-            lambda attempt: _request(f'allocation-{attempt}'),
+            lambda _attempt: _request(),
             consume,
         )
 
     assert len(fake.requests) == 1
-
-
-@pytest.mark.anyio
-async def test_upload_progress_deadline_raises_on_loop_before_return() -> None:
-    loop_thread = threading.get_ident()
-    clock_threads: list[int] = []
-    ticks = iter((0.0, 2.0, 2.0))
-
-    def clock() -> float:
-        clock_threads.append(threading.get_ident())
-        return next(ticks)
-
-    context = dataclasses.replace(
-        config_module.snapshot(_config()),
-        max_rpc_attempts=1,
-        timeout=TimeoutConfig(connect=1.0, read=1.0, total=1.0),
-    )
-    transport = _LoopPullingTransport()
-    driver = AsyncDriver(
-        transport,
-        _AsyncDriverTiming(clock=clock, sleep=_sleepless),
-    )
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
-
-    async def consume(
-        _response: AsyncLiveResponse,
-        _control: AsyncAttemptControl,
-    ) -> None:
-        raise AssertionError('deadline chunk reached the response consumer')
-
-    with pytest.raises(ReadTimeoutError, match='total attempt timeout exceeded'):
-        await driver.execute(
-            operation,
-            context,
-            lambda _attempt: TransportRequest(
-                method='PUT',
-                url='https://storage.example/object',
-                headers={'content-length': '1'},
-                body=iter((b'a',)),
-                timeout=context.timeout,
-                token=_LOOP_DEADLINE_REQUEST_ID,
-            ),
-            consume,
-        )
-
-    assert transport.returned_chunks == []
-    assert clock_threads == [loop_thread, loop_thread, loop_thread]
 
 
 @pytest.mark.anyio
@@ -2286,7 +2078,7 @@ async def test_upload_progress_observer_failure_isolated_on_loop(
     progress_counts: list[int] = []
     progress_threads: list[int] = []
 
-    def fail(event: ObserverEvent) -> None:
+    def fail(event: _ObserverEvent) -> None:
         if isinstance(event, ProgressEvent):
             progress_threads.append(threading.get_ident())
             progress_counts.append(event.bytes_transferred)
@@ -2297,7 +2089,7 @@ async def test_upload_progress_observer_failure_isolated_on_loop(
     context = config_module.snapshot(config)
     transport = _LoopPullingTransport()
     driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -2315,7 +2107,6 @@ async def test_upload_progress_observer_failure_isolated_on_loop(
                 headers={'content-length': '3'},
                 body=iter((b'a', b'bc')),
                 timeout=context.timeout,
-                token=_LOOP_OBSERVER_FAILURE_REQUEST_ID,
             ),
             consume,
         )
@@ -2334,7 +2125,7 @@ async def test_upload_progress_runs_on_loop_with_increasing_counts() -> None:
     progress_threads: list[int] = []
     progress_counts: list[int] = []
 
-    def observe(event: ObserverEvent) -> None:
+    def observe(event: _ObserverEvent) -> None:
         if isinstance(event, ProgressEvent):
             progress_threads.append(threading.get_ident())
             progress_counts.append(event.bytes_transferred)
@@ -2344,7 +2135,7 @@ async def test_upload_progress_runs_on_loop_with_increasing_counts() -> None:
     context = config_module.snapshot(config)
     transport = _LoopPullingTransport()
     driver = AsyncDriver(transport, _AsyncDriverTiming(sleep=_sleepless))
-    operation = _protocol.classify_endpoint('object_put', body_restartable=True)
+    operation = _protocol.classify_endpoint('object_put')
 
     async def consume(
         _response: AsyncLiveResponse,
@@ -2359,7 +2150,6 @@ async def test_upload_progress_runs_on_loop_with_increasing_counts() -> None:
             headers={'content-length': '3'},
             body=iter((b'a', b'bc')),
             timeout=context.timeout,
-            token=_LOOP_PROGRESS_REQUEST_ID,
         )
 
     assert await driver.execute(operation, context, request_factory, consume) == 'uploaded'
@@ -2370,7 +2160,7 @@ async def test_upload_progress_runs_on_loop_with_increasing_counts() -> None:
 
 @pytest.mark.anyio
 async def test_write_does_not_retry_ambiguous_send_error() -> None:
-    fake = _AsyncFakeTransport([SendError('connection lost mid-body')])
+    fake = AsyncFakeTransport([SendError('connection lost mid-body')])
     driver = AsyncDriver(fake, _AsyncDriverTiming(sleep=_sleepless))
 
     with pytest.raises(SendError, match='connection lost mid-body'):

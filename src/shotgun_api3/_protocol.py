@@ -16,7 +16,6 @@ from typing import Final, Literal, TypeAlias, TypeGuard, TypeVar, cast, overload
 from . import _errors
 from ._sg_timezone import SG_TIMEZONE
 from ._transport import (
-    AbortedError,
     ConnectError,
     ProxyError,
     ReadTimeoutError,
@@ -52,7 +51,6 @@ _FailureCategory = Literal[
     'proxy_auth',
     'tls',
     'authentication',
-    'abort',
     'configuration',
 ]
 _FailurePhase = Literal['pre_send', 'ambiguous_after_send', 'http_status', 'body_read']
@@ -136,9 +134,7 @@ _SAFE_RPC_METHODS = frozenset(
         'work_schedule_read',
     }
 )
-_TERMINAL_FAILURE_CATEGORIES = frozenset(
-    {'abort', 'authentication', 'configuration', 'proxy_auth', 'tls'}
-)
+_TERMINAL_FAILURE_CATEGORIES = frozenset({'authentication', 'configuration', 'proxy_auth', 'tls'})
 _WRITE_METHODS = frozenset(
     {
         'create',
@@ -214,13 +210,11 @@ class OperationDescriptor:
     Attributes:
         category: Stable operation category.
         replay_safe: Whether a completed request may be replayed.
-        body_restartable: Whether each attempt can obtain a fresh body.
         endpoint_role: Special endpoint role, when applicable.
     """
 
     category: OperationCategory
     replay_safe: bool
-    body_restartable: bool
     endpoint_role: _EndpointRole | None
 
 
@@ -249,7 +243,7 @@ def _backoff(
         (
             operation.category,
             operation.replay_safe,
-            operation.body_restartable,
+            True,  # Preserve the established jitter seed for restartable bodies.
             operation.endpoint_role,
             attempt,
             base_interval,
@@ -325,6 +319,24 @@ def _classify_rpc(
     elif method_name in _WRITE_METHODS:
         category = 'write'
     return category, replay_safe
+
+
+def _classify(
+    method_name: str,
+    normalized_params: object,
+    has_one_use_auth_token: bool = False,
+) -> OperationDescriptor:
+    """Classify an operation for phase-aware retry decisions."""
+    category, replay_safe = _classify_rpc(
+        method_name,
+        normalized_params,
+        has_one_use_auth_token,
+    )
+    return OperationDescriptor(
+        category=category,
+        replay_safe=replay_safe,
+        endpoint_role=None,
+    )
 
 
 def _entity_optimization_disabled() -> bool:
@@ -540,13 +552,11 @@ def build_payload(
 
 def classify_endpoint(
     endpoint_role: _EndpointRole,
-    body_restartable: bool = True,
 ) -> OperationDescriptor:
     """Classify a non-RPC endpoint exchange.
 
     Args:
         endpoint_role: Endpoint role used for retry and route decisions.
-        body_restartable: Whether the body can restart from byte zero.
 
     Returns:
         An immutable descriptor with conservative retry behavior.
@@ -568,41 +578,7 @@ def classify_endpoint(
     return OperationDescriptor(
         category=category,
         replay_safe=replay_safe,
-        body_restartable=body_restartable,
         endpoint_role=known_role,
-    )
-
-
-def classify(
-    method_name: str,
-    normalized_params: object,
-    body_restartable: bool = True,
-    has_one_use_auth_token: bool = False,
-) -> OperationDescriptor:
-    """Classify an operation for phase-aware retry decisions.
-
-    Args:
-        method_name: Normalized RPC method name.
-        normalized_params: Normalized method parameters, including every batch
-            member.
-        body_restartable: Whether the request body can be sent again from byte
-            zero.
-        has_one_use_auth_token: Whether captured request authentication
-            includes a one-use token outside method parameters.
-
-    Returns:
-        An immutable operation descriptor. Unknown inputs are not replay-safe.
-    """
-    category, replay_safe = _classify_rpc(
-        method_name,
-        normalized_params,
-        has_one_use_auth_token,
-    )
-    return OperationDescriptor(
-        category=category,
-        replay_safe=replay_safe,
-        body_restartable=body_restartable,
-        endpoint_role=None,
     )
 
 
@@ -629,10 +605,9 @@ def classify_rpc_operation(
         return OperationDescriptor(
             category='read',
             replay_safe=True,
-            body_restartable=True,
             endpoint_role=None,
         )
-    return classify(
+    return _classify(
         logical_method_name or wire_method_name,
         normalized_params,
         has_one_use_auth_token=has_one_use_auth_token,
@@ -652,12 +627,9 @@ def classify_transport_failure(
     Returns:
         Shared retry-policy failure vocabulary.
     """
-    if isinstance(error, AbortedError):
-        phase: _FailurePhase = 'body_read' if response_received else 'pre_send'
-        category: _FailureCategory = 'abort'
-    elif isinstance(error, ProxyError):
-        phase = 'pre_send'
-        category = 'proxy_auth'
+    if isinstance(error, ProxyError):
+        phase: _FailurePhase = 'pre_send'
+        category: _FailureCategory = 'proxy_auth'
     elif isinstance(error, TLSError):
         phase = 'pre_send'
         category = 'tls'
@@ -705,7 +677,6 @@ def decide(  # noqa: PLR0913
         attempt < 1
         or max_attempts < 1
         or attempt >= max_attempts
-        or not operation.body_restartable
         or (failure.phase != 'pre_send' and not operation.replay_safe)
         or not _failure_is_retryable(failure)
     )
@@ -1154,6 +1125,9 @@ def transform_outbound(data: object, convert_utc: bool) -> object:
         ValueError: If converting a naive local datetime to UTC exceeds the
             supported range. The message is `datetime conversion exceeds the
             supported range`, and the exception has no cause.
+        OverflowError: If converting an aware datetime to UTC exceeds the
+            supported datetime range.
+        OSError: If the platform cannot resolve a local datetime.
     """
 
     def visit(value: object) -> object:

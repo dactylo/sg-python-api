@@ -111,6 +111,9 @@ _LIFECYCLE_TYPES = frozenset(
         'Asset',
         'PublishedFile',
         'CutItem',
+        # 2026-11-10: a lone Cut or Attachment logs only its own lifecycle rows.
+        'Cut',
+        'Attachment',
     }
 )
 _LINK_TARGETS = {
@@ -145,6 +148,10 @@ _LINK_UPDATE_FORMS = {
 _SCALAR_ENCODINGS = frozenset(
     {'number', 'duration', 'checkbox', 'text', 'list', 'status_list', 'date', 'date_time', 'float'}
 )
+# 2026-11-10 trial capture: no create logs a default it fills into a field of these data types,
+# across 459 Task, 240 Note, 83 Reply and 36 Playlist creates; status list and list defaults are
+# always logged.
+_UNLOGGED_DEFAULT_TYPES = frozenset({'duration', 'number', 'percent', 'text'})
 _WRITE_TYPES = frozenset(
     {
         'Shot',
@@ -216,6 +223,10 @@ def _create_fields(store: Store, row: Row, supplied: Sequence[str]) -> list[str]
         if field not in _CREATE_IGNORED
         and row.get(field) is not None
         and row.get(field) != []
+        and not (
+            field not in supplied
+            and store.schema.field_type(kind, field) in _UNLOGGED_DEFAULT_TYPES
+        )
         and not (
             field not in supplied
             and row.get(field) is False
@@ -718,7 +729,13 @@ def _observed_create_fields(
     populated = {
         field
         for field in store.schema.fields[kind]
-        if field not in _CREATE_IGNORED and row.get(field) is not None and row.get(field) != []
+        if field not in _CREATE_IGNORED
+        and row.get(field) is not None
+        and row.get(field) != []
+        and not (
+            field not in supplied
+            and store.schema.field_type(kind, field) in _UNLOGGED_DEFAULT_TYPES
+        )
     }
     for form in _CREATE_FORMS:
         if (kind, session) != (form.kind, form.session):
@@ -862,10 +879,14 @@ def record_create(
     plans = _plan_create(store, row, supplied, context=context)
     if store.schema.declares('EventLogEntry') and store.events_unknown is None:
         if plans is None:
-            _unsettled(
-                store,
-                f'{row["type"]} {row["id"]} create has unsettled event rows',
+            # 2026-11-10: a new Project also logs hundreds of rows for the pages,
+            # page settings and field preferences the site copies from a template.
+            detail = (
+                ' for the pages and preferences the site creates with it'
+                if row['type'] == 'Project'
+                else ''
             )
+            _unsettled(store, f'{row["type"]} {row["id"]} create has unsettled event rows{detail}')
         else:
             _write_plans(store, plans, context)
     return plans is not None

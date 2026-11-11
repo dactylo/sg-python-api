@@ -67,10 +67,10 @@ def _unsettled(row: Row, field: str, reason: str) -> MockgunError:
     )
 
 
-def _known(store: Store, row: Row, field: str, *, membership: bool = False) -> None:
+def _known(store: Store, row: Row, field: str) -> None:
     """Include the thread RPC in a stored unknown marker's diagnostic."""
     try:
-        store.check_known(row, field, membership=membership)
+        store.check_known(row, field)
     except MockgunError as exc:
         raise _unsettled(row, field, str(exc)) from exc
 
@@ -78,7 +78,7 @@ def _known(store: Store, row: Row, field: str, *, membership: bool = False) -> N
 def _entries(store: Store, note: Row) -> list[Row]:
     """Collect active Replies and Note-member Attachments."""
     identity = note['id']
-    _known(store, note, 'attachments', membership=True)
+    _known(store, note, 'attachments')
     members = cast('list[dict[str, FieldValue]]', note.get('attachments', []))
     entries: list[Row] = []
     if store.schema.declares('Reply'):
@@ -88,7 +88,7 @@ def _entries(store: Store, note: Row) -> list[Row]:
                 entries.append(row)
     if store.schema.declares('Attachment'):
         for row in store.rows('Attachment', retired=False):
-            _known(store, row, 'attachment_links', membership=True)
+            _known(store, row, 'attachment_links')
             linked = {'type': 'Note', 'id': identity} in cast(
                 'list[dict[str, FieldValue]]', row.get('attachment_links', [])
             )

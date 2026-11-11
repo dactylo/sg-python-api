@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 (2026-11-10)
+
+### Fixed
+
+- mockgun orders the links in multi-entity fields, such as `Asset.shots`, by display name, as a
+  site does.
+- A mockgun Note given `tasks` also lists each Task's linked entity in `note_links`.
+- With a generated schema, reading mockgun's event log no longer raises `MockgunError` because of
+  default values a create fills in.
+
 ## 0.2.0 (2026-11-09)
 
 ### Breaking changes

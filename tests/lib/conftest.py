@@ -309,6 +309,7 @@ _EFFECTS_AUDIT_TYPES = {
     'PublishedFile',
     'Cut',
     'CutItem',
+    'TimeLog',
 }
 _EFFECTS_FIELDS = {
     'EventLogEntry': {
@@ -354,6 +355,7 @@ _EFFECTS_FIELDS = {
     'AssetAssetConnection': {'asset': 'entity', 'parent': 'entity'},
     'PlaylistVersionConnection': {'playlist': 'entity', 'version': 'entity'},
     'AssetSequenceConnection': {'asset': 'entity', 'sequence': 'entity'},
+    'TimeLog': {'entity': 'entity', 'project': 'entity', 'duration': 'duration'},
 }
 _EFFECTS_VALID_TYPES = {
     ('Shot', 'tasks'): ['Task'],
@@ -361,6 +363,7 @@ _EFFECTS_VALID_TYPES = {
     ('Task', 'sg_versions'): ['Version'],
     ('Note', 'tasks'): ['Task'],
     ('Note', 'note_links'): ['Shot', 'Asset', 'Sequence', 'Version'],
+    ('TimeLog', 'entity'): ['Shot', 'Task'],
 }
 _EFFECTS_VALID_VALUES = {
     ('Asset', 'sg_status_list'): ['wtg', 'ip', 'fin'],

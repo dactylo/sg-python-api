@@ -5,9 +5,26 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
 
-from ._links import RetirementEdge, hidden, retirement_edge
+from ._links import (
+    RetirementEdge,
+    hidden,
+    implicit_connection_fields,
+    link_target,
+    retirement_edge,
+)
 from ._sessions import RequestContext
 from ._store import FieldValue, Row, Store
+
+# A cascaded child revived while its parent stays retired hides its link to the
+# parent and is untouched by the parent's later revival (a Shot's Version
+# earlier; the rest on 2026-11-10). Each child type maps to its parent field and
+# the parent types observed.
+_SETTLED_ALONE = {
+    'Note': ('note_links', frozenset({'Asset', 'Sequence', 'Shot', 'Version'})),
+    'Shot': ('project', frozenset({'Project'})),
+    'Task': ('entity', frozenset({'Asset', 'Sequence', 'Shot'})),
+    'Version': ('entity', frozenset({'Asset', 'Sequence', 'Shot'})),
+}
 
 
 @dataclass(frozen=True)
@@ -86,21 +103,54 @@ def _holder_groups(
     return list(groups.values())
 
 
+def _mark_hidden_links(store: Store, rows: list[Row]) -> None:
+    """Record the NoteLink and NoteTask members already hidden when these rows retired."""
+    operation = {_identity(row) for row in rows}
+    for row in rows:
+        members: list[FieldValue] = []
+        for field in implicit_connection_fields(cast('str', row['type'])):
+            value = row.get(field)
+            for link in cast(
+                'list[dict[str, FieldValue]]', value if isinstance(value, list) else []
+            ):
+                target = link_target(store, link)
+                if (
+                    target is not None
+                    and target['__retired']
+                    and _identity(target) not in operation
+                ):
+                    members.append([field, target['type'], target['id']])
+        if members:
+            store.remember(row)
+            row['__retired_hidden'] = members
+
+
+def _names(value: FieldValue, target: Row) -> bool:
+    """Return whether a single or multi-entity value names the target."""
+    identity: FieldValue = {'type': target['type'], 'id': target['id']}
+    return value == identity or (isinstance(value, list) and identity in value)
+
+
+def _settled_alone(root: Row, source: Row) -> bool:
+    """Identify the observed standalone revivals of cascaded children."""
+    entry = _SETTLED_ALONE.get(cast('str', root['type']))
+    if entry is None or source['type'] not in entry[1]:
+        return False
+    if root['type'] == 'Note' and root.get('tasks'):
+        return False
+    return _names(root.get(entry[0]), source)
+
+
 def _revived_alone(store: Store, roots: tuple[Row, Row | None], children: list[Row]) -> None:
-    """Taint the unobserved standalone revival while preserving the Version exception."""
+    """Taint unobserved standalone revivals, keeping the observed ones settled."""
     root, source = roots
     if source is None or not source['__retired']:
         return
-    if (
-        root['type'] == 'Version'
-        and source['type'] == 'Shot'
-        and root.get('entity') == {'type': 'Shot', 'id': source['id']}
-    ):
-        return
     reason = f'unsettled revival while {source["type"]} {source["id"]} remains retired'
-    for holder, field in store.linking(*_identity(source)):
-        if holder is root:
-            store.taint(root, reason, source, link=(field, source), active=True)
+    if not _settled_alone(root, source):
+        for holder, field in store.linking(*_identity(source)):
+            if holder is root:
+                store.taint(root, reason, source, link=(field, source), active=True)
     for row in children:
         store.taint(row, reason, source)
 
@@ -146,23 +196,25 @@ def _holder_effect(
                 _touch(store, holder, context)
                 return 'touch'
         return 'hide'
-    if effect == 'keep' and not store.tainted(target):
-        return 'keep'
     for field, _ in edges:
         store.taint(holder, reason, root, link=(field, target))
     return 'taint'
 
 
 def _restore_children(store: Store, parent: Row, context: RequestContext) -> list[Row]:
-    """Revive only still-retired children owned by this cascade marker."""
+    """Revive the children this cascade retired that still link the parent."""
     children: list[Row] = []
     for kind in store.schema.fields:
         for row in store.rows(kind, retired=True):
             if row.get('__cascaded_by') == [parent['type'], parent['id']]:
                 store.check_writable(row)
-                store.revive(*_identity(row))
                 store.remember(row)
                 row.pop('__cascaded_by', None)
+                # 2026-11-10: a child relinked or cleared while retired stays retired.
+                if not any(_names(row.get(field), parent) for field in store.schema.fields[kind]):
+                    continue
+                store.revive(*_identity(row))
+                row.pop('__retired_hidden', None)
                 _touch(store, row, context)
                 children.append(row)
     return children
@@ -175,9 +227,57 @@ def _restore_touches(store: Store, parent: Row, context: RequestContext) -> list
     for link in cast('list[list[FieldValue]]', parent.pop('__retirement_touched', [])):
         holder = store.require(cast('str', link[0]), cast('int', link[1]))
         store.check_writable(holder)
+        # 2026-11-10: a holder retired meanwhile keeps its audit fields.
+        if holder['__retired']:
+            continue
         _touch(store, holder, context)
         holders.append(holder)
     return holders
+
+
+def _revive_marked_notes(store: Store, parent: Row, context: RequestContext) -> list[Row]:
+    """Revive the observed Notes retired after this parent, or taint other shapes.
+
+    A Note linking one Shot and one Asset, retired while the Shot was retired,
+    revives with the Shot; a one-link Note, or one retired after its Task,
+    stays retired (2026-11-10).
+    """
+    revived: list[Row] = []
+    if not store.schema.declares('Note', 'note_links'):
+        return revived
+    for note in store.rows('Note', retired=True):
+        markers = cast('list[list[FieldValue]]', note.get('__retired_hidden', []))
+        fields = {
+            cast('str', marker[0])
+            for marker in markers
+            if marker[1:] == [parent['type'], parent['id']]
+        }
+        if not fields:
+            continue
+        links = cast('list[dict[str, FieldValue]]', note.get('note_links', []))
+        # 2026-11-10: a one-link Note, or one retired after its Task, stays retired.
+        if fields == {'tasks'} or (
+            fields == {'note_links'} and len(links) == 1 and not note.get('tasks')
+        ):
+            continue
+        store.check_writable(note)
+        if (
+            fields == {'note_links'}
+            and parent['type'] == 'Shot'
+            and not note.get('tasks')
+            and sorted(cast('str', link['type']) for link in links) == ['Asset', 'Shot']
+        ):
+            store.revive(*_identity(note))
+            store.remember(note)
+            note.pop('__retired_hidden', None)
+            _touch(store, note, context)
+            revived.append(note)
+        else:
+            reason = (
+                f'unsettled revival of {parent["type"]} {parent["id"]} for a Note retired after it'
+            )
+            store.taint(note, reason, None)
+    return revived
 
 
 def _revive(store: Store, root: Row, context: RequestContext) -> RetirementEffects:
@@ -191,6 +291,7 @@ def _revive(store: Store, root: Row, context: RequestContext) -> RetirementEffec
     )
     retired_at = cast('datetime | None', root.get('__retired_at'))
     store.revive(*_identity(root), context=context)
+    root.pop('__retired_hidden', None)
     cascaded: list[Row] = []
     touched: list[Row] = []
     queue = [root]
@@ -207,6 +308,7 @@ def _revive(store: Store, root: Row, context: RequestContext) -> RetirementEffec
         cascaded.extend(children)
         queue.extend(children)
         touched.extend(_restore_touches(store, parent, context))
+    cascaded.extend(_revive_marked_notes(store, root, context))
     cleared = _clear_source(store, root)
     _revived_alone(store, (root, source), cascaded)
     return RetirementEffects(
@@ -253,6 +355,7 @@ def _scan(store: Store, root: Row, context: RequestContext) -> RetirementEffects
                     queue.append(holder)
     store.remember(root)
     root['__retirement_touched'] = [[row['type'], row['id']] for row in touched]
+    _mark_hidden_links(store, [root, *cascaded])
     return RetirementEffects(
         changed=True,
         root=root,
@@ -270,14 +373,16 @@ def kept_members(
     entity_id: int,
     fields: Mapping[str, object],
 ) -> dict[str, list[dict[str, FieldValue]]]:
-    """Keep hidden Asset.shots members when an edit names visible members only.
+    """Keep hidden Asset.shots members through an edit of the visible members.
+
+    The edit cannot name a hidden member: the site refuses links to retired
+    records before this runs.
 
     Args:
         store: Site records used to inspect existing shot links.
         entity_type: Entity type being updated.
         entity_id: Existing entity identifier.
-        fields: Incoming field values. Naming any hidden shot explicitly
-            disables automatic preservation.
+        fields: Incoming field values.
 
     Returns:
         A `shots` entry containing preserved stored link dictionaries, or an
@@ -287,23 +392,13 @@ def kept_members(
         ServerFaultError: If the Asset record cannot be resolved.
         MockgunError: If an existing shot link's visibility is unsettled.
     """
-    if entity_type != 'Asset' or 'shots' not in fields:
+    if entity_type != 'Asset' or not isinstance(fields.get('shots'), list):
         return {}
     row = store.require(entity_type, entity_id)
     if row['__retired']:
         return {}
     members = cast('list[dict[str, FieldValue]]', row.get('shots', []))
     kept = [link for link in members if hidden(store, row, 'shots', link)]
-    incoming = fields['shots']
-    if not isinstance(incoming, list):
-        return {}
-    identities = {
-        (cast('dict[str, object]', item).get('type'), cast('dict[str, object]', item).get('id'))
-        for item in cast('list[object]', incoming)
-        if isinstance(item, dict)
-    }
-    if any((link['type'], link['id']) in identities for link in kept):
-        return {}
     return {'shots': kept} if kept else {}
 
 

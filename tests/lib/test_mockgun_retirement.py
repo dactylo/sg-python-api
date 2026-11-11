@@ -159,6 +159,9 @@ async def test_retire_parent_cascades_children_and_preserves_hidden_holder_audit
         assert await case.call('find', child['type'], []) == []
         assert await case.call('find', child['type'], [], retired_only=True) == [child]
         await _touched_audit(case, child, 'HumanUser', _LATER, retired=True)
+    assert (await _read(case, task, 'entity', retired=True))['entity'] is None
+    assert (await _read(case, version, 'entity', retired=True))['entity'] is None
+    assert (await _read(case, note, 'note_links', retired=True))['note_links'] == []
     assert await case.call(
         'find', 'Task', [['updated_at', 'greater_than', QUERY_NOW]], retired_only=True
     ) == [task]
@@ -332,48 +335,110 @@ async def test_hidden_holders_and_audits(
 
 
 @pytest.mark.anyio
-async def test_revive_alone_preserves_prior_retirement_and_marks_task(
+async def test_shot_children_revived_alone_hide_the_shot_until_it_returns(
     effects_site: FakeSiteCase,
 ) -> None:
     case = effects_site
     shot = await _create_record_from_fields(case, 'Shot', code='shot')
     old = await _create_record_from_fields(case, 'Version', code='old', entity=shot)
-    child = await _create_record_from_fields(case, 'Version', code='child', entity=shot)
+    version = await _create_record_from_fields(case, 'Version', code='version', entity=shot)
     await _lifecycle(case, 'delete', old)
     await _lifecycle(case, 'delete', shot)
     await _lifecycle(case, 'revive', shot)
     assert await _read(case, old, retired=True) == old
-    assert await _read(case, child) == child
-    await _lifecycle(case, 'delete', shot)
-    await _lifecycle(case, 'revive', child)
-    assert (await _read(case, child, 'entity'))['entity'] is None
-    await _lifecycle(case, 'revive', shot)
-    assert (await _read(case, child, 'entity'))['entity'] == {**shot, 'name': 'shot'}
+    assert await _read(case, version) == version
     task = await _create_record_from_fields(case, 'Task', content='task', entity=shot)
+    note = await _create_record_from_fields(case, 'Note', subject='note', note_links=[shot])
     await _lifecycle(case, 'delete', shot)
+    case.client.site.set_time(_LATER)
+    for child in (version, task, note):
+        await _lifecycle(case, 'revive', child)
+        await _touched_audit(case, child, 'ApiUser', _LATER)
+    assert (await _read(case, version, 'entity'))['entity'] is None
+    assert (await _read(case, task, 'entity'))['entity'] is None
+    assert (await _read(case, note, 'note_links'))['note_links'] == []
+    assert await case.call('find', 'Task', [['entity', 'is', shot]]) == []
+    assert (await _read(case, shot, 'tasks', retired=True))['tasks'] == [{**task, 'name': 'task'}]
+    assert (await _read(case, shot, 'notes', retired=True))['notes'] == []
+    case.client.site.set_time(_LATER + timedelta(hours=1))
+    await _lifecycle(case, 'revive', shot)
+    linked = {**shot, 'name': 'shot'}
+    assert (await _read(case, version, 'entity'))['entity'] == linked
+    assert (await _read(case, task, 'entity'))['entity'] == linked
+    assert (await _read(case, note, 'note_links'))['note_links'] == [linked]
+    for child in (version, task, note):
+        await _touched_audit(case, child, 'ApiUser', _LATER)
+
+
+@pytest.mark.anyio
+async def test_project_task_revived_alone_stays_unsettled_until_a_change(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    project = await _create_record_from_fields(case, 'Project', name='project')
+    task = await _create_record_from_fields(case, 'Task', content='task', project=project)
+    await _lifecycle(case, 'delete', project)
     await _lifecycle(case, 'revive', task)
     assert await case.call('find', 'Task', []) == [task]
     assert await case.call('find', 'Task', [['content', 'is', 'task']]) == [task]
-    for field in ('entity', 'updated_at'):
+    for field in ('project', 'updated_at'):
         with pytest.raises(
-            MockgunError, match=f'(?=.*{field})Task.*{task["id"]}.*Shot.*{shot["id"]}'
+            MockgunError, match=f'(?=.*{field})Task.*{task["id"]}.*Project.*{project["id"]}'
         ):
             await _read(case, task, field)
-    with pytest.raises(MockgunError, match=f'Task.*{task["id"]}.*Shot.*{shot["id"]}'):
-        await case.call('find', 'Task', [['entity', 'is', shot]])
-    await _lifecycle(case, 'revive', shot)
+    with pytest.raises(MockgunError, match=f'Task.*{task["id"]}.*Project.*{project["id"]}'):
+        await case.call('find', 'Task', [['project', 'is', project]])
+    await _lifecycle(case, 'revive', project)
     assert (
-        cast('dict[str, object]', (await _read(case, task, 'entity'))['entity'])['id']
-        == shot['id']
+        cast('dict[str, object]', (await _read(case, task, 'project'))['project'])['id']
+        == project['id']
     )
     with pytest.raises(MockgunError, match=r'updated_at'):
         await _read(case, task, 'updated_at')
     await case.call('update', 'Task', task['id'], {'content': 'changed'})
     assert (await _read(case, task, 'updated_at'))['updated_at'] == QUERY_NOW
-    assert (
-        cast('dict[str, object]', (await _read(case, task, 'updated_by'))['updated_by'])['type']
-        == 'ApiUser'
-    )
+
+
+@pytest.mark.anyio
+async def test_project_shot_revived_alone_hides_the_project_until_it_returns(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    project = await _create_record_from_fields(case, 'Project', name='project')
+    shot = await _create_record_from_fields(case, 'Shot', code='shot', project=project)
+    await _lifecycle(case, 'delete', project)
+    case.client.site.set_time(_LATER)
+    await _lifecycle(case, 'revive', shot)
+    assert (await _read(case, shot, 'project'))['project'] is None
+    case.client.site.set_time(_LATER + timedelta(hours=1))
+    await _lifecycle(case, 'revive', project)
+    assert (await _read(case, shot, 'project'))['project'] == {**project, 'name': 'project'}
+    await _touched_audit(case, shot, 'ApiUser', _LATER)
+
+
+@pytest.mark.parametrize('parent_type', ['Asset', 'Sequence'])
+@pytest.mark.anyio
+async def test_children_of_other_parents_revived_alone_are_settled(
+    effects_site: FakeSiteCase, parent_type: str
+) -> None:
+    case = effects_site
+    parent = await _create_record_from_fields(case, parent_type, code='parent')
+    task = await _create_record_from_fields(case, 'Task', content='task', entity=parent)
+    version = await _create_record_from_fields(case, 'Version', code='version', entity=parent)
+    note = await _create_record_from_fields(case, 'Note', subject='note', note_links=[parent])
+    await _lifecycle(case, 'delete', parent)
+    case.client.site.set_time(_LATER)
+    for child in (task, version, note):
+        await _lifecycle(case, 'revive', child)
+    assert (await _read(case, task, 'entity'))['entity'] is None
+    assert (await _read(case, note, 'note_links'))['note_links'] == []
+    case.client.site.set_time(_LATER + timedelta(hours=1))
+    await _lifecycle(case, 'revive', parent)
+    linked = {**parent, 'name': 'parent'}
+    assert (await _read(case, version, 'entity'))['entity'] == linked
+    assert (await _read(case, note, 'note_links'))['note_links'] == [linked]
+    for child in (task, version, note):
+        await _touched_audit(case, child, 'ApiUser', _LATER)
 
 
 @pytest.mark.anyio
@@ -395,36 +460,83 @@ async def test_hidden_asset_members_survive_visible_edits(effects_site: FakeSite
     await _lifecycle(case, 'revive', shots[0])
     for shot in shots:
         assert await case.call('find', 'Asset', [['shots', 'is', shot]]) == [asset]
-    with pytest.raises(MockgunError, match=r'shots'):
-        await _read(case, asset, 'shots')
+    assert [
+        row['id']
+        for row in cast('list[dict[str, object]]', (await _read(case, asset, 'shots'))['shots'])
+    ] == [shot['id'] for shot in shots]
     await case.call('update', 'Asset', asset['id'], {'shots': [shots[1], shots[0]]})
     assert [
         row['id']
         for row in cast('list[dict[str, object]]', (await _read(case, asset, 'shots'))['shots'])
-    ] == [shots[1]['id'], shots[0]['id']]
+    ] == [shots[0]['id'], shots[1]['id']]
 
 
-@pytest.mark.parametrize('named_hidden', [False, True])
+@pytest.mark.parametrize(
+    ('method', 'entity_type', 'field', 'mode'),
+    [
+        ('update', 'Asset', 'shots', 'remove'),
+        ('update', 'Asset', 'shots', 'add'),
+        ('update', 'Asset', 'shots', 'set'),
+        ('update', 'Task', 'entity', None),
+        ('create', 'Asset', 'shots', None),
+        ('create', 'Task', 'entity', None),
+    ],
+)
 @pytest.mark.anyio
-async def test_hidden_member_remove_boundary(query_site: FakeSiteCase, named_hidden: bool) -> None:
-    case = query_site
-    shots = [
-        await _create_record_from_fields(case, 'Shot', code=f'shot{index}') for index in range(2)
-    ]
-    asset = await _create_record_from_fields(case, 'Asset', code='asset', shots=shots)
-    await _lifecycle(case, 'delete', shots[0])
-    await case.call(
-        'update',
-        'Asset',
-        asset['id'],
-        {'shots': [shots[0 if named_hidden else 1]]},
-        multi_entity_update_modes={'shots': 'remove'},
+async def test_write_naming_a_retired_record_is_refused(
+    effects_site: FakeSiteCase, method: str, entity_type: str, field: str, mode: str | None
+) -> None:
+    case = effects_site
+    retired = await _create_record_from_fields(case, 'Shot', code='retired')
+    live = await _create_record_from_fields(case, 'Shot', code='live')
+    asset = await _create_record_from_fields(case, 'Asset', code='asset', shots=[retired, live])
+    task = await _create_record_from_fields(case, 'Task', content='task', entity=live)
+    await _lifecycle(case, 'delete', retired)
+    if field == 'shots':
+        value: object = [retired, live] if mode in {'set', None} else [retired]
+    else:
+        value = retired
+    holder = asset if entity_type == 'Asset' else task
+    if method == 'create':
+        name = 'code' if entity_type == 'Asset' else 'content'
+        write = case.call('create', entity_type, {name: 'new', field: value})
+    else:
+        modes = {field: mode} if mode in {'add', 'remove'} else None
+        write = case.call(
+            'update', entity_type, holder['id'], {field: value}, multi_entity_update_modes=modes
+        )
+    pattern = (
+        rf'API {method}\(\) CRUD ERROR #\d+: .*'
+        rf'Update failed for \[{entity_type}\.{field}\]: Value is not legal\.'
     )
-    await _lifecycle(case, 'revive', shots[0])
+    with pytest.raises(Fault, match=pattern):
+        await write
+    assert await case.call('find', entity_type, []) == [holder]
+    await _lifecycle(case, 'revive', retired)
     assert [
         row['id']
         for row in cast('list[dict[str, object]]', (await _read(case, asset, 'shots'))['shots'])
-    ] == [shots[1 if named_hidden else 0]['id']]
+    ] == [live['id'], retired['id']]
+    assert (await _read(case, task, 'entity'))['entity'] == {**live, 'name': 'live'}
+
+
+@pytest.mark.anyio
+async def test_refused_retired_link_write_has_fault_code_104(effects_site: FakeSiteCase) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    task = await _create_record_from_fields(case, 'Task', content='task')
+    await _lifecycle(case, 'delete', shot)
+    response = raw_call(
+        case.client._server,
+        'update',
+        {'type': 'Task', 'id': task['id'], 'fields': [{'field_name': 'entity', 'value': shot}]},
+    )
+    assert response == {
+        'exception': True,
+        'message': 'API update() CRUD ERROR #5: Update failed for [Task.entity]: '
+        'Value is not legal.',
+        'error_code': 104,
+    }
 
 
 @pytest.mark.anyio
@@ -466,24 +578,22 @@ async def test_project_cascades_supported_children_and_taints_other_holders(
 
 
 @pytest.mark.anyio
-async def test_archived_project_taint_and_dependent_hide_link(effects_site: FakeSiteCase) -> None:
+async def test_archived_project_retirement_cascades_like_any_project(
+    effects_site: FakeSiteCase,
+) -> None:
     case = effects_site
     project = await _create_record_from_fields(case, 'Project', name='archived', archived=True)
     shot = await _create_record_from_fields(case, 'Shot', code='shot', project=project)
-    other = await _create_record_from_fields(case, 'Shot', code='other')
+    task = await _create_record_from_fields(case, 'Task', content='task', project=project)
     file = await _create_record_from_fields(case, 'PublishedFile', code='file', entity=shot)
     await _lifecycle(case, 'delete', project)
-    with pytest.raises(MockgunError, match=f'Shot.*{shot["id"]}.*Project.*{project["id"]}'):
-        await case.call('find', 'Shot', [])
-    assert await case.call('find', 'Shot', [['code', 'is', 'other']]) == [other]
-    assert await case.call('find', 'PublishedFile', []) == [file]
-    assert await case.call('find', 'PublishedFile', [['entity', 'is', other]]) == []
-    with pytest.raises(MockgunError, match=f'Shot.*{shot["id"]}.*Project.*{project["id"]}'):
-        await case.call('find', 'PublishedFile', [['entity', 'is', shot]])
-    with pytest.raises(
-        MockgunError, match=f'PublishedFile.*{file["id"]}.*entity.*Project.*{project["id"]}'
-    ):
-        await _read(case, file, 'entity')
+    assert await case.call('find', 'Shot', [], retired_only=True) == [shot]
+    assert await case.call('find', 'Task', [], retired_only=True) == [task]
+    assert (await _read(case, shot, 'project', retired=True))['project'] is None
+    assert (await _read(case, file, 'entity'))['entity'] is None
+    await _lifecycle(case, 'revive', project)
+    assert await case.call('find', 'Shot', [['project', 'is', project]]) == [shot]
+    assert await case.call('find', 'Task', [['project', 'is', project]]) == [task]
 
 
 @pytest.mark.anyio
@@ -532,18 +642,21 @@ async def test_unobserved_edges_taint_transitively_and_reject_writes_atomically(
     assert await case.call('find', 'Reply', []) == [reply]
     with pytest.raises(MockgunError, match=r'updated_at'):
         await _read(case, note, 'updated_at')
-    sequence = await _create_record_from_fields(case, 'Sequence', code='sequence')
-    file = await _create_record_from_fields(case, 'PublishedFile', code='file', entity=sequence)
-    await _lifecycle(case, 'delete', sequence)
-    with pytest.raises(MockgunError, match=f'PublishedFile.*{file["id"]}.*Sequence'):
-        await case.call('find', 'PublishedFile', [])
-    assert await case.call('find', 'PublishedFile', [['code', 'is', 'other']]) == []
+    edited = await _create_record_from_fields(case, 'Shot', code='edited')
+    cut = await _create_record_from_fields(case, 'Cut', code='cut', entity=edited)
+    item = await _create_record_from_fields(case, 'CutItem', code='item', cut=cut)
+    await _lifecycle(case, 'delete', edited)
+    with pytest.raises(MockgunError, match=f'Cut.*{cut["id"]}.*Shot'):
+        await case.call('find', 'Cut', [])
+    assert await case.call('find', 'Cut', [['code', 'is', 'other']]) == []
+    with pytest.raises(MockgunError, match=f'CutItem.*{item["id"]}.*cut.*Shot'):
+        await _read(case, item, 'cut')
 
 
 @pytest.mark.anyio
 async def test_latest_reductions_dominance_and_limit(effects_site: FakeSiteCase) -> None:
     case = effects_site
-    archived = await _create_record_from_fields(case, 'Project', name='archived', archived=True)
+    reviewer = await _create_record_from_fields(case, 'HumanUser', login='reviewer', name='r')
     active = await _create_record_from_fields(case, 'Project', name='active')
     shots = [
         await _create_record_from_fields(case, 'Shot', code=f'shot{index}', project=active)
@@ -559,7 +672,8 @@ async def test_latest_reductions_dominance_and_limit(effects_site: FakeSiteCase)
                 'Version',
                 code=f'uncertain{group}x{offset}',
                 entity=shots[group],
-                project=archived,
+                project=active,
+                user=reviewer,
                 created_at=QUERY_NOW - timedelta(hours=offset),
             )
             uncertain[-1].append(candidate)
@@ -573,7 +687,7 @@ async def test_latest_reductions_dominance_and_limit(effects_site: FakeSiteCase)
                 created_at=QUERY_NOW - timedelta(hours=(0, 1, 8)[group]),
             )
         )
-    await _lifecycle(case, 'delete', archived)
+    await _lifecycle(case, 'delete', reviewer)
     result = cast(
         'list[dict[str, object]]',
         await case.call(
@@ -586,11 +700,11 @@ async def test_latest_reductions_dominance_and_limit(effects_site: FakeSiteCase)
     )
     assert [row['id'] for row in result] == [winners[0]['id']]
     with pytest.raises(
-        MockgunError, match=f'Version.*{uncertain[0][0]["id"]}.*Project.*{archived["id"]}'
+        MockgunError, match=f'Version.*{uncertain[0][0]["id"]}.*HumanUser.*{reviewer["id"]}'
     ):
         await case.call('find', 'Version', [['entity', 'is', shots[0]]])
     with pytest.raises(
-        MockgunError, match=f'Version.*{uncertain[1][0]["id"]}.*Project.*{archived["id"]}'
+        MockgunError, match=f'Version.*{uncertain[1][0]["id"]}.*HumanUser.*{reviewer["id"]}'
     ):
         await case.call(
             'find', 'Version', [['entity', 'is', shots[1]]], additional_filter_presets=_LATEST
@@ -602,7 +716,7 @@ async def test_latest_reductions_dominance_and_limit(effects_site: FakeSiteCase)
 
 
 @pytest.mark.anyio
-async def test_cascade_of_cascade_and_keep_edge(effects_site: FakeSiteCase) -> None:
+async def test_cascade_of_cascade_and_cut_item_link(effects_site: FakeSiteCase) -> None:
     case = effects_site
     shot = await _create_record_from_fields(case, 'Shot', code='shot')
     note = await _create_record_from_fields(case, 'Note', subject='note', note_links=[shot])
@@ -621,18 +735,15 @@ async def test_cascade_of_cascade_and_keep_edge(effects_site: FakeSiteCase) -> N
         await _create_record_from_fields(case, 'CutItem', code=f'item{index}', cut=cut)
         for index, cut in enumerate(cuts)
     ]
+    original = await _read(case, items[0], 'updated_at', 'updated_by')
+    case.client.site.set_time(_LATER)
     await _lifecycle(case, 'delete', cuts[0])
     assert await case.call('find', 'CutItem', [], ['code']) == [
         {**item, 'code': f'item{index}'} for index, item in enumerate(items)
     ]
-    with pytest.raises(
-        MockgunError, match=f'CutItem.*{items[0]["id"]}.*cut.*Cut.*{cuts[0]["id"]}'
-    ):
-        await _read(case, items[0], 'cut')
-    with pytest.raises(
-        MockgunError, match=f'CutItem.*{items[0]["id"]}.*cut.*Cut.*{cuts[0]["id"]}'
-    ):
-        await case.call('find', 'CutItem', [['cut', 'is', cuts[0]]])
+    assert (await _read(case, items[0], 'cut'))['cut'] is None
+    assert await _read(case, items[0], 'updated_at', 'updated_by') == original
+    assert await case.call('find', 'CutItem', [['cut', 'is', cuts[0]]]) == []
     assert await case.call('find', 'CutItem', [['cut', 'is', cuts[1]]]) == [items[1]]
     await _lifecycle(case, 'revive', cuts[0])
     assert await case.call('find', 'CutItem', [['cut', 'is', cuts[0]]]) == [items[0]]
@@ -678,18 +789,314 @@ async def test_batch_restores_retirement_effects(effects_site: FakeSiteCase) -> 
 
 
 @pytest.mark.anyio
-async def test_retired_holder_keeps_its_link(effects_site: FakeSiteCase) -> None:
+async def test_retired_holder_hides_its_link_while_the_target_is_retired(
+    effects_site: FakeSiteCase,
+) -> None:
     case = effects_site
     shot = await _create_record_from_fields(case, 'Shot', code='shot')
     file = await _create_record_from_fields(case, 'PublishedFile', code='file', entity=shot)
+    linked = {**shot, 'name': 'shot'}
     await _lifecycle(case, 'delete', file)
+    assert (await _read(case, file, 'entity', retired=True))['entity'] == linked
     await _lifecycle(case, 'delete', shot)
+    assert (await _read(case, file, 'entity', retired=True))['entity'] is None
     assert (
-        cast('dict[str, object]', (await _read(case, file, 'entity', retired=True))['entity'])[
-            'id'
-        ]
-        == shot['id']
+        await case.call('find', 'PublishedFile', [['entity', 'is', shot]], retired_only=True) == []
     )
+    await _lifecycle(case, 'revive', file)
+    assert (await _read(case, file, 'entity'))['entity'] is None
+    await _lifecycle(case, 'revive', shot)
+    assert (await _read(case, file, 'entity'))['entity'] == linked
+
+
+@pytest.mark.anyio
+async def test_retired_record_keeps_its_link_to_itself(effects_site: FakeSiteCase) -> None:
+    case = effects_site
+    row = await _create_record_from_fields(case, 'PublishedFile', code='self')
+    await case.call('update', 'PublishedFile', row['id'], {'entity': row})
+    await _lifecycle(case, 'delete', row)
+    assert (await _read(case, row, 'entity', retired=True))['entity'] == {**row, 'name': 'self'}
+
+
+@pytest.mark.anyio
+async def test_holder_revived_before_its_target_hides_the_link_until_the_target_returns(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    task = await _create_record_from_fields(case, 'Task', content='task', entity=shot)
+    await _lifecycle(case, 'delete', task)
+    await _lifecycle(case, 'delete', shot)
+    assert (await _read(case, task, 'entity', retired=True))['entity'] is None
+    case.client.site.set_time(_LATER)
+    await _lifecycle(case, 'revive', task)
+    assert (await _read(case, task, 'entity'))['entity'] is None
+    assert await case.call('find', 'Task', [['entity', 'is', shot]]) == []
+    revived = await _read(case, task, 'updated_at', 'updated_by')
+    case.client.site.set_time(_LATER + timedelta(hours=1))
+    await _lifecycle(case, 'revive', shot)
+    assert (await _read(case, task, 'entity'))['entity'] == {**shot, 'name': 'shot'}
+    assert await _read(case, task, 'updated_at', 'updated_by') == revived
+
+
+@pytest.mark.parametrize(
+    'spec',
+    [
+        ('Shot', 'assets', 'Asset', 'shots', 'AssetShotConnection', ('shot', 'asset')),
+        ('Asset', 'shots', 'Shot', 'assets', 'AssetShotConnection', ('asset', 'shot')),
+        (
+            'Version',
+            'playlists',
+            'Playlist',
+            'versions',
+            'PlaylistVersionConnection',
+            ('version', 'playlist'),
+        ),
+        (
+            'Playlist',
+            'versions',
+            'Version',
+            'playlists',
+            'PlaylistVersionConnection',
+            ('playlist', 'version'),
+        ),
+        ('Asset', 'assets', 'Asset', 'parents', 'AssetAssetConnection', ('parent', 'asset')),
+        ('Asset', 'parents', 'Asset', 'assets', 'AssetAssetConnection', ('asset', 'parent')),
+    ],
+)
+@pytest.mark.anyio
+async def test_retiring_either_end_retires_the_connection_record(
+    effects_site: FakeSiteCase, spec: tuple[str, str, str, str, str, tuple[str, str]]
+) -> None:
+    case = effects_site
+    root_type, root_field, other_type, other_field, connection, sides = spec
+    root_side, other_side = sides
+    other = await _create_record_from_fields(case, other_type, code='other')
+    root = await _create_record_from_fields(case, root_type, code='root', **{root_field: [other]})
+    named_other = {**other, 'name': 'other'}
+    named_root = {**root, 'name': 'root'}
+    filters = [[other_side, 'is', other]]
+    [record] = cast(
+        'list[dict[str, object]]', await case.call('find', connection, filters, list(sides))
+    )
+    await _lifecycle(case, 'delete', root)
+    assert await case.call('find', connection, filters, list(sides)) == []
+    assert await case.call('find', connection, filters, list(sides), retired_only=True) == [
+        {**record, root_side: None, other_side: named_other}
+    ]
+    assert (await _read(case, other, other_field))[other_field] == []
+    assert (await _read(case, root, root_field, retired=True))[root_field] == []
+    await _lifecycle(case, 'revive', root)
+    assert await case.call('find', connection, filters, list(sides)) == [
+        {**record, root_side: named_root, other_side: named_other}
+    ]
+    assert (await _read(case, other, other_field))[other_field] == [named_root]
+    assert (await _read(case, root, root_field))[root_field] == [named_other]
+
+
+@pytest.mark.anyio
+async def test_connection_revives_with_the_end_that_retired_it(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    asset = await _create_record_from_fields(case, 'Asset', code='asset', shots=[shot])
+    case.client.site.set_time(_LATER)
+    await _lifecycle(case, 'delete', shot)
+    await _lifecycle(case, 'delete', asset)
+    retired_asset = await _read(case, asset, 'updated_at', retired=True)
+    await _lifecycle(case, 'revive', shot)
+    assert (await _read(case, asset, 'shots', retired=True))['shots'] == [{**shot, 'name': 'shot'}]
+    assert (await _read(case, shot, 'assets'))['assets'] == []
+    assert (await _read(case, asset, 'updated_at', retired=True)) == retired_asset
+    await _lifecycle(case, 'revive', asset)
+    assert (await _read(case, shot, 'assets'))['assets'] == [{**asset, 'name': 'asset'}]
+    other_shot = await _create_record_from_fields(case, 'Shot', code='other shot')
+    other = await _create_record_from_fields(case, 'Asset', code='other', shots=[other_shot])
+    await _lifecycle(case, 'delete', other)
+    await _lifecycle(case, 'delete', other_shot)
+    await _lifecycle(case, 'revive', other_shot)
+    assert (await _read(case, other_shot, 'assets'))['assets'] == []
+    assert (await _read(case, other, 'shots', retired=True))['shots'] == []
+    await _lifecycle(case, 'revive', other)
+    assert (await _read(case, other_shot, 'assets'))['assets'] == [{**other, 'name': 'other'}]
+
+
+@pytest.mark.anyio
+async def test_note_retired_after_its_shot_follows_the_observed_revival(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    asset = await _create_record_from_fields(case, 'Asset', code='asset')
+    pair = await _create_record_from_fields(case, 'Note', subject='pair', note_links=[shot, asset])
+    single = await _create_record_from_fields(case, 'Note', subject='single', note_links=[shot])
+    await _lifecycle(case, 'delete', shot)
+    await _lifecycle(case, 'revive', single)
+    await _lifecycle(case, 'delete', single)
+    await _lifecycle(case, 'delete', pair)
+    assert (await _read(case, pair, 'note_links', retired=True))['note_links'] == []
+    await _lifecycle(case, 'revive', shot)
+    assert (await _read(case, pair, 'note_links'))['note_links'] == [
+        {**asset, 'name': 'asset'},
+        {**shot, 'name': 'shot'},
+    ]
+    assert (await _read(case, single, 'note_links', retired=True))['note_links'] == [
+        {**shot, 'name': 'shot'}
+    ]
+
+
+@pytest.mark.anyio
+async def test_note_retired_after_its_task_stays_retired(effects_site: FakeSiteCase) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    task = await _create_record_from_fields(case, 'Task', content='task')
+    note = await _create_record_from_fields(
+        case, 'Note', subject='note', tasks=[task], note_links=[shot]
+    )
+    await _lifecycle(case, 'delete', task)
+    await _lifecycle(case, 'delete', note)
+    await _lifecycle(case, 'revive', task)
+    retired = await _read(case, note, 'tasks', 'note_links', retired=True)
+    assert retired['tasks'] == [{**task, 'name': 'task'}]
+    assert retired['note_links'] == []
+
+
+@pytest.mark.anyio
+async def test_unobserved_note_shape_retired_after_its_target_is_unsettled(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    other = await _create_record_from_fields(case, 'Shot', code='other')
+    note = await _create_record_from_fields(case, 'Note', subject='note', note_links=[shot, other])
+    await _lifecycle(case, 'delete', shot)
+    assert (await _read(case, note, 'note_links'))['note_links'] == [{**other, 'name': 'other'}]
+    await _lifecycle(case, 'delete', note)
+    await _lifecycle(case, 'revive', shot)
+    with pytest.raises(MockgunError, match=rf'Note.*{note["id"]}.*Shot {shot["id"]}'):
+        await case.call('find', 'Note', [], retired_only=True)
+
+
+@pytest.mark.parametrize('parent_type', ['Shot', 'Task'])
+@pytest.mark.anyio
+async def test_time_log_survives_its_entity_with_the_link_hidden(
+    effects_site: FakeSiteCase, parent_type: str
+) -> None:
+    case = effects_site
+    name = 'code' if parent_type == 'Shot' else 'content'
+    parent = await _create_record_from_fields(case, parent_type, **{name: 'parent'})
+    log = await _create_record_from_fields(case, 'TimeLog', entity=parent, duration=60)
+    original = await _read(case, log, 'updated_at', 'updated_by')
+    case.client.site.set_time(_LATER)
+    await _lifecycle(case, 'delete', parent)
+    assert await case.call('find', 'TimeLog', []) == [log]
+    assert (await _read(case, log, 'entity'))['entity'] is None
+    assert await _read(case, log, 'updated_at', 'updated_by') == original
+    await _lifecycle(case, 'revive', parent)
+    assert (await _read(case, log, 'entity'))['entity'] == {**parent, 'name': 'parent'}
+    assert await _read(case, log, 'updated_at', 'updated_by') == original
+
+
+@pytest.mark.anyio
+async def test_parent_revival_leaves_children_whose_link_changed_while_retired(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    other = await _create_record_from_fields(case, 'Shot', code='other')
+    kept, cleared, moved = [
+        await _create_record_from_fields(case, 'Version', code=code, entity=shot)
+        for code in ('kept', 'cleared', 'moved')
+    ]
+    await _lifecycle(case, 'delete', shot)
+    await case.call('update', 'Version', cleared['id'], {'entity': None})
+    await case.call('update', 'Version', moved['id'], {'entity': other})
+    await _lifecycle(case, 'revive', shot)
+    assert await case.call('find', 'Version', []) == [kept]
+    assert await case.call('find', 'Version', [], retired_only=True) == [cleared, moved]
+    assert (await _read(case, moved, 'entity', retired=True))['entity'] == {
+        **other,
+        'name': 'other',
+    }
+
+
+@pytest.mark.anyio
+async def test_note_created_for_a_task_also_links_the_task_entity(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    task = await _create_record_from_fields(case, 'Task', content='task', entity=shot)
+    bare = await _create_record_from_fields(case, 'Task', content='bare')
+    note = await _create_record_from_fields(case, 'Note', subject='note', tasks=[task])
+    plain = await _create_record_from_fields(case, 'Note', subject='plain', tasks=[bare])
+    assert (await _read(case, note, 'note_links'))['note_links'] == [{**shot, 'name': 'shot'}]
+    assert (await _read(case, shot, 'notes'))['notes'] == [{**note, 'name': 'note'}]
+    assert (await _read(case, plain, 'note_links'))['note_links'] == []
+    original = await _read(case, note, 'updated_at', 'updated_by')
+    case.client.site.set_time(_LATER)
+    await _lifecycle(case, 'delete', task)
+    assert await case.call('find', 'Note', []) == [note, plain]
+    assert (await _read(case, note, 'tasks'))['tasks'] == []
+    assert (await _read(case, note, 'note_links'))['note_links'] == [{**shot, 'name': 'shot'}]
+    assert await _read(case, note, 'updated_at', 'updated_by') == original
+    await _lifecycle(case, 'revive', task)
+    assert (await _read(case, note, 'tasks'))['tasks'] == [{**task, 'name': 'task'}]
+
+
+@pytest.mark.anyio
+async def test_note_links_gain_the_entities_of_every_new_task(effects_site: FakeSiteCase) -> None:
+    case = effects_site
+    shot_a = await _create_record_from_fields(case, 'Shot', code='a')
+    shot_b = await _create_record_from_fields(case, 'Shot', code='b')
+    task_a = await _create_record_from_fields(case, 'Task', content='ta', entity=shot_a)
+    task_a2 = await _create_record_from_fields(case, 'Task', content='ta2', entity=shot_a)
+    task_b = await _create_record_from_fields(case, 'Task', content='tb', entity=shot_b)
+
+    async def links(note: dict[str, object]) -> list[object]:
+        rows = cast(
+            'list[dict[str, object]]', (await _read(case, note, 'note_links'))['note_links']
+        )
+        return [row['id'] for row in rows]
+
+    both = await _create_record_from_fields(case, 'Note', subject='both', tasks=[task_b, task_a])
+    assert await links(both) == [shot_a['id'], shot_b['id']]
+    same = await _create_record_from_fields(case, 'Note', subject='same', tasks=[task_a, task_a2])
+    assert await links(same) == [shot_a['id']]
+    union = await _create_record_from_fields(
+        case, 'Note', subject='union', tasks=[task_a], note_links=[shot_b]
+    )
+    assert await links(union) == [shot_a['id'], shot_b['id']]
+    later = await _create_record_from_fields(case, 'Note', subject='later', note_links=[shot_b])
+    await case.call('update', 'Note', later['id'], {'tasks': [task_a]})
+    assert await links(later) == [shot_a['id'], shot_b['id']]
+    assert (await _read(case, shot_a, 'notes'))['notes'] == [
+        {**both, 'name': 'both'},
+        {**later, 'name': 'later'},
+        {**same, 'name': 'same'},
+        {**union, 'name': 'union'},
+    ]
+    await case.call('update', 'Note', later['id'], {'tasks': []})
+    assert await links(later) == [shot_a['id'], shot_b['id']]
+    await case.call('update', 'Note', both['id'], {'tasks': [task_b], 'note_links': []})
+    assert await links(both) == []
+
+
+@pytest.mark.anyio
+async def test_note_link_from_a_task_with_a_retired_entity_is_unsettled(
+    effects_site: FakeSiteCase,
+) -> None:
+    case = effects_site
+    shot = await _create_record_from_fields(case, 'Shot', code='shot')
+    task = await _create_record_from_fields(case, 'Task', content='task', entity=shot)
+    await _lifecycle(case, 'delete', task)
+    await _lifecycle(case, 'delete', shot)
+    await _lifecycle(case, 'revive', task)
+    create = case.call('create', 'Note', {'subject': 'note', 'tasks': [task]})
+    with pytest.raises(MockgunError, match=rf'Task {task["id"]}.*retired Shot {shot["id"]}'):
+        await create
+    assert await case.call('find', 'Note', []) == []
 
 
 @pytest.mark.anyio
@@ -883,7 +1290,7 @@ async def test_effects_hidden_member_visible_remove(effects_site: FakeSiteCase) 
 
 
 @pytest.mark.anyio
-async def test_retained_set_marks_order_without_membership_change(
+async def test_retained_set_without_membership_change_touches_nothing(
     effects_site: FakeSiteCase,
 ) -> None:
     case = effects_site
@@ -910,8 +1317,10 @@ async def test_retained_set_marks_order_without_membership_change(
     assert stored['updated_at'] == before['updated_at']
     assert stored['updated_by'] == before['updated_by']
     await _lifecycle(case, 'revive', shots[0])
-    with pytest.raises(MockgunError, match=rf'Asset.*shots.*{asset["id"]}'):
-        await _read(case, asset, 'shots')
+    assert [
+        row['id']
+        for row in cast('list[dict[str, object]]', (await _read(case, asset, 'shots'))['shots'])
+    ] == [shot['id'] for shot in shots]
 
 
 @pytest.mark.anyio
@@ -919,9 +1328,9 @@ async def test_known_active_taint_is_rejected_before_retired_filters(
     effects_site: FakeSiteCase,
 ) -> None:
     case = effects_site
-    shot = await _create_record_from_fields(case, 'Shot', code='shot')
-    task = await _create_record_from_fields(case, 'Task', content='task', entity=shot)
-    await _lifecycle(case, 'delete', shot)
+    project = await _create_record_from_fields(case, 'Project', name='project')
+    task = await _create_record_from_fields(case, 'Task', content='task', project=project)
+    await _lifecycle(case, 'delete', project)
     await _lifecycle(case, 'revive', task)
     assert (
         await case.call(

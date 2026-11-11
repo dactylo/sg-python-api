@@ -15,10 +15,14 @@ from ._errors import MockgunError, ServerFaultError
 from ._events import check_meta
 from ._links import (
     RecordState,
+    connection_backed,
+    connection_record,
     deciding_record,
     derived_name,
     display_name,
     hidden,
+    implicit_link_hidden,
+    link_target,
     named_link,
 )
 from ._presets import (
@@ -44,7 +48,7 @@ _COLLATION_CHARACTERS = frozenset(ascii_letters + digits)
 _COLLATION_IGNORED = str.maketrans('', '', '_-. ')
 _EntityLink: TypeAlias = dict[str, FieldValue]
 _LINK_PATH_PARTS = 3
-_NOTE_LINK_PAIR = {'Asset', 'Shot'}
+_MEMBER_ORDER_MINIMUM = 2
 _NUMERIC_TYPES = frozenset({'date', 'date_time', 'duration', 'float', 'number', 'percent'})
 _ORDER_TYPES = _NUMERIC_TYPES | {
     'checkbox',
@@ -220,9 +224,7 @@ class _RowReader:
         self._schema = schema
         self._assume: dict[tuple[str, int], RecordState] | None = None
 
-    def _direct_field_value(
-        self, entity_type: str, row: Row, field_name: str, *, membership: bool = False
-    ) -> FieldValue:
+    def _direct_field_value(self, entity_type: str, row: Row, field_name: str) -> FieldValue:
         """Read a stored field or compute its non-retained display cache."""
         if entity_type == 'Project' and field_name == 'last_accessed_by_current_user':
             context = self._store.context
@@ -241,8 +243,8 @@ class _RowReader:
                     'actor has never accessed the Project'
                 )
             return value
-        if '__unknown' in row or (not membership and '__unordered' in row):
-            self._store.check_known(row, field_name, membership=membership)
+        if '__unknown' in row:
+            self._store.check_known(row, field_name)
         if entity_type == 'EventLogEntry' and field_name == 'meta':
             check_meta(self._store, row)
         if field_name == 'cached_display_name' and entity_type != 'EventLogEntry':
@@ -282,7 +284,7 @@ class _Projection(_RowReader):
         if len(parts) != _LINK_PATH_PARTS:
             value = self._direct_field_value(entity_type, row, path)
             visible = self._visible_value(row, path, value)
-            return True, _ordered_note_links(row, path, value, visible, self._projection_context)
+            return True, visible
         field, linked_type, rest = parts
         link_value = self._direct_field_value(entity_type, row, field)
         if self._visible_value(row, field, link_value) != link_value:
@@ -368,9 +370,11 @@ class _Projection(_RowReader):
                     continue
                 if field_type in {'entity', 'multi_entity'}:
                     if isinstance(value, list):
-                        value = [
-                            named_link(self._store, cast('_EntityLink', item)) for item in value
-                        ]
+                        value = _member_order(
+                            entity_type,
+                            name,
+                            [named_link(self._store, cast('_EntityLink', item)) for item in value],
+                        )
                     elif isinstance(value, dict):
                         value = named_link(self._store, value)
                 elif field_type == 'date_time':
@@ -608,7 +612,7 @@ class _Query(_RowReader):
     ) -> bool:
         """Reduce identity conditions before reading link visibility."""
         field_type = self._schema.field_type(entity_type, path)
-        actual = self._direct_field_value(entity_type, row, path, membership=True)
+        actual = self._direct_field_value(entity_type, row, path)
         if (
             field_type in {'entity', 'multi_entity'}
             and relation == 'is'
@@ -646,7 +650,7 @@ class _Query(_RowReader):
         if len(parts) != _LINK_PATH_PARTS:
             return self._matches_direct(entity_type, row, path, relation, values)
         field, linked_type, rest = parts
-        actual = self._direct_field_value(entity_type, row, field, membership=True)
+        actual = self._direct_field_value(entity_type, row, field)
         actual = self._hidden_filter_value(row, field, actual, relation, values)
         links = actual if isinstance(actual, list) else [actual]
         matches: list[bool] = []
@@ -956,6 +960,19 @@ class _Query(_RowReader):
             )
         return bool(row['__retired'])
 
+    def _retired_hidden(self, row: Row, field: str, link: _EntityLink) -> _Decision:
+        """Hide a retired holder's links to retired targets and retired connections."""
+        target = link_target(self._store, link)
+        if target is None or (target['type'], target['id']) == (row['type'], row['id']):
+            return False
+        retired_target = self._symbolic_retired(target)
+        if not connection_backed(row, field, target):
+            return retired_target
+        record = connection_record(self._store, row, field, target)
+        if record is None:
+            return self._any(retired_target, implicit_link_hidden(row, field, target))
+        return self._any(retired_target, self._symbolic_retired(record))
+
     def _symbolic_hidden(self, row: Row, field: str, link: _EntityLink) -> _Decision:
         """Express hiding through the deciding record and the holder's scope."""
         deciding = deciding_record(self._store, row, field, link)
@@ -978,7 +995,9 @@ class _Query(_RowReader):
                 (cast('str', row['type']), cast('int', row['id'])): RecordState(retired=False)
             }
             outcome = hidden(self._store, row, field, link, assume=active)
-        return self._choose(self._symbolic_retired(row), yes=False, no=outcome)
+        return self._choose(
+            self._symbolic_retired(row), yes=self._retired_hidden(row, field, link), no=outcome
+        )
 
     def _symbolic_archive(self, row: Row, scope: ReadScope) -> _Decision:
         """Retain a project visibility bit only when its archive status matters."""
@@ -1004,7 +1023,7 @@ class _Query(_RowReader):
         relation = cast('str', condition['relation'])
         values = cast('list[FieldValue]', condition['values'])
         field_type = self._schema.field_type(kind, path)
-        actual = self._direct_field_value(kind, row, path, membership=True)
+        actual = self._direct_field_value(kind, row, path)
         if field_type not in {'entity', 'multi_entity'}:
             return self._matches_direct(kind, row, path, relation, values)
         links = actual if isinstance(actual, list) else [actual]
@@ -1037,9 +1056,7 @@ class _Query(_RowReader):
             if len(path.split('.', 2)) != _LINK_PATH_PARTS:
                 return self._symbolic_direct(row, condition)
             field = path.split('.', 1)[0]
-            actual = self._direct_field_value(
-                cast('str', row['type']), row, field, membership=True
-            )
+            actual = self._direct_field_value(cast('str', row['type']), row, field)
             links = actual if isinstance(actual, list) else [actual]
             result: _Decision = False
             for link in links:
@@ -1952,26 +1969,51 @@ def _operand_fault(field_type: str, relation: str, value: object) -> str | None:
     return None
 
 
-def _ordered_note_links(
-    row: Row, field: str, stored: FieldValue, visible: FieldValue, context: RequestContext | None
-) -> FieldValue:
-    """Return Asset before Shot for script reads of a script-authored Note's two links."""
-    creator = row.get('created_by')
-    if (
-        row['type'] == 'Note'
-        and context is not None
-        and context.session_kind == 'script'
-        and isinstance(creator, dict)
-        and creator.get('type') == 'ApiUser'
-        and field == 'note_links'
-        and isinstance(stored, list)
-        and len(stored) == len(_NOTE_LINK_PAIR)
-        and {cast('str', cast('_EntityLink', member)['type']) for member in stored}
-        == _NOTE_LINK_PAIR
-        and isinstance(visible, list)
-    ):
-        return sorted(visible, key=lambda member: cast('str', cast('_EntityLink', member)['type']))
-    return visible
+def _settled_member_keys(keys: Collection[str]) -> bool:
+    """Return whether observed comparisons order distinct lowered member names.
+
+    Names compare by character code (2026-11-10), with non-ASCII characters
+    after ASCII ones; two differing non-ASCII characters were observed only in
+    lowercase.
+    """
+    for left, right in combinations(keys, 2):
+        for first, second in zip(left, right, strict=False):
+            if first != second:
+                if not (first.isascii() or second.isascii()) and (
+                    first != first.lower() or second != second.lower()
+                ):
+                    return False
+                break
+    return True
+
+
+def _member_order(entity_type: str, field: str, links: list[_EntityLink]) -> list[_EntityLink]:
+    """Order members as the site reads them: by lowercased name, then by ID.
+
+    Members without a modeled display name keep the stored order when the named
+    members already appear in their observed order within it.
+    """
+    if len(links) < _MEMBER_ORDER_MINIMUM:
+        return links
+    keyed: list[tuple[str, int, int]] = []
+    for index, link in enumerate(links):
+        name = link.get('name')
+        if isinstance(name, str):
+            keyed.append((name.translate(_ASCII_LOWER), cast('int', link['id']), index))
+    if not _settled_member_keys({key for key, _, _ in keyed}):
+        raise MockgunError(
+            f'mockgun cannot order {entity_type}.{field} members: their names compare by '
+            'unobserved rules'
+        )
+    order = [index for _, _, index in sorted(keyed)]
+    if len(keyed) == len(links):
+        return [links[index] for index in order]
+    if order != sorted(order):
+        raise MockgunError(
+            f'mockgun cannot order {entity_type}.{field} members: the order depends on '
+            'members without a modeled display name; declare their display fields'
+        )
+    return links
 
 
 def _validate_operands(

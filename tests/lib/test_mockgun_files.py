@@ -515,7 +515,7 @@ async def test_raw_filmstrip_update_events_unsettled(workflow_site: FakeSiteCase
         await workflow_site.call('find', 'EventLogEntry', [])
 
 
-async def test_retired_attachment_keeps_note_writable(
+async def test_retired_attachment_hides_from_a_writable_note(
     workflow_site: FakeSiteCase, tmp_path: Path
 ) -> None:
     _, note = await _scene(workflow_site)
@@ -528,8 +528,10 @@ async def test_retired_attachment_keeps_note_writable(
     )
     await workflow_site.call('delete', 'Attachment', identity)
     await workflow_site.call('update', 'Note', second['id'], {'subject': 'x'})
-    with pytest.raises(MockgunError, match='attachments'):
-        await workflow_site.call('find_one', 'Note', [['id', 'is', second['id']]], ['attachments'])
+    found = await workflow_site.call(
+        'find_one', 'Note', [['id', 'is', second['id']]], ['attachments']
+    )
+    assert cast('dict[str, object]', found)['attachments'] == []
 
 
 @pytest.mark.parametrize('upload_type', ['Attachment', 'Thumbnail'])

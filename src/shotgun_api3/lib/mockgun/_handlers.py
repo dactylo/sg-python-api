@@ -27,7 +27,6 @@ from ._wire import RpcCall
 
 if TYPE_CHECKING:
     from ._server import FakeServer
-    from ._store import FieldValue
 
 _Handler: TypeAlias = Callable[['FakeServer', RpcCall, RequestContext], object]
 HANDLERS: dict[str, _Handler] = {}
@@ -385,6 +384,7 @@ def _update(server: 'FakeServer', call: RpcCall, context: RequestContext) -> obj
     entity_type = cast('str', params['type'])
     entity_id = cast('int', params['id'])
     _check_event_write(server, entity_type)
+    server.store.check_link_targets(entity_type, fields, 'update')
     kept = kept_members(server.store, entity_type, entity_id, fields)
     effective = server.store.kept_fields(
         server.store.require(entity_type, entity_id), fields, modes, kept
@@ -401,11 +401,6 @@ def _update(server: 'FakeServer', call: RpcCall, context: RequestContext) -> obj
         row = server.store.update(
             entity_type, entity_id, effective, effective_modes, context=context
         )
-        for field in kept:
-            if len(cast('list[FieldValue]', row[field])) > 1:
-                server.store.mark_unknown(
-                    row, field, 'retained hidden members have unsettled order', order_only=True
-                )
         settled = record_update(
             server.store,
             before,

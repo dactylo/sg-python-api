@@ -1758,36 +1758,6 @@ async def test_group_schema_display_names(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize('archived', [False, True])
-async def test_group_archive_check_resolves_retired_targets(
-    query_site: FakeSiteCase, archived: bool
-) -> None:
-    project = seed(query_site, 'Project', {'name': 'P', 'archived': archived})
-    shot = seed(query_site, 'Shot', {'code': 'S', 'project': project})
-    await query_site.call('delete', 'Shot', shot['id'])
-    seed(query_site, 'Scalar', {'sg_link': shot})
-    grouping = [_by('sg_link', 'exact')]
-    if archived:
-        with pytest.raises(MockgunError):
-            await query_site.call(
-                'summarize',
-                'Scalar',
-                [],
-                _COUNT,
-                grouping=grouping,
-                include_archived_projects=False,
-            )
-    else:
-        await _assert_groups(
-            query_site,
-            'Scalar',
-            grouping,
-            [_group('S', _group_link(shot, 'S'), 1)],
-            include_archived_projects=False,
-        )
-
-
-@pytest.mark.anyio
 async def test_summary_combines_errors_before_faults_in_validation_order(
     query_site: FakeSiteCase,
 ) -> None:

@@ -12,6 +12,7 @@ from shotgun_api3.lib.mockgun._store import Store
 from shotgun_api3.lib.mockgun._sync_client import Shotgun
 from tests._threads import run_concurrently
 
+from ._schemas import schema
 from .conftest import SCHEMA, FakeSiteCase
 
 _TEST_CREDENTIAL = 'offline'
@@ -192,3 +193,35 @@ def test_store_default_values_are_owned_by_each_row() -> None:
     metadata_properties = cast('dict[str, object]', metadata_field['properties'])
     metadata_default = cast('dict[str, object]', metadata_properties['default_value'])
     assert metadata_default['value'] == {'source': 'schema'}
+
+
+# 2026-11-10 trial capture: generated schemas give number, percent and duration defaults as
+# strings such as '0' and '100'; the site reads those fields as integers.
+def test_store_numeric_string_defaults_are_integers() -> None:
+    fields = schema(
+        {
+            'Task': {
+                'time_logs_sum': 'duration',
+                'workload_assignee_count': 'number',
+                'sg_progress': 'percent',
+                'sg_label': 'text',
+            }
+        },
+        defaults={
+            ('Task', 'time_logs_sum'): '0',
+            ('Task', 'workload_assignee_count'): '-2',
+            ('Task', 'sg_progress'): '100',
+            ('Task', 'sg_label'): '0',
+        },
+    )
+    site_schema = SiteSchema(cast('dict[str, dict[str, object]]', {**SCHEMA, **fields}), {})
+    row = Store(site_schema).create('Task', {}, context=RequestContext(None, datetime.now(UTC)))
+    assert [row[name] for name in ('time_logs_sum', 'workload_assignee_count', 'sg_progress')] == [
+        0,
+        -2,
+        100,
+    ]
+    assert row['sg_label'] == '0'
+    field = cast('dict[str, object]', site_schema.fields['Task']['time_logs_sum'])
+    properties = cast('dict[str, object]', field['properties'])
+    assert properties['default_value'] == {'value': '0'}

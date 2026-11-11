@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import cast
 
 from ._errors import MockgunError
-from ._store import FieldValue, Row, Store
+from ._store import CONNECTION_FIELDS, FieldValue, Row, Store
 
 
 @dataclass(frozen=True)
@@ -43,19 +43,28 @@ _DISPLAY_FIELDS = {
     'ApiUser': ('firstname', 'lastname'),
 }
 _DISPLAY_LIMIT = 255
+# Fields the site keeps in NoteLink and NoteTask records, which mockgun does not
+# store; a retired holder hides their members (2026-11-10 live comparison).
+_IMPLICIT_CONNECTIONS = {
+    'Note': frozenset({'note_links', 'tasks'}),
+    'Shot': frozenset({'notes'}),
+}
 _RETIREMENT_EDGES = {
+    # 2026-11-10: Attachment and Note links hide; neither end is touched or logged.
     ('Attachment', 'attachment_links', 'Note'): _RetirementRule(
-        'keep', 'always', touched=False, settled=False
+        'hide', 'always', touched=False, settled=True
     ),
     ('Attachment', 'attachment_links', 'Version'): _RetirementRule(
-        'keep', 'always', touched=False, settled=False
+        'hide', 'always', touched=False, settled=True
     ),
     ('Note', 'attachments', 'Attachment'): _RetirementRule(
-        'keep', 'always', touched=False, settled=False
+        'hide', 'always', touched=False, settled=True
     ),
-    ('Task', 'entity', 'Shot'): _RetirementRule('cascade', 'always', touched=False, settled=False),
+    # 2026-11-10: a live Task whose Shot is revived gains no event rows.
+    ('Task', 'entity', 'Shot'): _RetirementRule('cascade', 'always', touched=False, settled=True),
+    # 2026-11-10: a live Version whose Shot is revived gains no event rows.
     ('Version', 'entity', 'Shot'): _RetirementRule(
-        'cascade', 'always', touched=False, settled=False
+        'cascade', 'always', touched=False, settled=True
     ),
     ('Task', 'entity', 'Asset'): _RetirementRule(
         'cascade', 'always', touched=False, settled=False
@@ -108,8 +117,13 @@ _RETIREMENT_EDGES = {
     ),
     ('CutItem', 'shot', 'Shot'): _RetirementRule('hide', 'always', touched=False, settled=True),
     ('PublishedFile', 'entity', 'Asset'): _RetirementRule(
-        'hide', 'always', touched=False, settled=False
+        'hide', 'always', touched=False, settled=True
     ),
+    ('PublishedFile', 'entity', 'Sequence'): _RetirementRule(
+        'hide', 'always', touched=False, settled=True
+    ),
+    ('TimeLog', 'entity', 'Shot'): _RetirementRule('hide', 'always', touched=False, settled=True),
+    ('TimeLog', 'entity', 'Task'): _RetirementRule('hide', 'always', touched=False, settled=True),
     ('Shot', 'sg_sequence', 'Sequence'): _RetirementRule(
         'hide', 'always', touched=False, settled=True
     ),
@@ -122,10 +136,11 @@ _RETIREMENT_EDGES = {
     ),
     ('Version', 'sg_task', 'Task'): _RetirementRule('hide', 'always', touched=False, settled=True),
     ('PublishedFile', 'task', 'Task'): _RetirementRule(
-        'hide', 'always', touched=False, settled=False
+        'hide', 'always', touched=False, settled=True
     ),
     ('Sequence', 'shots', 'Shot'): _RetirementRule('hide', 'always', touched=False, settled=False),
-    ('Shot', 'tasks', 'Task'): _RetirementRule('hide', 'always', touched=False, settled=False),
+    # 2026-11-10: retiring or reviving a Task alone adds no row for its Shot.
+    ('Shot', 'tasks', 'Task'): _RetirementRule('hide', 'always', touched=False, settled=True),
     ('Shot', 'notes', 'Note'): _RetirementRule('hide', 'always', touched=False, settled=False),
     ('Version', 'published_files', 'PublishedFile'): _RetirementRule(
         'hide', 'always', touched=False, settled=False
@@ -143,7 +158,27 @@ _RETIREMENT_EDGES = {
     ('Asset', 'assets', 'Asset'): _RetirementRule('hide', 'always', touched=True, settled=False),
     ('Shot', 'assets', 'Asset'): _RetirementRule('hide', 'always', touched=True, settled=False),
     ('Asset', 'shots', 'Shot'): _RetirementRule('hide', 'always', touched=True, settled=False),
-    ('CutItem', 'cut', 'Cut'): _RetirementRule('keep', 'always', touched=False, settled=False),
+    # 2026-11-10: a CutItem outlives its Cut with the link hidden and no rows.
+    ('CutItem', 'cut', 'Cut'): _RetirementRule('hide', 'always', touched=False, settled=True),
+    # 2026-11-10: a connection record retires with either end and revives with it.
+    ('AssetShotConnection', 'shot', 'Shot'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
+    ('AssetShotConnection', 'asset', 'Asset'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
+    ('AssetAssetConnection', 'parent', 'Asset'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
+    ('AssetAssetConnection', 'asset', 'Asset'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
+    ('PlaylistVersionConnection', 'version', 'Version'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
+    ('PlaylistVersionConnection', 'playlist', 'Playlist'): _RetirementRule(
+        'cascade', 'always', touched=False, settled=False
+    ),
 }
 _NOTE_COMBINED_LIMIT = 83
 _NOTE_SUBJECT_LIMIT = 120
@@ -154,8 +189,8 @@ class RetirementEdge:
     """Describe an immutable link retirement effect and its completeness.
 
     Attributes:
-        effect: `hide`, `keep`, `cascade`, or `taint`, describing the effect on
-            the holder when the target is retired.
+        effect: `hide`, `cascade`, or `taint`, describing the effect on the
+            holder when the target is retired.
         touched: Whether hiding the link affects the holder's update audit
             fields.
         settled: Whether the edge's lifecycle-event effects are fully modeled.
@@ -195,26 +230,23 @@ def _listed(holder: Row, field_name: str, link: Mapping[str, FieldValue]) -> boo
     )
 
 
-def _note_edge(store: Store, holder: Row, target: Row) -> RetirementEdge:
-    """Resolve the two observed Note.note_links shapes."""
-    links = cast('list[dict[str, FieldValue]]', holder.get('note_links', []))
-    if holder.get('tasks'):
-        return RetirementEdge('taint')
-    if len(links) == 1:
-        return RetirementEdge('cascade')
-    others = [
-        link for link in links if (link['type'], link['id']) != (target['type'], target['id'])
-    ]
-    if (
-        len(others) == 1
-        and len(links) == len(others) + 1
-        and target['type'] == 'Shot'
-        and others[0]['type'] == 'Asset'
-    ):
-        other = store.row('Asset', cast('int', others[0]['id']))
-        if other is not None and not other['__retired'] and not store.tainted(other):
-            return RetirementEdge('hide')
-    return RetirementEdge('taint')
+def _retired_target(target: Row, assume: Mapping[tuple[str, int], RecordState] | None) -> bool:
+    """Return a target's assumed or settled retirement, rejecting an unsettled one."""
+    state = (
+        assume.get((cast('str', target['type']), cast('int', target['id']))) if assume else None
+    )
+    if state is not None:
+        return state.retired
+    taint = cast('dict[str, FieldValue]', target.get('__taint', {}))
+    if taint and not taint.get('active'):
+        raise MockgunError(f'{target["type"]} {target["id"]}: {taint["reason"]}')
+    return bool(target['__retired'])
+
+
+def _uncertain(row: Row) -> bool:
+    """Return whether a record's own retirement state is unsettled."""
+    taint = cast('dict[str, FieldValue]', row.get('__taint', {}))
+    return bool(taint) and not taint.get('active')
 
 
 def _unsettled(entity_type: str, fields: tuple[str, ...]) -> MockgunError:
@@ -293,6 +325,45 @@ def _display(store: Store, entity_type: str, entity_id: int) -> tuple[str | None
     return name, derived
 
 
+def connection_backed(holder: Row, field_name: str, target: Row) -> bool:
+    """Return whether the site keeps a link's membership in a connection record.
+
+    A retired holder hides such a member while its connection record is
+    retired, even when the target is active.
+    """
+    kind = cast('str', holder['type'])
+    return (kind, field_name, cast('str', target['type'])) in CONNECTION_FIELDS or (
+        field_name in _IMPLICIT_CONNECTIONS.get(kind, frozenset())
+    )
+
+
+def connection_record(store: Store, holder: Row, field_name: str, target: Row) -> Row | None:
+    """Return the stored connection record behind one member, retired or not.
+
+    Returns:
+        The live stored connection row, or `None` when the schema declares no
+        such record or none joins the two records.
+    """
+    definition = CONNECTION_FIELDS.get(
+        (cast('str', holder['type']), field_name, cast('str', target['type']))
+    )
+    if definition is None:
+        return None
+    connection_type, holder_side, target_side = definition
+    if not (
+        store.schema.declares(connection_type, holder_side)
+        and store.schema.declares(connection_type, target_side)
+    ):
+        return None
+    return store.connection_row(
+        connection_type,
+        {
+            holder_side: {'type': holder['type'], 'id': holder['id']},
+            target_side: {'type': target['type'], 'id': target['id']},
+        },
+    )
+
+
 def derived_name(store: Store, entity_type: str, entity_id: int) -> bool:
     """Return whether a modeled name uses Task fallback or Note truncation.
 
@@ -309,6 +380,191 @@ def display_name(store: Store, entity_type: str, entity_id: int) -> str | None:
         MockgunError: If the target's display name is unsettled.
     """
     return _display(store, entity_type, entity_id)[0]
+
+
+def implicit_connection_fields(entity_type: str) -> frozenset[str]:
+    """Return a type's connection-backed fields whose records mockgun does not store."""
+    return _IMPLICIT_CONNECTIONS.get(entity_type, frozenset())
+
+
+def implicit_link_hidden(holder: Row, field_name: str, target: Row) -> bool:
+    """Return whether a retired holder hides an active NoteLink or NoteTask member.
+
+    The internal record stays retired with the holder, unless the target
+    retired first and so revived it on its own revival (2026-11-10).
+    """
+    member: FieldValue = [field_name, target['type'], target['id']]
+    return member not in cast('list[FieldValue]', holder.get('__retired_hidden', []))
+
+
+def _retired_holder_hidden(
+    store: Store,
+    holder: Row,
+    field_name: str,
+    target: Row,
+    assume: Mapping[tuple[str, int], RecordState] | None,
+) -> bool:
+    """Resolve a retired holder's link from its target and any connection record."""
+    if _retired_target(target, assume):
+        return True
+    if not connection_backed(holder, field_name, target):
+        return False
+    record = connection_record(store, holder, field_name, target)
+    if record is not None:
+        return _retired_target(record, assume)
+    return implicit_link_hidden(holder, field_name, target)
+
+
+def link_target(store: Store, link: Mapping[str, FieldValue]) -> Row | None:
+    """Return the stored record a link names, including a retired one.
+
+    Returns:
+        The live stored row, or `None` when the link is malformed, names an
+        undeclared entity type, or names a missing record.
+    """
+    kind, identity = link.get('type'), link.get('id')
+    if (
+        not isinstance(kind, str)
+        or not isinstance(identity, int)
+        or not store.schema.declares(kind)
+    ):
+        return None
+    return store.row(kind, identity)
+
+
+def _live(store: Store, link: Mapping[str, FieldValue]) -> bool:
+    """Return whether a link names an existing active record with settled state."""
+    row = link_target(store, link)
+    return row is not None and not row['__retired'] and not store.tainted(row)
+
+
+def _chained_task(store: Store, holder: Row, target: Row) -> bool:
+    """Identify a Note linked to a Shot and to one live Task of that Shot."""
+    links = cast('list[dict[str, FieldValue]]', holder.get('note_links', []))
+    tasks = cast('list[dict[str, FieldValue]]', holder.get('tasks', []))
+    identity = {'type': target['type'], 'id': target['id']}
+    if target['type'] != 'Shot' or len(tasks) != 1 or links != [identity]:
+        return False
+    task = link_target(store, tasks[0])
+    return task is not None and task.get('entity') == identity and _live(store, tasks[0])
+
+
+def _note_edge(store: Store, holder: Row, target: Row) -> RetirementEdge:
+    """Resolve the observed Note.note_links shapes, including the Shot-Task chain."""
+    links = cast('list[dict[str, FieldValue]]', holder.get('note_links', []))
+    if holder.get('tasks'):
+        # A Note created for a Task also links the Task's Shot; both retire with the Shot.
+        return RetirementEdge('cascade' if _chained_task(store, holder, target) else 'taint')
+    if len(links) == 1:
+        return RetirementEdge('cascade')
+    others = [
+        link for link in links if (link['type'], link['id']) != (target['type'], target['id'])
+    ]
+    # 2026-11-10: a two-link Note survives either link's retirement while the other is live.
+    if len(others) == 1 and len(links) == len(others) + 1 and _live(store, others[0]):
+        return RetirementEdge('hide')
+    return RetirementEdge('taint')
+
+
+def _task_note_edge(store: Store, holder: Row, rule: _RetirementRule) -> RetirementEdge:
+    """Resolve a Note's single Task link by whether a live note_links target remains."""
+    links = cast('list[dict[str, FieldValue]]', holder.get('note_links', []))
+    if len(cast('list[FieldValue]', holder.get('tasks', []))) != 1:
+        return RetirementEdge('taint')
+    if not links:
+        return RetirementEdge(rule.effect, rule.touched, rule.settled)
+    # 2026-11-10: a Note keeping a live note_links target survives its Task.
+    return RetirementEdge('hide' if all(_live(store, link) for link in links) else 'taint')
+
+
+def deciding_record(
+    store: Store, holder: Row, field_name: str, link: Mapping[str, FieldValue]
+) -> Row | None:
+    """Return the record whose possible states decide an uncertain link.
+
+    Args:
+        store: Site records used to resolve the link target.
+        holder: Stored record containing the outgoing link.
+        field_name: Holder field containing the link.
+        link: Target identity with `type` and `id`.
+
+    Returns:
+        The holder, target or connection row whose state decides link
+        visibility, or `None` when no modeled uncertainty requires a deciding
+        record.
+    """
+    target = link_target(store, link)
+    if target is None or (target['type'], target['id']) == (holder['type'], holder['id']):
+        return None
+    if _listed(holder, field_name, link):
+        return holder
+    if _uncertain(target):
+        return target
+    if holder['__retired'] and connection_backed(holder, field_name, target):
+        record = connection_record(store, holder, field_name, target)
+        if record is not None and _uncertain(record):
+            return record
+    return None
+
+
+def hidden(
+    store: Store,
+    holder: Row,
+    field_name: str,
+    link: Mapping[str, FieldValue],
+    *,
+    assume: Mapping[tuple[str, int], RecordState] | None = None,
+) -> bool:
+    """Resolve observed link hiding under optional record-state assumptions.
+
+    A link is hidden while its target is retired, whether the holder is active
+    or retired. A retired holder also hides a connection-backed member while
+    the connection record is retired. A link to the holder itself stays
+    visible.
+
+    Args:
+        store: Site records used to resolve link targets.
+        holder: Stored record containing the outgoing link.
+        field_name: Holder field containing the link.
+        link: Target identity with `type` and `id`.
+        assume: Optional states keyed by `(entity_type, entity_id)` for records
+            whose visibility is uncertain.
+
+    Returns:
+        Whether the link is hidden under the observed rules and supplied
+        assumptions.
+
+    Raises:
+        MockgunError: If visibility depends on an uncertain record for which no
+            explicit state was supplied.
+    """
+    target = link_target(store, link)
+    if target is None or (target['type'], target['id']) == (holder['type'], holder['id']):
+        return False
+    identity = (cast('str', holder['type']), cast('int', holder['id']))
+    holder_state = assume.get(identity) if assume is not None else None
+    retired = holder_state.retired if holder_state is not None else bool(holder['__retired'])
+    deciding = deciding_record(store, holder, field_name, link)
+    if deciding is not None:
+        key = (cast('str', deciding['type']), cast('int', deciding['id']))
+        state = assume.get(key) if assume is not None else None
+        if state is None:
+            raise MockgunError(
+                f'{holder["type"]} {holder["id"]}.{field_name}: {store.tainted(deciding)}'
+            )
+        if deciding is holder:
+            if not state.retired:
+                return (
+                    field_name,
+                    cast('str', link['type']),
+                    cast('int', link['id']),
+                ) in state.hidden
+            retired = True
+        elif not retired:
+            return state.retired
+    if retired:
+        return _retired_holder_hidden(store, holder, field_name, target, assume)
+    return _retired_target(target, assume)
 
 
 def named_link(store: Store, link: Mapping[str, FieldValue]) -> dict[str, FieldValue]:
@@ -331,110 +587,12 @@ def retirement_edge(store: Store, holder: Row, field_name: str, target: Row) -> 
     if kind == 'EventLogEntry' and field_name == 'entity':
         return RetirementEdge('hide')
     rule = _RETIREMENT_EDGES.get((kind, field_name, target_type))
-    if rule is None or (target_type == 'Project' and target.get('archived')):
+    if rule is None:
         return RetirementEdge('taint')
     if rule.condition == 'note_links':
         return _note_edge(store, holder, target)
-    if rule.condition == 'tasks' and (
-        holder.get('note_links') or len(cast('list[FieldValue]', holder.get('tasks', []))) != 1
-    ):
-        return RetirementEdge('taint')
+    if rule.condition == 'tasks':
+        return _task_note_edge(store, holder, rule)
     if rule.condition == 'note_project' and (holder.get('note_links') or holder.get('tasks')):
         return RetirementEdge('taint')
     return RetirementEdge(rule.effect, rule.touched, rule.settled)
-
-
-def deciding_record(
-    store: Store, holder: Row, field_name: str, link: Mapping[str, FieldValue]
-) -> Row | None:
-    """Return the record whose possible states decide an uncertain link.
-
-    Args:
-        store: Site records used to resolve the link target.
-        holder: Stored record containing the outgoing link.
-        field_name: Holder field containing the link.
-        link: Target identity with `type` and `id`.
-
-    Returns:
-        The live holder or target row whose state decides link visibility, or
-        `None` when no modeled uncertainty requires a deciding record.
-    """
-    if (
-        not isinstance(link.get('type'), str)
-        or not isinstance(link.get('id'), int)
-        or not store.schema.declares(cast('str', link['type']))
-    ):
-        return None
-    if _listed(holder, field_name, link):
-        return holder
-    target = store.row(cast('str', link['type']), cast('int', link['id']))
-    if target is None:
-        return None
-    edge = retirement_edge(store, holder, field_name, target)
-    if edge.effect == 'keep' and target['__retired']:
-        return holder
-    if (
-        edge.effect == 'hide'
-        and store.tainted(target)
-        and not cast('dict[str, FieldValue]', target['__taint']).get('active')
-    ):
-        return target
-    return None
-
-
-def hidden(
-    store: Store,
-    holder: Row,
-    field_name: str,
-    link: Mapping[str, FieldValue],
-    *,
-    assume: Mapping[tuple[str, int], RecordState] | None = None,
-) -> bool:
-    """Resolve observed link hiding under optional record-state assumptions.
-
-    Args:
-        store: Site records used to resolve link targets.
-        holder: Stored record containing the outgoing link.
-        field_name: Holder field containing the link.
-        link: Target identity with `type` and `id`.
-        assume: Optional states keyed by `(entity_type, entity_id)` for records
-            whose visibility is uncertain.
-
-    Returns:
-        Whether the link is hidden under the observed rules and supplied
-        assumptions. Retired holders retain their links.
-
-    Raises:
-        MockgunError: If visibility depends on an uncertain record for which no
-            explicit state was supplied.
-    """
-    identity = (cast('str', holder['type']), cast('int', holder['id']))
-    holder_state = assume.get(identity) if assume is not None else None
-    if holder_state.retired if holder_state is not None else holder['__retired']:
-        return False
-    deciding = deciding_record(store, holder, field_name, link)
-    if deciding is not None:
-        key = (cast('str', deciding['type']), cast('int', deciding['id']))
-        state = assume.get(key) if assume is not None else None
-        if state is None:
-            reason = store.tainted(deciding) or f'retired {link["type"]} {link["id"]} keep link'
-            raise MockgunError(f'{holder["type"]} {holder["id"]}.{field_name}: {reason}')
-        if deciding is holder:
-            return (field_name, cast('str', link['type']), cast('int', link['id'])) in state.hidden
-        return state.retired
-    if (
-        not isinstance(link.get('type'), str)
-        or not isinstance(link.get('id'), int)
-        or not store.schema.declares(cast('str', link['type']))
-    ):
-        return False
-    target = store.row(cast('str', link['type']), cast('int', link['id']))
-    if target is None:
-        return False
-    edge = retirement_edge(store, holder, field_name, target)
-    hides = edge.effect == 'hide' or (holder['type'], field_name, target['type']) == (
-        'Version',
-        'entity',
-        'Shot',
-    )
-    return hides and bool(target['__retired'])

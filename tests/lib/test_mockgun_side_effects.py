@@ -87,9 +87,6 @@ async def test_failed_write_restores_all_tables_after_event_mutation(
     row = store.require(entity_type, entity_id(target))
     store.mark_unknown(row, 'updated_at', 'previous unknown audit')
     store.mark_unknown(row, 'updated_by', 'previous unknown audit')
-    store.mark_unknown(
-        row, 'assets' if entity_type == 'Shot' else 'playlists', 'old order', order_only=True
-    )
     unrelated = seed(effects_site, 'Asset', {'code': 'unrelated'})
     store.taint(store.require('Asset', entity_id(unrelated)), 'existing taint', None)
     before = deepcopy((store._db, store.events_unknown))
@@ -322,19 +319,20 @@ async def test_changed_and_mixed_updates_touch_audit(effects_site: FakeSiteCase)
 
 
 @pytest.mark.anyio
-async def test_reordering_same_members_is_a_change(effects_site: FakeSiteCase) -> None:
+async def test_reordering_same_members_changes_nothing(effects_site: FakeSiteCase) -> None:
     _, asset_a, asset_b, shot = await _scene(effects_site)
     await effects_site.call('update', 'Shot', shot['id'], {'assets': [asset_a, asset_b]})
-    later = _LATER + timedelta(hours=1)
-    effects_site.client.site.set_time(later)
+    before = await _fields(effects_site, shot, 'updated_at', 'updated_by')
+    effects_site.client.site.set_time(_LATER + timedelta(hours=1))
     result = cast(
         'dict[str, object]',
         await effects_site.call('update', 'Shot', shot['id'], {'assets': [asset_b, asset_a]}),
     )
-    assert _links(result['assets']) == _links([asset_b, asset_a])
-    actual = await _fields(effects_site, shot, 'assets', 'updated_at')
-    assert _links(actual['assets']) == _links([asset_b, asset_a])
-    assert actual['updated_at'] == later
+    assert _links(result['assets']) == _links([asset_a, asset_b])
+    assert _links((await _fields(effects_site, shot, 'assets'))['assets']) == _links(
+        [asset_a, asset_b]
+    )
+    assert await _fields(effects_site, shot, 'updated_at', 'updated_by') == before
 
 
 def test_side_and_record_id_reservations_survive_rollback() -> None:
@@ -687,21 +685,21 @@ async def test_summary_update_is_read_only(effects_site: FakeSiteCase) -> None:
 async def test_version_task_inverse_rejects_tainted_old_task_atomically(
     effects_site: FakeSiteCase, replace: bool
 ) -> None:
-    project = seed(effects_site, 'Project', {'name': 'Archived', 'archived': True})
-    old_task = seed(effects_site, 'Task', {'content': 'old', 'project': project})
+    cut = seed(effects_site, 'Cut', {'code': 'cut'})
+    old_task = seed(effects_site, 'Task', {'content': 'old', 'entity': cut})
     new_task = seed(effects_site, 'Task', {'content': 'new'})
     version = seed(effects_site, 'Version', {'code': 'version', 'sg_task': old_task})
     store = effects_site.client._server.store
-    await effects_site.call('delete', 'Project', project['id'])
+    await effects_site.call('delete', 'Cut', cut['id'])
     assert store.tainted(store.require('Task', entity_id(old_task))) is not None
     assert store.tainted(store.require('Version', entity_id(version))) is None
     before = store.snapshot()
     target = new_task if replace else None
-    with pytest.raises(mockgun.MockgunError, match=rf'Task {old_task["id"]}.*Project'):
+    with pytest.raises(mockgun.MockgunError, match=rf'Task {old_task["id"]}.*Cut'):
         await effects_site.call('update', 'Version', version['id'], {'sg_task': target})
     assert store.snapshot() == before
 
-    assert await effects_site.call('revive', 'Project', project['id']) is True
+    assert await effects_site.call('revive', 'Cut', cut['id']) is True
     await effects_site.call('update', 'Version', version['id'], {'sg_task': target})
     assert _links((await _fields(effects_site, version, 'sg_task'))['sg_task']) == target
     with pytest.raises(mockgun.MockgunError, match=r'Task\.sg_versions'):
@@ -803,34 +801,6 @@ async def test_partial_schema_marks_only_declared_unknown_fields(query_site: Fak
         await query_site.call('create', 'Version', {'code': 'v', 'sg_task': known}),
     )
     assert cast('dict[str, object]', version['sg_task'])['name'] == 'known'
-
-
-@pytest.mark.anyio
-async def test_unknown_order_preserves_membership_and_clears_on_write(
-    effects_site: FakeSiteCase,
-) -> None:
-    shot = seed(effects_site, 'Shot', {'code': 's'})
-    asset = seed(effects_site, 'Asset', {'code': 'a', 'shots': [shot]})
-    seed(effects_site, 'Asset', {'code': 'b'})
-    store = effects_site.client._server.store
-    row = store.require('Asset', entity_id(asset))
-    store.mark_unknown(row, 'shots', 'member order unobserved', order_only=True)
-    assert _links(await effects_site.call('find', 'Asset', [['shots', 'is', shot]], ['id'])) == [
-        asset
-    ]
-    with pytest.raises(mockgun.MockgunError, match=r'Asset\.shots.*member order unobserved'):
-        await _fields(effects_site, asset, 'shots')
-    with pytest.raises(mockgun.MockgunError, match=r'Asset\.shots'):
-        await effects_site.call(
-            'find', 'Asset', [], order=[{'field_name': 'shots', 'direction': 'asc'}]
-        )
-    snapshot = store.snapshot()
-    store.forget_unknown(row, 'shots')
-    store.restore(snapshot)
-    with pytest.raises(mockgun.MockgunError, match=r'Asset\.shots'):
-        await _fields(effects_site, asset, 'shots')
-    await effects_site.call('update', 'Asset', asset['id'], {'shots': [shot]})
-    assert _links((await _fields(effects_site, asset, 'shots'))['shots']) == [shot]
 
 
 @pytest.mark.anyio
@@ -1015,7 +985,9 @@ async def test_connection_read_rejects_unobserved_fields_and_types(
 
 
 @pytest.mark.anyio
-async def test_connection_taint_filter_and_revival(effects_site: FakeSiteCase) -> None:
+async def test_connection_of_a_retired_end_leaves_active_reads_and_returns(
+    effects_site: FakeSiteCase,
+) -> None:
     a = cast('dict[str, object]', await effects_site.call('create', 'Asset', {'code': 'a'}))
     b = cast('dict[str, object]', await effects_site.call('create', 'Asset', {'code': 'b'}))
     shot = cast(
@@ -1023,14 +995,18 @@ async def test_connection_taint_filter_and_revival(effects_site: FakeSiteCase) -
         await effects_site.call('create', 'Shot', {'code': 's', 'assets': [a, b]}),
     )
     await effects_site.call('delete', 'Asset', a['id'])
-    with pytest.raises(mockgun.MockgunError, match='AssetShotConnection'):
-        await effects_site.call('find', 'AssetShotConnection', [])
     rows = cast(
         'list[dict[str, object]]',
-        await effects_site.call('find', 'AssetShotConnection', [['asset', 'is', b]], ['asset']),
+        await effects_site.call('find', 'AssetShotConnection', [], ['asset']),
     )
-    assert len(rows) == 1
-    assert _links(rows[0]['asset']) == _links(b)
+    assert [_links(row['asset']) for row in rows] == [_links(b)]
+    retired = cast(
+        'list[dict[str, object]]',
+        await effects_site.call(
+            'find', 'AssetShotConnection', [], ['asset', 'shot'], retired_only=True
+        ),
+    )
+    assert [(row['asset'], _links(row['shot'])) for row in retired] == [(None, _links(shot))]
     await effects_site.call('revive', 'Asset', a['id'])
     assert (
         len(
@@ -1044,7 +1020,7 @@ async def test_connection_taint_filter_and_revival(effects_site: FakeSiteCase) -
 
 
 @pytest.mark.anyio
-async def test_connection_tainted_remove_is_atomic_then_succeeds(
+async def test_removing_a_retired_member_is_refused_atomically_then_succeeds(
     effects_site: FakeSiteCase,
 ) -> None:
     s6 = cast('dict[str, object]', await effects_site.call('create', 'Shot', {'code': 's6'}))
@@ -1061,7 +1037,7 @@ async def test_connection_tainted_remove_is_atomic_then_succeeds(
     removed = next(row for row in rows if _links(row['shot']) == _links(s6))
     await effects_site.call('delete', 'Shot', s6['id'])
     before = effects_site.client._server.store.snapshot()
-    with pytest.raises(mockgun.MockgunError, match=rf'AssetShotConnection.*{removed["id"]}.*Shot'):
+    with pytest.raises(Fault, match=r'Update failed for \[Asset\.shots\]: Value is not legal'):
         await effects_site.call('update', 'Asset', a3['id'], {'shots': [s6]}, {'shots': 'remove'})
     assert effects_site.client._server.store.snapshot() == before
     await effects_site.call('revive', 'Shot', s6['id'])
@@ -1076,19 +1052,6 @@ async def test_connection_tainted_remove_is_atomic_then_succeeds(
         )
         == []
     )
-
-
-@pytest.mark.anyio
-async def test_connection_absent_in_partial_schema_control(query_site: FakeSiteCase) -> None:
-    s6 = cast('dict[str, object]', await query_site.call('create', 'Shot', {'code': 's6'}))
-    s7 = cast('dict[str, object]', await query_site.call('create', 'Shot', {'code': 's7'}))
-    a3 = cast(
-        'dict[str, object]',
-        await query_site.call('create', 'Asset', {'code': 'a3', 'shots': [s6, s7]}),
-    )
-    await query_site.call('delete', 'Shot', s6['id'])
-    await query_site.call('update', 'Asset', a3['id'], {'shots': [s6]}, {'shots': 'remove'})
-    assert _links((await _fields(query_site, a3, 'shots'))['shots']) == [_links(s7)]
 
 
 @pytest.mark.anyio

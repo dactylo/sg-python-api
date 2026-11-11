@@ -132,10 +132,12 @@ A schema generated from your site provides full field and entity declarations fo
 supported behavior. A partial schema also works: mockgun maintains server fields only where
 declared, creates acting user records only for declared user types, writes event rows and
 connection records only for declared entity types, and gives a link a display name only when its
-target display field is declared. Archive scope uses `Project.archived` only when declared. Schema
-reads return the loaded schema as changed by schema writes, without adding missing declarations.
-For example, if `HumanUser.sg_status_list` is absent, `authenticate_human_user()` raises `Fault`
-for that unknown field.
+target display field is declared. Multi-entity members are ordered by those names, so a field whose
+members lack them keeps its written order only where that order agrees with the named members.
+Archive scope uses `Project.archived` only when declared. Schema reads return the loaded schema as
+changed by schema writes, without adding missing declarations. For example, if
+`HumanUser.sg_status_list` is absent, `authenticate_human_user()` raises `Fault` for that unknown
+field.
 
 ### Create a client
 

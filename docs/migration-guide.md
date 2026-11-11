@@ -114,9 +114,13 @@ a server-side entity validation request. `create()` returns submitted fields and
 plus declared requested fields.
 
 Compare links by `type` and `id`, or include the target's display `name`. Give linked records a
-display field when the test reads that name. For a Note with exactly one Shot and one Asset link,
-with `Note.created_by` declared and an `ApiUser` creator, a non-sudo `ApiUser` reader receives the
-Asset link before the Shot link. This ordering rule applies to that two-member case.
+display field when the test reads that name.
+
+Expect multi-entity fields to list their members by display name, as a site does, whatever order
+you wrote them in. Names compare character by character without regard to case, so `s10` comes
+before `s9`, and equal names fall back to ID order. A `set` that only reorders members changes
+nothing. When a member's type has no display field in the schema, mockgun keeps the written order
+if it agrees with the named members, and raises `MockgunError` otherwise.
 
 Compare datetime instants after conversion. With default UTC conversion, expect lost microseconds
 and local aware values. Date objects travel as ISO strings; valid ISO datetime strings and datetime
@@ -154,13 +158,18 @@ computed fields explicitly or expect `MockgunError`.
 Assert batch atomicity: a failed batch leaves no earlier writes visible. Use declared
 `valid_values`, account for paired-field effects, and expect `Fault` for rejected writes.
 
-Assert supported retirement cascades and hidden links until revival. Reads or writes involving an
-unsettled cascade can raise `MockgunError`; narrow the fixture or revive the parent.
+Assert supported retirement cascades and hidden links until revival: a link to a retired record
+reads as empty on active and retired records alike. A write that names a retired record in a link
+field raises `Fault`, as it does on a site. Reads or writes involving an unsettled cascade can
+raise `MockgunError`; narrow the fixture or revive the parent.
 
 For event rows, assert known types, attributes and links instead of generated descriptions or
 literal IDs. With `Attachment.this_file` and the supported event fields declared, a plain script
 Note upload of an ASCII lowercase `.txt` file emits four rows when its display name equals its
 filename, and five when the names differ.
+
+Event reads raise `MockgunError` after any write whose rows mockgun cannot reproduce. Creating a
+Project is one: a site also logs rows for the pages it sets up for the new Project.
 
 ### Check files, threads, and activity
 

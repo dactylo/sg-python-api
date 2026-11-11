@@ -140,7 +140,10 @@ class _Grouping:
 
 
 def _check_archive_targets(ctx: _Grouping, targets: set[tuple[str, int]], message: str) -> None:
-    """Resolve linked target archive state through selection and projection only."""
+    """Resolve visible linked targets' archive state through selection and projection only.
+
+    Visible group links name active records; links to retired ones are hidden.
+    """
     if ctx.scope.include_archived_projects or not ctx.schema.declares('Project', 'archived'):
         return
     for kind in sorted({kind for kind, _ in targets}):
@@ -151,22 +154,20 @@ def _check_archive_targets(ctx: _Grouping, targets: set[tuple[str, int]], messag
         }
         field_name = 'archived' if kind == 'Project' else 'project.Project.archived'
         fields = [field_name] if kind == 'Project' or ctx.schema.declares(kind, 'project') else []
-        found: set[int] = set()
-        for retired in (False, True):
-            rows = select(
-                ctx.store,
-                kind,
-                tree,
-                [],
-                scope=ReadScope(
-                    retired=retired, context=ctx.scope.context, include_archived_projects=True
-                ),
-            )
-            projected = project_rows(ctx.store, ctx.schema, rows, fields)
-            found.update(cast('int', row['id']) for row in projected)
-            if any(row.get(field_name) is True for row in projected):
-                raise MockgunError(message)
-        if found != ids:
+        rows = select(
+            ctx.store,
+            kind,
+            tree,
+            [],
+            scope=ReadScope(
+                retired=False, context=ctx.scope.context, include_archived_projects=True
+            ),
+        )
+        projected = project_rows(ctx.store, ctx.schema, rows, fields)
+        if (
+            any(row.get(field_name) is True for row in projected)
+            or {cast('int', row['id']) for row in projected} != ids
+        ):
             raise MockgunError(message)
 
 

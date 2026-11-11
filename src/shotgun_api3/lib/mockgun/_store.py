@@ -196,12 +196,13 @@ class Store:
         entity_schema = cast('_Schema', self._schema[entity_type])
         for field_name, field_schema_value in entity_schema.items():
             field_schema = cast('_Schema', field_schema_value)
-            if self._schema_field_type(entity_type, field_name) == 'multi_entity':
+            data_type = self._schema_field_type(entity_type, field_name)
+            if data_type == 'multi_entity':
                 row[field_name] = []
             else:
                 properties = cast('_Schema', field_schema['properties'])
                 default_value = cast('_Schema', properties['default_value'])
-                row[field_name] = copy.deepcopy(default_value['value'])
+                row[field_name] = _row_default(data_type, default_value['value'])
         return row
 
     def _set_created_audit(
@@ -449,25 +450,37 @@ class Store:
         return self._actors.get((entity_type, entity_id))
 
     @staticmethod
-    def check_known(row: Row, field_name: str, *, membership: bool = False) -> None:
-        """Reject an unknown field value or an order-dependent read.
+    def check_known(row: Row, field_name: str) -> None:
+        """Reject a read of an unknown field value.
 
         Args:
             row: Stored or detached record whose field is being read.
             field_name: Direct field name.
-            membership: Whether only membership, rather than member order, is
-                read.
 
         Raises:
-            MockgunError: If the requested value or order is unknown.
+            MockgunError: If the requested value is unknown.
         """
-        for key in ('__unknown',) if membership else ('__unknown', '__unordered'):
-            markers = cast('dict[str, FieldValue]', row.get(key, {}))
-            if field_name in markers:
-                raise MockgunError(
-                    f'{row["type"]}.{field_name} on record {row["id"]} is unknown: '
-                    f'{markers[field_name]}'
-                )
+        markers = cast('dict[str, FieldValue]', row.get('__unknown', {}))
+        if field_name in markers:
+            raise MockgunError(
+                f'{row["type"]}.{field_name} on record {row["id"]} is unknown: '
+                f'{markers[field_name]}'
+            )
+
+    def connection_row(
+        self, connection_type: str, endpoints: Mapping[str, _EntityLink]
+    ) -> Row | None:
+        """Return the stored connection record joining both endpoints, retired or not.
+
+        Args:
+            connection_type: Declared connection entity type.
+            endpoints: Endpoint field names mapped to their `type` and `id`
+                links.
+        """
+        for row in self._db[connection_type].values():
+            if all(row.get(name) == link for name, link in endpoints.items()):
+                return row
+        return None
 
     def followers(self, entity_type: str, entity_id: int) -> list[int]:
         """Return following HumanUser IDs in ascending order for one record."""
@@ -514,13 +527,12 @@ class Store:
             self._remember_identity(entity_type, entity_id)
 
     def forget_unknown(self, row: Row, field_name: str) -> None:
-        """Clear the value and order markers for a field made known by a write."""
+        """Clear the unknown marker for a field made known by a write."""
         self.remember(row)
-        for key in ('__unknown', '__unordered'):
-            markers = cast('dict[str, FieldValue]', row.get(key, {}))
-            markers.pop(field_name, None)
-            if not markers:
-                row.pop(key, None)
+        markers = cast('dict[str, FieldValue]', row.get('__unknown', {}))
+        markers.pop(field_name, None)
+        if not markers:
+            row.pop('__unknown', None)
 
     def _set_updated_audit(self, entity_type: str, row: Row, context: RequestContext) -> None:
         """Record the actor and time of a successful change when declared."""
@@ -542,20 +554,16 @@ class Store:
             row.pop(field_name, None)
             self.forget_unknown(row, field_name)
 
-    def mark_unknown(
-        self, row: Row, field_name: str, reason: str, *, order_only: bool = False
-    ) -> None:
-        """Record an unsettled value or member order alongside its stored row.
+    def mark_unknown(self, row: Row, field_name: str, reason: str) -> None:
+        """Record an unsettled value alongside its stored row.
 
         Args:
             row: Record to mark; snapshots include these markers.
-            field_name: Declared field whose value or order is unsettled.
+            field_name: Declared field whose value is unsettled.
             reason: Evidence-specific explanation returned by read failures.
-            order_only: Mark only member order, retaining known membership.
         """
         self.remember(row)
-        key = '__unordered' if order_only else '__unknown'
-        markers = cast('dict[str, FieldValue]', row.setdefault(key, {}))
+        markers = cast('dict[str, FieldValue]', row.setdefault('__unknown', {}))
         markers[field_name] = reason
 
     def _apply_create_computed(
@@ -617,7 +625,6 @@ class Store:
                 continue
             field_type = self._schema_field_type(entity_type, field_name)
             unknown = field_name in cast('dict[str, FieldValue]', stored.get('__unknown', {}))
-            unordered = field_name in cast('dict[str, FieldValue]', stored.get('__unordered', {}))
             if unknown:
                 uncertain = True
                 changed = changed or (
@@ -627,8 +634,6 @@ class Store:
                     self.forget_unknown(row, field_name)
             else:
                 changed = changed or row[field_name] != stored[field_name]
-                if unordered:
-                    self.forget_unknown(row, field_name)
         if changed:
             self._set_updated_audit(entity_type, row, context)
         elif uncertain:
@@ -734,6 +739,82 @@ class Store:
         ):
             return candidate
         return self._db[entity_type].get(entity_id)
+
+    def _link_task_entities(self, row: Row, added: Sequence[_EntityLink]) -> None:
+        """Add the entities of a Note's newly linked Tasks to its note_links, as the site does.
+
+        Raises:
+            MockgunError: If a Task's entity is unknown, or is retired, whose
+                effect is unobserved.
+        """
+        if (
+            row['type'] != 'Note'
+            or not self.schema.declares('Note', 'note_links')
+            or not self.schema.declares('Task', 'entity')
+        ):
+            return
+        members = list(cast('list[_EntityLink]', row.get('note_links') or []))
+        for link in added:
+            task = self.row('Task', cast('int', link['id']))
+            if task is None:
+                continue
+            self.check_known(task, 'entity')
+            entity = task.get('entity')
+            if not isinstance(entity, dict):
+                continue
+            target = self.row(cast('str', entity['type']), cast('int', entity['id']))
+            if target is None:
+                continue
+            if target['__retired']:
+                raise MockgunError(
+                    f'Note.note_links from Task {task["id"]}: its retired '
+                    f'{target["type"]} {target["id"]} has an unobserved effect'
+                )
+            identity: _EntityLink = {'type': target['type'], 'id': target['id']}
+            if identity not in members:
+                members.append(identity)
+        # 2026-11-10: creates and updates add each new Task's entity; removing a Task
+        # leaves note_links alone.
+        row['note_links'] = cast('FieldValue', members)
+
+    def check_link_targets(
+        self, entity_type: str, fields: Mapping[str, object], operation: str
+    ) -> None:
+        """Refuse a write naming a retired record in a link field, in any update mode.
+
+        Args:
+            entity_type: Entity type being written.
+            fields: Supplied field values; undeclared fields are left to
+                validation.
+            operation: `create` or `update`, selecting the site's message.
+
+        Raises:
+            ServerFaultError: If a supplied link names a retired record, with
+                error code 104 (live comparison, 2026-11-10).
+        """
+        for field_name, value in fields.items():
+            if not self.schema.declares(entity_type, field_name) or self._schema_field_type(
+                entity_type, field_name
+            ) not in {'entity', 'multi_entity'}:
+                continue
+            for item in cast('list[object]', value) if isinstance(value, list) else [value]:
+                if not isinstance(item, dict):
+                    continue
+                link = cast('dict[str, object]', item)
+                kind, identity = link.get('type'), link.get('id')
+                if not isinstance(kind, str) or not isinstance(identity, int):
+                    continue
+                target = self.row(kind, identity) if self.schema.declares(kind) else None
+                if target is None or not target['__retired']:
+                    continue
+                failure = f'Update failed for [{entity_type}.{field_name}]: Value is not legal.'
+                message = (
+                    f'API update() CRUD ERROR #5: {failure}'
+                    if operation == 'update'
+                    else f'API create() CRUD ERROR #6: Invalid field value, update failed '
+                    f'[5 - {failure}]'
+                )
+                raise ServerFaultError(message, error_code=104)
 
     def rows(self, entity_type: str, *, retired: bool) -> list[Row]:
         """Return live rows of the requested retirement state in ascending ID order.
@@ -1188,6 +1269,7 @@ class Store:
         self._set_created_audit(entity_type, data, context)
         self._validate_entity_data(entity_type, data, 'create')
         self._check_link_writes(entity_type, data)
+        self.check_link_targets(entity_type, data, 'create')
         row = self._new_row(entity_type)
         for field_name, value in data.items():
             if field_name == 'cached_display_name':
@@ -1196,6 +1278,8 @@ class Store:
             row[field_name] = self._normalize_field_value(field_type, cast('FieldValue', value))
         row['id'] = self._next_ids[entity_type]
         self._apply_create_computed(row, fields, context)
+        if 'tasks' in fields:
+            self._link_task_entities(row, self._links(row.get('tasks'), 'Task'))
         return row
 
     def create(
@@ -1231,7 +1315,11 @@ class Store:
         self._next_ids[entity_type] += 1
         self._remember_identity(entity_type, cast('int', row['id']))
         self._db[entity_type][cast('int', row['id'])] = row
-        self._apply_pairs(entity_type, {}, row, fields.keys(), context)
+        mirrored = [
+            *fields,
+            *(['note_links'] if entity_type == 'Note' and 'tasks' in fields else []),
+        ]
+        self._apply_pairs(entity_type, {}, row, mirrored, context)
         if context.actor is not None:
             self._mark_task_inverse({}, row)
         return row
@@ -1290,18 +1378,23 @@ class Store:
                 continue
             field_type = self._schema_field_type(entity_type, field_name)
             if field_type == 'multi_entity':
-                row[field_name] = cast(
-                    'FieldValue',
-                    self._update_multi_entity(
-                        cast('list[_EntityLink]', row[field_name]),
-                        cast('list[_EntityLink]', value),
-                        modes.get(field_name, 'set'),
-                    ),
+                members = cast('list[_EntityLink]', row[field_name])
+                updated = self._update_multi_entity(
+                    members, cast('list[_EntityLink]', value), modes.get(field_name, 'set')
                 )
+                # 2026-11-10: the site keeps no member order, so a reordering set changes
+                # nothing, including audit fields and event rows.
+                if _identities(updated) != _identities(members):
+                    row[field_name] = cast('FieldValue', updated)
             else:
                 row[field_name] = self._normalize_field_value(
                     field_type, cast('FieldValue', value)
                 )
+        if 'tasks' in data:
+            old = self._links(stored.get('tasks'), 'Task')
+            self._link_task_entities(
+                row, [link for link in self._links(row.get('tasks'), 'Task') if link not in old]
+            )
         self._update_certainty(row, stored, data, modes, context)
         self._sequence_shots_provenance(stored, row, data)
         return row
@@ -1410,7 +1503,11 @@ class Store:
             self.remember(stored)
             stored.clear()
             stored.update(row)
-            self._apply_pairs(entity_type, before, stored, fields.keys(), context)
+            mirrored = [
+                *fields,
+                *(['note_links'] if entity_type == 'Note' and 'tasks' in fields else []),
+            ]
+            self._apply_pairs(entity_type, before, stored, mirrored, context)
             self._mark_task_inverse(before, stored)
         image_fields = {'image', 'filmstrip_image'} & fields.keys()
         if 'image' in image_fields and fields['image'] is None:
@@ -1424,6 +1521,11 @@ class Store:
                 f'update {entity_type} {entity_id} image fields: activity is unsettled',
             )
         return stored
+
+
+def _identities(links: Sequence[_EntityLink]) -> list[tuple[str, int]]:
+    """Return validated member identities in a stable order for membership comparison."""
+    return sorted((cast('str', link['type']), cast('int', link['id'])) for link in links)
 
 
 def _observed_task_form(fields: Mapping[str, object], context: RequestContext) -> bool:
@@ -1444,3 +1546,14 @@ def _observed_task_form(fields: Mapping[str, object], context: RequestContext) -
             )
         )
     )
+
+
+def _row_default(data_type: str, value: FieldValue) -> FieldValue:
+    """Copy a schema default, reading a generated schema's integer text as an integer."""
+    # 2026-11-10 trial capture: generated schemas give number, percent and duration defaults
+    # as text such as '0' and '100', and the site reads those fields as integers.
+    if _FIELD_PYTHON_TYPES.get(data_type) is int and isinstance(value, str):
+        digits = value.removeprefix('-')
+        if digits.isascii() and digits.isdigit():
+            return int(value)
+    return copy.deepcopy(value)

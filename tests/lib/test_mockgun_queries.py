@@ -355,6 +355,14 @@ async def _scalar_rows(case: FakeSiteCase, field: str) -> None:
         await create_link(case, 'Scalar', {field: value} if value is not None else {})
 
 
+async def _shot_ids(case: FakeSiteCase, asset: dict[str, object]) -> list[object]:
+    found = cast(
+        'dict[str, object]',
+        await case.call('find_one', 'Asset', [['id', 'is', asset['id']]], ['shots']),
+    )
+    return [link['id'] for link in cast('list[dict[str, object]]', found['shots'])]
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     ('retired', 'holder', 'field', 'remaining'),
@@ -493,7 +501,7 @@ async def test_deep_return_through_hidden_link_raises(query_site: FakeSiteCase) 
 
 
 @pytest.mark.anyio
-async def test_retired_holder_keeps_retired_target_link(query_site: FakeSiteCase) -> None:
+async def test_retired_holder_hides_retired_target_link(query_site: FakeSiteCase) -> None:
     records = await _retired_link_records(query_site)
     assert await query_site.call('delete', 'Shot', records['S1']['id'])
     assert await query_site.call('delete', 'PublishedFile', records['PF']['id'])
@@ -501,7 +509,7 @@ async def test_retired_holder_keeps_retired_target_link(query_site: FakeSiteCase
         'list[dict[str, object]]',
         await query_site.call('find', 'PublishedFile', [], ['entity'], retired_only=True),
     )
-    assert result == [{**records['PF'], 'entity': {**records['S1'], 'name': 'S010'}}]
+    assert result == [{**records['PF'], 'entity': None}]
 
 
 @pytest.mark.anyio
@@ -1402,7 +1410,7 @@ async def test_order_deep_candidate_checks_only_preceding_clause_ties(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize('read_kind', ['absent', 'anonymous', 'human', 'sudo', 'script'])
-async def test_projection_without_selection_preserves_context_specific_note_order(
+async def test_projection_orders_note_links_by_name_in_every_context(
     query_site: FakeSiteCase, read_kind: str
 ) -> None:
     shot = seed(query_site, 'Shot', {'code': 'shot'})
@@ -1425,9 +1433,7 @@ async def test_projection_without_selection_preserves_context_specific_note_orde
     )
     result = project_rows(server.store, server.schema, [row], ['note_links'], context=context)
     links = cast('list[dict[str, object]]', result[0]['note_links'])
-    assert [link['type'] for link in links] == (
-        ['Asset', 'Shot'] if read_kind == 'script' else ['Shot', 'Asset']
-    )
+    assert [link['type'] for link in links] == ['Asset', 'Shot']
     links[0]['name'] = 'detached'
     assert row['note_links'] == [shot, asset]
 
@@ -1544,7 +1550,93 @@ async def test_nested_multi_entity_paths_filter_but_are_left_out_of_results(
 
 
 @pytest.mark.anyio
-async def test_three_member_note_keeps_requested_order(
+async def test_members_read_sorted_by_current_name(query_site: FakeSiteCase) -> None:
+    shots = {code: await create_link(query_site, 'Shot', {'code': code}) for code in 'mza'}
+    created = cast(
+        'dict[str, object]',
+        await query_site.call(
+            'create', 'Asset', {'code': 'h', 'shots': [shots[code] for code in 'zam']}, ['shots']
+        ),
+    )
+    expected = [shots[code]['id'] for code in 'amz']
+    assert [link['id'] for link in cast('list[dict[str, object]]', created['shots'])] == expected
+    assert await _shot_ids(query_site, created) == expected
+    await query_site.call('update', 'Shot', shots['a']['id'], {'code': 'zz'})
+    assert await _shot_ids(query_site, created) == [shots[code]['id'] for code in 'mza']
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('written', 'expected'),
+    [
+        (['B1', 'a1'], ['a1', 'B1']),
+        (['s9', 's10'], ['s10', 's9']),
+        (['xa', 'x_b'], ['x_b', 'xa']),
+        (['ya', 'y-b'], ['y-b', 'ya']),
+        (['wa', 'w b'], ['w b', 'wa']),
+        (['xa', 'x.b'], ['x.b', 'xa']),
+        (['xa', 'x1'], ['x1', 'xa']),
+        (['x~', 'xa'], ['xa', 'x~']),
+        (['xZ', 'x_'], ['x_', 'xZ']),
+        (['x\u00e9', 'xf'], ['xf', 'x\u00e9']),
+        (['x\u00ea', 'x\u00e8'], ['x\u00e8', 'x\u00ea']),
+    ],
+)
+async def test_member_names_compare_case_blind_by_character(
+    query_site: FakeSiteCase, written: list[str], expected: list[str]
+) -> None:
+    shots = {code: await create_link(query_site, 'Shot', {'code': code}) for code in written}
+    asset = await create_link(query_site, 'Asset', {'code': 'h', 'shots': list(shots.values())})
+    assert await _shot_ids(query_site, asset) == [shots[code]['id'] for code in expected]
+
+
+@pytest.mark.anyio
+async def test_members_with_equal_names_read_by_id(query_site: FakeSiteCase) -> None:
+    older = await create_link(query_site, 'Shot', {'code': 'Ab'})
+    newer = await create_link(query_site, 'Shot', {'code': 'ab'})
+    asset = await create_link(query_site, 'Asset', {'code': 'h', 'shots': [newer, older]})
+    assert await _shot_ids(query_site, asset) == [older['id'], newer['id']]
+    same = await create_link(query_site, 'Asset', {'code': 'Ab'})
+    note = await create_link(query_site, 'Note', {'subject': 'n', 'note_links': [newer, same]})
+    found = cast(
+        'dict[str, object]',
+        await query_site.call('find_one', 'Note', [['id', 'is', note['id']]], ['note_links']),
+    )
+    links = cast('list[dict[str, object]]', found['note_links'])
+    assert [(link['type'], link['id']) for link in links] == sorted(
+        [('Shot', newer['id']), ('Asset', same['id'])], key=lambda pair: cast('int', pair[1])
+    )
+
+
+@pytest.mark.anyio
+async def test_member_order_raises_where_unobserved(query_site: FakeSiteCase) -> None:
+    shot = await create_link(query_site, 'Shot', {'code': 'x\u00c9'})
+    asset = await create_link(query_site, 'Asset', {'code': 'x\u00e8'})
+    create = query_site.call('create', 'Note', {'subject': 'n', 'note_links': [shot, asset]})
+    with pytest.raises(MockgunError, match=r'cannot order Note\.note_links members'):
+        await create
+    assert await query_site.call('find', 'Note', []) == []
+
+
+@pytest.mark.anyio
+async def test_unnamed_members_keep_stored_order_only_when_consistent(
+    query_site: FakeSiteCase,
+) -> None:
+    first = await create_link(query_site, 'Shot', {'code': 'a'})
+    second = await create_link(query_site, 'Shot', {'code': 'b'})
+    missing = {'type': 'Shot', 'id': 9999}
+    kept = await create_link(
+        query_site, 'Asset', {'code': 'h1', 'shots': [first, missing, second]}
+    )
+    assert await _shot_ids(query_site, kept) == [first['id'], 9999, second['id']]
+    create = query_site.call('create', 'Asset', {'code': 'h2', 'shots': [second, missing, first]})
+    with pytest.raises(MockgunError, match='without a modeled display name'):
+        await create
+    assert await query_site.call('find', 'Asset', [['code', 'is', 'h2']]) == []
+
+
+@pytest.mark.anyio
+async def test_note_links_read_in_name_order(
     workflow_site: FakeSiteCase,
 ) -> None:
     case = workflow_site
@@ -1554,9 +1646,9 @@ async def test_three_member_note_keeps_requested_order(
     await case.call('create', 'Note', {'subject': 'shared', 'note_links': [shot, asset, other]})
     found = cast('dict[str, object]', await case.call('find_one', 'Note', [], ['note_links']))
     assert found['note_links'] == [
-        {'type': 'Shot', 'id': shot['id'], 'name': 'S'},
         {'type': 'Asset', 'id': asset['id'], 'name': 'A'},
         {'type': 'Shot', 'id': other['id'], 'name': 'Other'},
+        {'type': 'Shot', 'id': shot['id'], 'name': 'S'},
     ]
 
 
@@ -1565,7 +1657,7 @@ async def test_three_member_note_keeps_requested_order(
     ('creator_kind', 'reader_kind'),
     [('script', 'sudo'), ('script', 'human'), ('sudo', 'script'), ('human', 'script')],
 )
-async def test_note_link_order_preserves_unobserved_actor_forms(
+async def test_note_link_order_is_the_same_for_every_actor(
     workflow_site: FakeSiteCase, creator_kind: str, reader_kind: str
 ) -> None:
     case = workflow_site
@@ -1591,27 +1683,12 @@ async def test_note_link_order_preserves_unobserved_actor_forms(
             ),
         )
         assert found['note_links'] == [
-            {'type': 'Shot', 'id': shot['id'], 'name': 'S'},
             {'type': 'Asset', 'id': asset['id'], 'name': 'A'},
+            {'type': 'Shot', 'id': shot['id'], 'name': 'S'},
         ]
     finally:
         await sudo.call('close')
         await human.call('close')
-
-
-@pytest.mark.anyio
-async def test_note_link_order_without_creator_declaration_stays_unchanged(
-    query_site: FakeSiteCase,
-) -> None:
-    case = query_site
-    shot = cast('dict[str, object]', await case.call('create', 'Shot', {'code': 'S'}))
-    asset = cast('dict[str, object]', await case.call('create', 'Asset', {'code': 'A'}))
-    await case.call('create', 'Note', {'subject': 'partial', 'note_links': [shot, asset]})
-    found = cast('dict[str, object]', await case.call('find_one', 'Note', [], ['note_links']))
-    assert found['note_links'] == [
-        {'type': 'Shot', 'id': shot['id'], 'name': 'S'},
-        {'type': 'Asset', 'id': asset['id'], 'name': 'A'},
-    ]
 
 
 @pytest.mark.anyio

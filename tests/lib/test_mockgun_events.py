@@ -15,7 +15,8 @@ from shotgun_api3.lib.mockgun._sessions import RequestContext, _Actor
 from tests.conftest import entity_id
 from tests.lib._events import cursor, delta
 
-from .conftest import EFFECTS_SCHEMA, QUERY_NOW, FakeSiteCase, raw_call, seed
+from ._schemas import schema
+from .conftest import EFFECTS_SCHEMA, QUERY_NOW, WORKFLOW_SCHEMA, FakeSiteCase, raw_call, seed
 
 _COMMON_FIELDS = [
     'event_type',
@@ -53,6 +54,31 @@ _SHOT_DEFAULTS_SCHEMA = {
                 'valid_values': {'value': ['Feature', 'Commercial']},
             },
         },
+    },
+}
+# 2026-11-10 trial capture: number, duration and text defaults that a generated schema declares,
+# which no create logs.
+_SITE_DEFAULT_FIELDS = schema(
+    {
+        'Task': {'time_logs_sum': 'duration', 'workload_assignee_count': 'number'},
+        'Note': {'publish_status': 'text'},
+        'Reply': {'publish_status': 'text'},
+        'Shot': {'sg_frame_count': 'number', 'sg_label': 'text'},
+    },
+    defaults={
+        ('Task', 'time_logs_sum'): '0',
+        ('Task', 'workload_assignee_count'): '0',
+        ('Note', 'publish_status'): 'published',
+        ('Reply', 'publish_status'): 'published',
+        ('Shot', 'sg_frame_count'): '0',
+        ('Shot', 'sg_label'): 'plate',
+    },
+)
+_SITE_DEFAULTS_SCHEMA = {
+    **WORKFLOW_SCHEMA,
+    **{
+        entity_type: {**WORKFLOW_SCHEMA[entity_type], **fields}
+        for entity_type, fields in _SITE_DEFAULT_FIELDS.items()
     },
 }
 _SLATE_DEFAULT_SCHEMA = {
@@ -123,6 +149,8 @@ async def create_event_site(
         schema = _PARTIAL_ASSET_SCHEMA
     if schema_name == 'slate-default':
         schema = _SLATE_DEFAULT_SCHEMA
+    if schema_name == 'site-defaults':
+        schema = _SITE_DEFAULTS_SCHEMA
     path = tmp_path / 'create-events.pickle'
     path.write_bytes(pickle.dumps(schema, protocol=2))
     monkeypatch.setattr(mockgun.Shotgun, '_schema_path', str(path))
@@ -323,21 +351,71 @@ async def test_lifecycle_events_revive_active_control_adds_no_row(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('parent_type', 'holders'),
+    [
+        ('Shot', [('PublishedFile', 'entity'), ('CutItem', 'shot'), ('TimeLog', 'entity')]),
+        ('Task', [('PublishedFile', 'task'), ('TimeLog', 'entity'), ('Version', 'sg_task')]),
+        ('Asset', [('PublishedFile', 'entity')]),
+        ('Sequence', [('PublishedFile', 'entity')]),
+        ('Cut', [('CutItem', 'cut')]),
+    ],
+)
 async def test_lifecycle_events_single_link_holders_add_no_rows(
+    effects_site: FakeSiteCase, parent_type: str, holders: list[tuple[str, str]]
+) -> None:
+    project = seed(effects_site, 'Project', {'name': 'Alpha'})
+    name = 'content' if parent_type == 'Task' else 'code'
+    parent = seed(effects_site, parent_type, {name: 'p1', 'project': project})
+    for holder_type, field in holders:
+        seed(effects_site, holder_type, {field: parent})
+    for method, kind in (('delete', 'Retirement'), ('revive', 'Revival')):
+        before = await cursor(effects_site)
+        assert await effects_site.call(method, parent_type, parent['id']) is True
+        rows = await delta(effects_site, before, ['event_type', 'attribute_name'])
+        assert [row['event_type'] for row in rows] == [
+            f'Shotgun_{parent_type}_Change',
+            f'Shotgun_{parent_type}_{kind}',
+        ]
+        assert [row['attribute_name'] for row in rows] == ['retirement_date', None]
+
+
+@pytest.mark.anyio
+async def test_project_create_explains_its_unsettled_event_rows(
     effects_site: FakeSiteCase,
+) -> None:
+    project = cast(
+        'dict[str, object]', await effects_site.call('create', 'Project', {'name': 'Alpha'})
+    )
+    with pytest.raises(
+        mockgun.MockgunError,
+        match=rf'Project {project["id"]} create has unsettled event rows for the pages',
+    ):
+        await effects_site.call('find', 'EventLogEntry', [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(('child_type', 'name'), [('Task', 'content'), ('Version', 'code')])
+async def test_lifecycle_events_holder_revived_before_its_target_adds_no_rows(
+    effects_site: FakeSiteCase, child_type: str, name: str
 ) -> None:
     project = seed(effects_site, 'Project', {'name': 'Alpha'})
     shot = seed(effects_site, 'Shot', {'code': 's1', 'project': project})
-    seed(effects_site, 'PublishedFile', {'code': 'pf1', 'entity': shot})
-    seed(effects_site, 'CutItem', {'code': 'ci1', 'shot': shot})
+    child = seed(effects_site, child_type, {name: 'c1', 'project': project, 'entity': shot})
     before = await cursor(effects_site)
-    assert await effects_site.call('delete', 'Shot', shot['id']) is True
-    rows = await delta(effects_site, before, ['event_type', 'attribute_name'])
+    for method, row in (('delete', child), ('delete', shot), ('revive', child), ('revive', shot)):
+        assert await effects_site.call(method, row['type'], row['id']) is True
+    rows = await delta(effects_site, before, ['event_type'])
     assert [row['event_type'] for row in rows] == [
+        f'Shotgun_{child_type}_Change',
+        f'Shotgun_{child_type}_Retirement',
         'Shotgun_Shot_Change',
         'Shotgun_Shot_Retirement',
+        f'Shotgun_{child_type}_Change',
+        f'Shotgun_{child_type}_Revival',
+        'Shotgun_Shot_Change',
+        'Shotgun_Shot_Revival',
     ]
-    assert [row['attribute_name'] for row in rows] == ['retirement_date', None]
 
 
 @pytest.mark.anyio
@@ -400,7 +478,6 @@ async def test_lifecycle_events_sudo_update_guard(effects_site: FakeSiteCase) ->
         'shot-task',
         'asset-shots',
         'sequence-shots',
-        'published-file-task',
         'version-published-files',
         'project-asset',
     ],
@@ -412,9 +489,6 @@ async def test_lifecycle_events_unsettled_holders_guard(
     if variant == 'playlist-version':
         target = seed(effects_site, 'Version', {'code': 'v1', 'project': project})
         seed(effects_site, 'Playlist', {'code': 'pl', 'versions': [target]})
-    elif variant == 'published-file-task':
-        target = seed(effects_site, 'Task', {'content': 't1', 'project': project})
-        seed(effects_site, 'PublishedFile', {'code': 'pf1', 'task': target})
     elif variant == 'version-published-files':
         target = seed(effects_site, 'PublishedFile', {'code': 'pf1', 'project': project})
         seed(effects_site, 'Version', {'code': 'v1', 'published_files': [target]})
@@ -1123,6 +1197,66 @@ async def test_create_events_version_supplied_checkbox_stays_unsettled(
     )
     with pytest.raises(mockgun.MockgunError):
         await _rows(create_event_site, {'type': 'Version', 'id': record['id']}, ['attribute_name'])
+
+
+# 2026-11-10 trial capture: no create logs a number, duration or text default, whatever the
+# entity type.
+@pytest.mark.anyio
+@pytest.mark.parametrize('create_event_site', ['site-defaults'], indirect=True)
+@pytest.mark.parametrize(
+    ('kind', 'data', 'expected'),
+    [
+        ('Task', {'content': 't'}, ['Task:', 'Task:color', 'Task:content', 'Task:sg_status_list']),
+        (
+            'Note',
+            {'subject': 's', 'content': 'c'},
+            ['Note:', 'Note:user', 'Note:sg_status_list', 'Note:subject', 'Note:content'],
+        ),
+        (
+            'Reply',
+            {'entity': 'note', 'content': 'c'},
+            ['Reply:', 'Reply:user', 'Reply:entity', 'Note:replies', 'Reply:content'],
+        ),
+        ('Shot', {'code': 's2'}, ['Shot:', 'Shot:code']),
+    ],
+)
+async def test_create_events_under_generated_schema_defaults(
+    create_event_site: FakeSiteCase, kind: str, data: dict[str, str], expected: list[str]
+) -> None:
+    project = seed(create_event_site, 'Project', {'name': 'Alpha'})
+    links = {
+        'shot': [seed(create_event_site, 'Shot', {'code': 's1', 'project': project})],
+        'note': seed(create_event_site, 'Note', {'subject': 'n', 'project': project}),
+    }
+    values = {name: links.get(value, value) for name, value in data.items()}
+    before = await cursor(create_event_site)
+    await create_event_site.call(
+        'create', kind, {**({} if kind == 'Reply' else {'project': project}), **values}
+    )
+    rows = await delta(create_event_site, before, ['event_type', 'attribute_name'])
+    assert [(row['event_type'], row['attribute_name']) for row in rows] == [
+        (
+            f'Shotgun_{item.split(":")[0]}_{"Change" if item.split(":")[1] else "New"}',
+            item.split(':')[1] or None,
+        )
+        for item in expected
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('create_event_site', ['site-defaults'], indirect=True)
+async def test_create_events_supplied_unlogged_default_stays_unsettled(
+    create_event_site: FakeSiteCase,
+) -> None:
+    project = seed(create_event_site, 'Project', {'name': 'Alpha'})
+    record = cast(
+        'dict[str, object]',
+        await create_event_site.call(
+            'create', 'Note', {'project': project, 'subject': 's', 'publish_status': 'published'}
+        ),
+    )
+    with pytest.raises(mockgun.MockgunError, match=rf'Note {record["id"]} create has unsettled'):
+        await cursor(create_event_site)
 
 
 @pytest.mark.anyio
